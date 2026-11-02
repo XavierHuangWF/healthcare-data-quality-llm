@@ -218,3 +218,27 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+
+# ====================================
+# Private customer data and local state
+# ====================================
+
+/data/
+/outputs/
+/reports/
+/runs/
+/artifacts/
+/tmp/
+
+# Local development configuration
+/.idea/
+.env
+.env.*
+
+# Local databases and secrets
+*.sqlite
+*.sqlite3
+*.db
+*.key
