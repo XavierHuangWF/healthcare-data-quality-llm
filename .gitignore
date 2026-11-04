@@ -242,3 +242,8 @@ __marimo__/
 *.sqlite3
 *.db
 *.key
+
+
+/models/
+
+data/decision_memory/
