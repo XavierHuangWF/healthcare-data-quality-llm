@@ -147,7 +147,10 @@ if (
 ):
     st.session_state.pop("audit_result", None)
 
-    with st.spinner("AI agent is investigating the dataset..."):
+    with st.spinner(
+            "AI agent is investigating the dataset...",
+            show_time=True,
+    ):
         try:
             audit = run_initial_audit(
                 st.session_state.upload_path
