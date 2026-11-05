@@ -15,7 +15,7 @@ from ..duplicate_validation import (
 
 from .microbiome import observe_matrix_structure
 from .context import STRUCTURE_CONTEXT
-
+from .provenance import inspect_provenance
 
 @dataclass(frozen=True)
 class ToolSpec:
@@ -107,6 +107,19 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
             "required": ["positions"],
             "additionalProperties": False,
         },
+    ),
+
+    "inspect_provenance": ToolSpec(
+        description=(
+            "Inspect available dataset-bound provenance documentation. "
+            "Verify the dataset fingerprint and referenced columns. "
+            "Use this tool when investigating duplicate columns "
+            "to determine whether their redundancy is documented. "
+            "Documented lineage is not independent scientific proof "
+            "and does not authorize data modification."
+        ),
+        function=inspect_provenance,
+        requires_context=STRUCTURE_CONTEXT,
     ),
 
     "compare_columns": ToolSpec(

@@ -29,56 +29,12 @@ def main():
     source = args.source
     output = args.output
 
-    keep_position = 105
-    drop_position = 106
 
     if source.resolve() == output.resolve():
         raise ValueError("Cannot overwrite the original dataset")
 
     if output.exists():
         raise FileExistsError(f"Output already exists: {output}")
-
-    comparison = compare_columns(
-        source, keep_position, drop_position
-    )[0]
-
-    if not comparison["identical"]:
-        raise ValueError("Column values are not identical")
-
-    if comparison["left_name"] != comparison["right_name"]:
-        raise ValueError("Column headers are different")
-
-    with source.open(
-        "r", encoding="utf-8-sig", newline=""
-    ) as f:
-        rows = list(csv.reader(f))
-
-    if not rows:
-        raise ValueError("Empty dataset")
-
-    width = len(rows[0])
-
-    if width < drop_position:
-        raise ValueError("Column position exceeds dataset width")
-
-    if any(len(row) != width for row in rows):
-        raise ValueError("Inconsistent row widths")
-
-    keep_index = keep_position - 1
-    drop_index = drop_position - 1
-
-    if any(
-        row[keep_index] != row[drop_index]
-        for row in rows
-    ):
-        raise ValueError("Columns differ at the row level")
-
-    print("Duplicate-column inspection: PASS")
-    print("Original columns:", width)
-    print("Original records:", len(rows) - 1)
-    print("Keep:", keep_position)
-    print("Candidate removal:", drop_position)
-    print("Original dataset will not be modified.")
 
     # New authorization verification
     source_hash = sha256(source)
@@ -107,6 +63,20 @@ def main():
 
     authorization = matches[0]
 
+    keep_position = authorization.get("keep_position")
+    drop_position = authorization.get("drop_position")
+
+    if (
+            type(keep_position) is not int
+            or type(drop_position) is not int
+            or keep_position < 1
+            or drop_position < 1
+            or keep_position == drop_position
+    ):
+        raise PermissionError(
+            "Invalid authorized column positions"
+        )
+
     expected = {
         "source_fingerprint": source_hash,
         "output_path": str(output.resolve()),
@@ -122,6 +92,114 @@ def main():
             raise PermissionError(
                 f"Authorization mismatch: {key}"
             )
+
+    comparison = compare_columns(
+        source, keep_position, drop_position
+    )[0]
+
+    if not comparison["identical"]:
+        raise ValueError("Column values are not identical")
+
+    if comparison["left_name"] != comparison["right_name"]:
+        raise ValueError("Column headers are different")
+
+    with source.open(
+        "r", encoding="utf-8-sig", newline=""
+    ) as f:
+        rows = list(csv.reader(f))
+
+    if not rows:
+        raise ValueError("Empty dataset")
+
+    width = len(rows[0])
+
+    if width < max(keep_position, drop_position):
+        raise ValueError("Column position exceeds dataset width")
+
+    if any(len(row) != width for row in rows):
+        raise ValueError("Inconsistent row widths")
+
+    keep_index = keep_position - 1
+    drop_index = drop_position - 1
+
+    if any(
+        row[keep_index] != row[drop_index]
+        for row in rows
+    ):
+        raise ValueError("Columns differ at the row level")
+
+    print("Duplicate-column inspection: PASS")
+    print("Original columns:", width)
+    print("Original records:", len(rows) - 1)
+    print("Keep:", keep_position)
+    print("Candidate removal:", drop_position)
+    print("Original dataset will not be modified.")
+
+
+
+
+    # Revalidate human approval immediately before execution.
+    review_id = authorization.get("review_decision_id")
+    proposal_id = authorization.get("proposal_id")
+
+    if not all(
+        isinstance(value, str) and value
+        for value in (review_id, proposal_id)
+    ):
+        raise PermissionError("Authorization lacks review linkage")
+
+    decisions_path = Path("data/decision_memory/decisions.jsonl")
+
+    if not decisions_path.is_file():
+        raise PermissionError("Review history missing")
+
+    latest_review = None
+
+    with decisions_path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+
+            entry = json.loads(line)
+
+            if (
+                entry.get("dataset_fingerprint") == source_hash
+                and entry.get("proposal_id") == proposal_id
+            ):
+                latest_review = entry
+
+    if (
+        latest_review is None
+        or latest_review.get("decision_id") != review_id
+        or latest_review.get("human_decision") != "accepted"
+    ):
+        raise PermissionError(
+            "Authorization revoked or review superseded"
+        )
+
+    if (
+        latest_review.get("action_kind") != "data_change"
+        or latest_review.get("validation_status")
+        != "needs_human_review"
+        or latest_review.get("target_verified") is not True
+        or latest_review.get("execution_authorized") is not False
+    ):
+        raise PermissionError("Review validation no longer valid")
+
+    target = latest_review.get("target_ref") or {}
+
+    if (
+        target.get("kind") != "column_pair"
+        or target.get("positions")
+        != [keep_position, drop_position]
+        or "identical_columns" not in latest_review.get(
+            "verified_fact_types", []
+        )
+    ):
+        raise PermissionError("Review evidence or target mismatch")
+
+    print("Current human approval verified:", review_id)
+
 
     operation_id = authorization.get("operation_id")
     authorization_id = authorization["authorization_id"]

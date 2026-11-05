@@ -16,15 +16,28 @@ AUTHORIZATION_PATH = Path(
 
 def main():
     parser = argparse.ArgumentParser()
+
+
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--keep-position", type=int, default=105)
+    parser.add_argument("--drop-position", type=int, default=106)
+    parser.add_argument("--decision-id", required=True)
     args = parser.parse_args()
+
 
     source = args.source
     output = args.output
 
-    keep_position = 105
-    drop_position = 106
+    keep_position = args.keep_position
+    drop_position = args.drop_position
+
+    if (
+            keep_position < 1
+            or drop_position < 1
+            or keep_position == drop_position
+    ):
+        raise ValueError("Invalid column positions")
 
     if source.resolve() == output.resolve():
         raise ValueError("Cannot overwrite source dataset")
@@ -44,6 +57,96 @@ def main():
 
     source_hash = fingerprint_dataset(source)
 
+
+    decisions_path = Path(
+        "data/decision_memory/decisions.jsonl"
+    )
+
+    if not decisions_path.is_file():
+        raise PermissionError("Human review history not found")
+
+    with decisions_path.open(encoding="utf-8") as f:
+        matches = [
+            json.loads(line)
+            for line in f
+            if line.strip()
+            and json.loads(line).get("decision_id")
+            == args.decision_id
+        ]
+
+    if len(matches) != 1:
+        raise PermissionError(
+            "Review decision not found or duplicated"
+        )
+
+    decision = matches[0]
+
+    if decision.get("dataset_fingerprint") != source_hash:
+        raise PermissionError("Review decision dataset mismatch")
+
+    if decision.get("human_decision") != "accepted":
+        raise PermissionError("Proposal was not accepted")
+
+    if decision.get("action_kind") != "data_change":
+        raise PermissionError("Not a data-change proposal")
+
+    if decision.get("validation_status") != "needs_human_review":
+        raise PermissionError("Invalid proposal validation status")
+
+    if decision.get("target_verified") is not True:
+        raise PermissionError("Target was not verified")
+
+    if decision.get("execution_authorized") is not False:
+        raise PermissionError("Unexpected execution authorization")
+
+    target = decision.get("target_ref") or {}
+
+    if (
+        target.get("kind") != "column_pair"
+        or target.get("positions") != [keep_position, drop_position]
+    ):
+        raise PermissionError("Review target does not match operation")
+
+    if "identical_columns" not in decision.get(
+        "verified_fact_types", []
+    ):
+        raise PermissionError(
+            "Required duplicate-column evidence missing"
+        )
+
+    proposal_id = decision.get("proposal_id")
+
+    if not isinstance(proposal_id, str) or not proposal_id:
+        raise PermissionError("Missing proposal ID")
+
+
+    latest_decision = None
+
+    with decisions_path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+
+            entry = json.loads(line)
+
+            if (
+                entry.get("dataset_fingerprint") == source_hash
+                and entry.get("proposal_id") == proposal_id
+            ):
+                latest_decision = entry
+
+    if (
+        latest_decision is None
+        or latest_decision.get("decision_id") != args.decision_id
+    ):
+        raise PermissionError(
+            "Review decision has been superseded"
+        )
+
+
+    print("Prior accepted review verified:", args.decision_id)
+
+
     print("\nPROPOSED REMEDIATION")
     print("Operation: drop_duplicate_column")
     print("Keep column:", keep_position)
@@ -62,11 +165,15 @@ def main():
         print("DEFERRED: Reviewer and evidence required")
         return
 
+    confirmation_phrase = (
+        f"AUTHORIZE DROP {drop_position} TO COPY"
+    )
+
     confirmation = input(
-        "\nType AUTHORIZE DROP 106 TO COPY: "
+        f"\nType {confirmation_phrase}: "
     ).strip()
 
-    if confirmation != "AUTHORIZE DROP 106 TO COPY":
+    if confirmation != confirmation_phrase:
         print("DEFERRED: Authorization not granted")
         return
 
@@ -76,6 +183,8 @@ def main():
     record = {
         "authorization_id": str(uuid4()),
         "operation_id": str(uuid4()),
+        "review_decision_id": args.decision_id,
+        "proposal_id": proposal_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source_fingerprint": source_hash,
         "output_path": str(output.resolve()),

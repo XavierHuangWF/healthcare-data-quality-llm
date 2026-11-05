@@ -34,6 +34,45 @@ def validate_remediation_proposals(
             for evidence_id in evidence_ids:
                 entry = evidence_index[evidence_id]
 
+
+                if entry["tool"] == "inspect_provenance":
+                    observation = entry["observation"]
+
+                    if not isinstance(observation, dict):
+                        continue
+
+                    positions = observation.get("positions")
+
+                    if (
+                        observation.get("status")
+                        == "dataset_binding_verified"
+                        and observation.get("evidence_type")
+                        == "documented_column_lineage"
+                        and observation.get("source_type")
+                        == "synthetic_fixture"
+                        and observation.get("documented_redundancy") is True
+                        and observation.get(
+                            "independent_semantic_verification"
+                        ) is False
+                        and observation.get("execution_authorized") is False
+                        and isinstance(positions, list)
+                        and len(positions) == 2
+                        and all(
+                            type(p) is int and p >= 1
+                            for p in positions
+                        )
+                        and positions[0] != positions[1]
+                    ):
+                        verified_facts.append({
+                            "fact_type": "documented_column_lineage",
+                            "positions": positions,
+                            "evidence_id": evidence_id,
+                            "source_type": "synthetic_fixture",
+                        })
+
+                    continue
+
+
                 if entry["tool"] != "compare_columns":
                     continue
 
@@ -80,6 +119,45 @@ def validate_remediation_proposals(
         )
 
 
+        operation = proposal.get("operation")
+        operation_supported = False
+
+        if (
+            proposal.get("action_kind") == "data_change"
+            and isinstance(operation, dict)
+            and operation.get("kind") == "drop_duplicate_column"
+        ):
+            keep = operation.get("keep_position")
+            drop = operation.get("drop_position")
+
+            if (
+                type(keep) is int
+                and type(drop) is int
+                and keep >= 1
+                and drop >= 1
+                and keep != drop
+                and target_verified
+                and target_ref["positions"] == [keep, drop]
+            ):
+                comparison_verified = any(
+                    fact["fact_type"] == "identical_columns"
+                    and sorted(fact["positions"])
+                    == sorted([keep, drop])
+                    for fact in verified_facts
+                )
+
+                lineage_verified = any(
+                    fact["fact_type"] == "documented_column_lineage"
+                    and fact["positions"] == [keep, drop]
+                    and fact["source_type"] == "synthetic_fixture"
+                    for fact in verified_facts
+                )
+
+                operation_supported = (
+                    comparison_verified and lineage_verified
+                )
+
+
         validated.append({
             **proposal,
             "execution_authorized": False,
@@ -88,13 +166,23 @@ def validate_remediation_proposals(
                 "unknown_evidence_ids": unknown_ids,
                 "action_kind_valid": action_valid,
                 "claim_support_verified": False,
+                "operation_supported": operation_supported,
                 "target_verified": target_verified,
                 "verified_facts": verified_facts,
+
                 "status": (
                     "needs_human_review"
-                    if references_valid and action_valid
+                    if (
+                        references_valid
+                        and action_valid
+                        and (
+                            proposal.get("action_kind") == "investigation"
+                            or operation_supported
+                        )
+                    )
                     else "rejected"
                 ),
+
             },
         })
 

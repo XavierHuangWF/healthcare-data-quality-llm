@@ -97,3 +97,105 @@ assert validated["validation"]["target_verified"] is False
 assert validated["execution_authorized"] is False
 
 print("INCORRECT TARGET REJECTION: PASS")
+
+
+
+from pathlib import Path
+from healthcare_data_quality.remediation_validator import (
+    validate_remediation_proposals,
+)
+
+poc_path = Path("/tmp/poc_with_provenance.json")
+
+if poc_path.is_file():
+    import json
+
+    poc = json.loads(poc_path.read_text(encoding="utf-8"))
+
+    validated = validate_remediation_proposals(
+        history=poc["history"],
+        proposals=poc["remediation"]["proposals"],
+    )
+
+    assert len(validated) == 1
+
+    proposal = validated[0]
+    validation = proposal["validation"]
+
+    facts = {
+        fact["fact_type"]: fact
+        for fact in validation["verified_facts"]
+    }
+
+    assert "identical_columns" in facts
+    assert "documented_column_lineage" in facts
+
+    assert facts["identical_columns"]["positions"] == [2, 4]
+    assert facts["documented_column_lineage"]["positions"] == [2, 4]
+
+    assert facts["documented_column_lineage"]["source_type"] == (
+        "synthetic_fixture"
+    )
+
+    assert validation["target_verified"] is True
+    assert validation["status"] == "needs_human_review"
+    assert validation["claim_support_verified"] is False
+    assert proposal["execution_authorized"] is False
+
+    print("GEMMA STRUCTURAL EVIDENCE: PASS")
+    print("GEMMA DOCUMENTED LINEAGE: PASS")
+    print("HUMAN APPROVAL SAFETY: PASS")
+
+
+# Reject removal of the source column instead of its documented duplicate.
+reverse_history = [
+    {
+        "step": 1,
+        "tool": "compare_columns",
+        "observations": [{
+            "left_position": 2,
+            "right_position": 4,
+            "identical": True,
+            "one_missing": 0,
+            "conflicting_nonmissing": 0,
+        }],
+    },
+    {
+        "step": 2,
+        "tool": "inspect_provenance",
+        "observations": [{
+            "status": "dataset_binding_verified",
+            "evidence_type": "documented_column_lineage",
+            "source_type": "synthetic_fixture",
+            "positions": [2, 4],
+            "documented_redundancy": True,
+            "independent_semantic_verification": False,
+            "execution_authorized": False,
+        }],
+    },
+]
+
+reverse_proposal = {
+    "action_kind": "data_change",
+    "target_ref": {
+        "kind": "column_pair",
+        "positions": [4, 2],
+    },
+    "operation": {
+        "kind": "drop_duplicate_column",
+        "keep_position": 4,
+        "drop_position": 2,
+    },
+    "evidence_ids": ["T1.O1", "T2.O1"],
+}
+
+reverse_result = validate_remediation_proposals(
+    reverse_history,
+    [reverse_proposal],
+)[0]
+
+assert reverse_result["validation"]["operation_supported"] is False
+assert reverse_result["validation"]["status"] == "rejected"
+assert reverse_result["execution_authorized"] is False
+
+print("REVERSED COLUMN REMOVAL REJECTED: PASS")
