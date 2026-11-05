@@ -63,6 +63,101 @@ PYTHONPATH=src python scripts/run_investigation.py \
 
 Replace the example CSV path with a dataset you are authorized to use. Never commit real patient/research data, derived copies, or private decision-memory logs. The CLI currently has a limited investigation-step budget; valid JSON does not imply full coverage.
 
+
+### Run a customer's dataset — current and future workflows
+
+The backend is designed to accept unfamiliar scientific CSV datasets without requiring dataset-specific Python modifications.
+
+#### Current workflow — implemented
+
+Start the local Gemma server in Terminal A.
+
+From the project root in Terminal B:
+
+```bash
+source /home/xavier/.venv/bin/activate
+
+DATASET="/mnt/c/Users/Xavier/Downloads/customer_data.csv"
+
+PYTHONPATH=src python scripts/run_investigation.py \
+  "$DATASET" \
+  > /tmp/hdq_customer_audit.json
+
+python -m json.tool /tmp/hdq_customer_audit.json | less
+```
+
+The current implementation:
+- Profiles the dataset and invokes LLM-selected read-only tools.
+- Collects tool observations and evidence-backed findings.
+- Identifies unresolved questions.
+- Generates and validates remediation proposals.
+- Writes investigation results to JSON.
+- Does not modify the source dataset.
+
+To review the proposals:
+
+```bash
+PYTHONPATH=src python scripts/review_proposals.py \
+  /tmp/hdq_customer_audit.json \
+  "$DATASET"
+```
+
+This records Accept / Reject / Defer decisions in persistent decision memory.
+
+IMPORTANT: Human review does not authorize or execute cleaning. Supported cleaning operations currently require additional authorization, execution, and independent verification steps.
+
+#### Target workflow — NOT YET IMPLEMENTED
+
+The final customer-facing CLI should require only one command:
+
+```bash
+PYTHONPATH=src python scripts/run_workflow.py \
+  --input "/path/to/customer_data.csv" \
+  --interactive
+```
+
+`run_workflow.py` is a proposed entry point and must not be presented as an existing executable.
+
+The unified interactive workflow must:
+
+1. Ingest the customer's dataset and establish its fingerprint.
+2. Automatically execute all applicable baseline data-quality checks.
+3. Run LLM-directed investigations using the existing tool registry.
+4. Track investigation coverage and unresolved evidence gaps.
+5. Attempt further read-only investigation before requesting human input.
+6. Present specific issues, affected records/columns, evidence, uncertainty, and proposed corrections.
+7. Ask the customer for scientific clarification only when needed.
+8. Offer Accept / Reject / Defer for proposals requiring review.
+9. Request separate, explicit authorization before any data-changing operation.
+10. Execute only supported, validated, authorized transformations on a derived copy.
+11. Independently verify the result and preserve the original dataset.
+12. Record decisions, authorizations, executions, and verified outcomes in persistent memory.
+13. Deliver a cleaned dataset, investigation report, and audit trail when applicable.
+
+If an operation is unsupported, evidence is insufficient, or authorization is denied, the system must not execute the change.
+
+The customer should not need to manually run separate Python scripts for review, authorization, cleaning, or verification.
+
+#### Shared backend requirement
+
+The CLI and Streamlit UI must invoke the same workflow controller and backend functions.
+
+- `backend` branch: implement and test the workflow using the terminal.
+- `main` branch: expose the tested workflow through Streamlit.
+
+Do not create separate cleaning, authorization, or memory engines for the two interfaces.
+
+#### Current limitations
+
+- The agent can stop at its configured investigation-step budget.
+- Comprehensive coverage of arbitrary datasets is not established.
+- General-purpose cleaning operations are not yet implemented.
+- Only the currently supported remediation operations may execute.
+- A successful investigation does not imply the dataset has been cleaned.
+
+The unified interactive workflow is the next major backend development milestone.
+
+
 ### Terminal B — Start the Streamlit UI instead
 
 ```bash
