@@ -1,4 +1,3 @@
-
 import json
 from pathlib import Path
 
@@ -7,26 +6,33 @@ from .llm_client import query_local_model
 from .tools.registry import TOOL_REGISTRY, describe_tools, execute_tool
 from .profile_summary import select_profile
 from .investigation_report import summarize_investigation
-
+from collections.abc import Callable
 
 
 def run_investigation(
-    path: Path,
-    max_steps: int = 4,
-    verified_contexts: set[str] | None = None,
-    user_request: str = "",
+        path: Path,
+        max_steps: int = 4,
+        verified_contexts: set[str] | None = None,
+        user_request: str = "",
+        progress_callback: Callable[[str], None] | None = None,
 ) -> dict:
-
     if verified_contexts is None:
         verified_contexts = set()
 
     if max_steps < 1:
         raise ValueError("max_steps must be positive")
 
+    def notify(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+
+    notify("Profiling dataset structure...")
     profile = select_profile(profile_csv(path))
     history = []
+    notify("Dataset profiling completed.")
 
     def finish(status: str, reason: str | None = None) -> dict:
+        notify("Summarizing investigation evidence with Gemma...")
         report = (
             summarize_investigation(history)
             if history
@@ -45,9 +51,8 @@ def run_investigation(
 
         if reason is not None:
             result["reason"] = reason
-
+        notify(f"Investigation ended: {status}")
         return result
-
 
     for step in range(max_steps):
         used_nonparameterized = {
@@ -65,14 +70,11 @@ def run_investigation(
             }
             for name, spec in TOOL_REGISTRY.items()
             if spec.requires_context in verified_contexts
-            and name not in used_nonparameterized
+               and name not in used_nonparameterized
         }
-
-
 
         if not available:
             return finish("tools_exhausted")
-
 
         argument_properties = {
             key: {
@@ -103,7 +105,6 @@ def run_investigation(
             "required": ["action", "arguments", "reason"],
             "additionalProperties": False,
         }
-
 
         prompt = f"""
 You are investigating an unfamiliar scientific dataset.
@@ -171,8 +172,13 @@ Do not interpret numeric values as raw counts without evidence.
 Stop when no further useful investigation is available.
 """
 
-
         for attempt in range(2):
+
+            notify(
+                f"Step {step + 1}/{max_steps}: "
+                "Gemma is selecting the next investigation tool..."
+            )
+
             decision = json.loads(
                 query_local_model(prompt, json_schema=schema)
             )
@@ -180,18 +186,14 @@ Stop when no further useful investigation is available.
             action = decision["action"]
             arguments = decision["arguments"]
 
-
             if action == "stop":
                 return finish(
                     "model_stopped",
                     decision["reason"],
                 )
 
-
             if action not in available:
                 raise ValueError(f"Unauthorized tool: {action}")
-
-
 
             inspected_positions = set()
 
@@ -230,24 +232,28 @@ Stop when no further useful investigation is available.
             if not repeated:
                 break
 
-
             prompt += (
-                "\nRejected tool selection: "
-                + json.dumps({
-                    "action": action,
-                    "arguments": arguments,
-                })
-                + f"\nAlready inspected positions: "
-                  f"{sorted(inspected_positions)}."
-                + "\nAvoid previously inspected columns and "
-                  "identical tool calls. Choose new evidence, "
-                  "a different tool, or stop."
+                    "\nRejected tool selection: "
+                    + json.dumps({
+                "action": action,
+                "arguments": arguments,
+            })
+                    + f"\nAlready inspected positions: "
+                      f"{sorted(inspected_positions)}."
+                    + "\nAvoid previously inspected columns and "
+                      "identical tool calls. Choose new evidence, "
+                      "a different tool, or stop."
             )
 
 
 
         else:
             return finish("no_new_action")
+
+        notify(
+            f"Step {step + 1}/{max_steps}: "
+            f"Running {action}..."
+        )
 
         observations = execute_tool(
             action,
@@ -262,6 +268,11 @@ Stop when no further useful investigation is available.
             "arguments": arguments,
             "reason": decision["reason"],
             "observations": observations,
+
         })
+        notify(
+            f"Step {step + 1}/{max_steps}: "
+            f"{action} completed; observations recorded."
+        )
 
     return finish("max_steps_reached")

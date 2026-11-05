@@ -12,6 +12,9 @@ from healthcare_data_quality.remediation_proposal import generate_remediation_pr
 from healthcare_data_quality.remediation_validator import validate_remediation_proposals
 from healthcare_data_quality.decision_memory import get_decision_context
 
+def terminal_progress(message: str) -> None:
+    print(f"[Agent] {message}", file=sys.stderr, flush=True)
+
 if __name__ == "__main__":
     dataset_path = Path(sys.argv[1])
     ingestion_report = inspect_headers(dataset_path)
@@ -22,6 +25,7 @@ if __name__ == "__main__":
         path=dataset_path,
         max_steps=4,
         verified_contexts=verified_contexts,
+        progress_callback=terminal_progress,
     )
 
     result["ingestion"] = ingestion_report
