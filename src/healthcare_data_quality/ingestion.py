@@ -3,7 +3,7 @@ from collections import defaultdict
 from pathlib import Path
 
 
-def inspect_headers(path: Path) -> None:
+def inspect_headers(path: Path) -> dict:
     with path.open("r", encoding="utf-8-sig", newline="") as file:
         reader = csv.reader(file)
         headers = next(reader)
@@ -22,21 +22,7 @@ def inspect_headers(path: Path) -> None:
     for column_number, header in enumerate(headers, start=1):
         positions[header].append(column_number)
 
-    print(f"Total columns: {len(headers)}")
-    print(f"Data rows: {row_count}")
-    print(f"Ragged records: {len(ragged_records)}")
 
-    for record_number, field_count in ragged_records:
-        print(
-            f"Record {record_number}: "
-            f"expected {len(headers)} fields, found {field_count}"
-        )
-
-    print(f"Blank header positions: {positions.get('', [])}")
-
-    for header, columns in positions.items():
-        if len(columns) > 1:
-            print(f"Duplicate header: {header!r}, columns: {columns}")
 
     return {
         "path": str(path),
@@ -54,6 +40,9 @@ def inspect_headers(path: Path) -> None:
 
 
 if __name__ == "__main__":
+    import json
     import sys
 
-    inspect_headers(Path(sys.argv[1]))
+    result = inspect_headers(Path(sys.argv[1]))
+    print(json.dumps(result, indent=2))
+

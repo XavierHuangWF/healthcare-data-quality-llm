@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from healthcare_data_quality.agent_loop import run_investigation
+from healthcare_data_quality.ingestion import inspect_headers
 
 from healthcare_data_quality.investigation_report import summarize_investigation
 
@@ -13,6 +14,7 @@ from healthcare_data_quality.decision_memory import get_decision_context
 
 if __name__ == "__main__":
     dataset_path = Path(sys.argv[1])
+    ingestion_report = inspect_headers(dataset_path)
 
     verified_contexts = verify_contexts(dataset_path)
 
@@ -21,6 +23,8 @@ if __name__ == "__main__":
         max_steps=4,
         verified_contexts=verified_contexts,
     )
+
+    result["ingestion"] = ingestion_report
 
     if result["history"]:
 
