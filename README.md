@@ -4,9 +4,9 @@
 
 > **Personal developer notes (not secret).** These commands are my fast reference for launching and testing this project in **WSL Ubuntu** from the **single** PyCharm project folder. They are not the end-user setup instructions. **If this README is committed to a public GitHub repository, these notes will be public too; put secrets and truly private configuration in an ignored local file instead.** All model inference is local; the Streamlit page is a **local web UI**, not an Internet-hosted service. See the detailed sections below for prerequisites, permission safeguards, and troubleshooting.
 
-**Project root (WSL):** `/mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm`  
-**Existing Python environment:** `/home/xavier/.venv`  
-**Local model API:** `http://127.0.0.1:8000` · **Streamlit UI:** `http://127.0.0.1:8501`  
+**Project root (WSL):** `/mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm`
+**Existing Python environment:** `/home/xavier/.venv`
+**Local model API:** `http://127.0.0.1:8000` · **Streamlit UI:** `http://127.0.0.1:8501`
 **Git branches:** `backend` = agent/kernel/CLI; `main` = UI + tested backend. **Same folder, switch branches**; do not create another project directory.
 
 
@@ -144,7 +144,7 @@ This records Accept / Reject / Defer decisions in persistent decision memory.
 
 IMPORTANT: Human review does not authorize or execute cleaning. Supported cleaning operations currently require additional authorization, execution, and independent verification steps.
 
-#### Unified interactive backend — IMPLEMENTED, END-TO-END VALIDATION PENDING
+#### Unified interactive backend — SYNTHETIC END-TO-END VALIDATED
 
 The final customer-facing CLI should require only one command:
 
@@ -161,9 +161,7 @@ evidence-grounded proposals, human review, R draft generation,
 Bubblewrap-isolated synthetic verification, separate authorization,
 supported remediation, and audit recording.
 
-Individual components and authorization gates have passed targeted
-tests. The complete interactive workflow still requires an end-to-end
-integration test using a synthetic dataset.
+Individual components and authorization gates have passed targeted tests. The complete interactive CLI workflow also passed an end-to-end integration test on a documented synthetic dataset with 80 records.
 
 Synthetic verification does not establish scientific correctness
 or authorize changes to customer data.
@@ -188,6 +186,56 @@ If an operation is unsupported, evidence is insufficient, or authorization is de
 
 The customer should not need to manually run separate Python scripts for review, authorization, cleaning, or verification.
 
+
+### End-to-end synthetic validation — 2026-11-07
+
+The `backend` branch successfully completed one uninterrupted
+interactive CLI workflow using a documented synthetic CSV fixture.
+
+Command:
+
+```bash
+PYTHONPATH=src:scripts python scripts/run_workflow.py \
+  --input data/synthetic/poc_e2e_20261107.csv \
+  --interactive
+```
+
+Validated stages:
+- Baseline auditing and LLM-directed investigation.
+- Evidence-grounded remediation proposal.
+- Human proposal acceptance.
+- Local Gemma R draft generation.
+- Bubblewrap-isolated R synthetic verification.
+- Separate human execution authorization.
+- Authorized duplicate-column removal on a derived copy.
+- Independent post-remediation verification.
+- Persistent verified-outcome recording.
+
+Observed results:
+- 80 of 80 records preserved.
+- Columns reduced from 4 to 3.
+- Duplicate column 4 removed; column 2 retained.
+- Original dataset unchanged.
+- Technical verification: passed.
+- Verified outcome recorded: true.
+- Semantic verification: not_established.
+
+Architecture:
+- Generated R code was executed only against isolated synthetic data.
+- Actual remediation used the supported deterministic cleaning executor.
+- This test does not establish safe arbitrary R execution.
+
+Limitations:
+- Validated on one synthetic duplicate-column fixture.
+- Does not establish scientific correctness on unfamiliar datasets.
+- General-purpose cleaning operations remain incomplete.
+- Additional failure-path and dataset-diversity testing is required.
+
+Next milestone:
+Integrate the validated shared backend workflow into the
+Streamlit UI on `main`, without duplicating the workflow engine.
+
+
 #### Shared backend requirement
 
 The CLI and Streamlit UI must invoke the same workflow controller and backend functions.
@@ -205,9 +253,7 @@ Do not create separate cleaning, authorization, or memory engines for the two in
 - Only the currently supported remediation operations may execute.
 - A successful investigation does not imply the dataset has been cleaned.
 
-Next milestone: complete synthetic end-to-end backend validation,
-then integrate the verified shared backend with the Streamlit UI
-on the main branch.
+Next milestone: integrate the synthetic-validated shared backend workflow into the Streamlit UI on the main branch. Broader dataset coverage and failure-path testing remain necessary.
 
 
 ### Terminal B — Start the Streamlit UI instead
@@ -456,7 +502,7 @@ The project uses **one Git repository and one working folder** with separate `ba
 | Cross-dataset subject-ID matching | **Partial utility available** | Direct Python module exists, but is not yet a comprehensive multi-upload agent workflow |
 | Taxonomy/microbiome checks | **Partial utilities available** | Some checks are implemented; agent registration/coverage remains limited |
 | General metadata cleaning / record merging | **Not yet complete** | Detection and hypotheses must not be represented as safe merge authorization |
-| R script generation and R execution | **Planned** | Named in project objectives; not demonstrated in current Python execution path |
+| R script generation and R execution | **Implemented, synthetic-only, and clarify** |Local Gemma generates R cleaning drafts; Bubblewrap-isolated R execution verifies supported transformations against synthetic fixtures. Arbitrary generated R execution on customer data is not supported. |
 | Multi-user SaaS security / compliance | **Not implemented** | No claim of HIPAA compliance, tenant isolation, or production readiness |
 
 ### A critical interpretation rule
@@ -1284,9 +1330,9 @@ This roadmap separates working prototypes from required engineering work. It doe
 
 This README expands the project's original five objectives and development approach while documenting the current Python CLI and Streamlit prototypes. The initial README described work in Python and R; the **reviewed executable code is primarily Python**, with R-based cleaning still an objective rather than a demonstrated feature.
 
-**Maintainer:** Xavier Huang  
-**GitHub:** [XavierHuangWF](https://github.com/XavierHuangWF)  
-**Project repository:** [healthcare-data-quality-llm](https://github.com/XavierHuangWF/healthcare-data-quality-llm)  
+**Maintainer:** Xavier Huang
+**GitHub:** [XavierHuangWF](https://github.com/XavierHuangWF)
+**Project repository:** [healthcare-data-quality-llm](https://github.com/XavierHuangWF/healthcare-data-quality-llm)
 **Contact:** william.techlover@gmail.com
 
 When updating this document, prefer **verified functionality and exact commands** over aspirational claims. Distinguish tested, partially implemented, and planned features; never include confidential dataset names, contents, private paths, patient information, model credentials, or customer evidence in public documentation.

@@ -87,6 +87,14 @@ Instructions:
 - The function must accept a data frame and return
   a transformed data frame.
 - Use base R only.
+- Column positions in the proposal are 1-based physical CSV column positions.
+- R data.frame column indexing is also 1-based.
+- Use keep_position and drop_position directly as R column indices.
+- NEVER add 1 to or subtract 1 from these proposal positions.
+- When duplicate column names exist, select columns by numeric position, not by name.
+- For drop_duplicate_column, remove exactly drop_position and preserve every other column.
+- Preserve the data.frame structure with drop=FALSE when subsetting columns.
+- Do not infer zero-based indexing from Python or JSON conventions.
 - Do not include filesystem access, network access,
   system commands, dynamic evaluation, or package installation.
 - Keep the transformation focused and concise.

@@ -2,11 +2,11 @@ from pathlib import Path
 import json
 
 from healthcare_data_quality.cleaning_codegen import draft_r_transformation
-
+from healthcare_data_quality.r_verification import verify_duplicate_column_draft
 
 def main():
     report = max(
-        Path("data/reports").glob("dirtyL7PVDforXav_*_audit.json"),
+        Path("data/reports").glob("poc_e2e_20261107_*_audit.json"),
         key=lambda path: path.stat().st_mtime,
     )
 
@@ -39,12 +39,7 @@ def main():
     draft = draft_r_transformation(
         proposal=proposal,
         evidence=evidence,
-        reviewer_context=(
-            "The reviewer cannot verify the meaning of the "
-            "duplicate columns. Their scientific provenance "
-            "is currently unknown. Preserve both columns "
-            "unless sufficient evidence supports removal."
-        ),
+        reviewer_context="",
 
     )
 
@@ -53,6 +48,24 @@ def main():
     print("Assumptions:", draft["assumptions"])
     print("Question:", draft["review_question"])
     print("R draft length:", len(draft["r_function"]))
+    print("\nGenerated R function:\n", draft["r_function"])
+    if draft["status"] != "draft_ready":
+        raise RuntimeError(
+            f"R draft is not ready: {draft['status']}"
+        )
+
+    operation = proposal["operation"]
+
+    verification = verify_duplicate_column_draft(
+        r_function=draft["r_function"],
+        keep_position=operation["keep_position"],
+        drop_position=operation["drop_position"],
+    )
+
+    assert verification["status"] == "verified"
+
+    print("R SYNTHETIC REGRESSION: PASS")
+    print("Verification:", verification)
     print("Verification plan:", draft["verification_plan"])
     print("\nNO CODE EXECUTED. ORIGINAL DATA PRESERVED.")
 
