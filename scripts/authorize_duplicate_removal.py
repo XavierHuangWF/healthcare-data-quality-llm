@@ -138,6 +138,17 @@ def authorize_duplicate_removal(
     print("Output:", output.resolve())
     print("Original dataset will be preserved.")
     print("Semantic equivalence is NOT independently verified.")
+    print(
+        "\nSEPARATE EXECUTION AUTHORIZATION"
+        "\n  Reviewer ID       - Identify the person authorizing this operation."
+        "\n  Evidence reference - Identify documentation supporting the proposed change."
+        "\n  Confirmation       - Explicitly authorize the specified column removal."
+        "\n"
+        "\n  Accepting a proposal does NOT authorize execution."
+        "\n  Synthetic verification does NOT prove scientific correctness."
+        "\n  Authorization creates a derived copy; the original is preserved."
+        "\n  Leave a required field blank to defer authorization."
+    )
 
     reviewer = input("\nReviewer ID: ").strip()
     evidence = input(

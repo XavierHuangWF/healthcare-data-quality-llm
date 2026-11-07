@@ -128,6 +128,17 @@ def review_interactively(
                 continue
 
         while True:
+
+            print(
+                "\nAvailable actions:"
+                "\n  [C] Clarify - Provide additional context and reconsider the proposal."
+                "\n  [A] Accept  - Accept the proposal for further validation; does NOT authorize execution."
+                "\n  [R] Reject  - Reject the proposal; no cleaning will occur."
+                "\n  [D] Defer   - Postpone the decision; no cleaning will occur."
+                "\n  [S] Skip    - Skip this proposal without recording a decision."
+                "\n  [Q] Quit    - End the review session."
+            )
+
             choice = input(
                 "\n[C]larify / [A]ccept / [R]eject / "
                 "[D]efer / [S]kip / [Q]uit: "

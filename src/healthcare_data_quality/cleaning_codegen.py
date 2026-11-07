@@ -93,6 +93,13 @@ Instructions:
 - Explain assumptions and how the output must be verified.
 - This is a draft only. Do not execute code.
 
+- Draft generation and execution authorization are separate stages.
+- execution_authorized=false does not prohibit drafting R code.
+- claim_support_verified=false does not automatically prohibit drafting; clearly disclose unresolved scientific uncertainty.
+- Generate a draft only when verified evidence supports a specific transformation without guessing.
+- Return needs_clarification if uncertainty prevents specifying a defensible transformation, not merely because execution approval is pending.
+- Never execute a transformation or claim that drafting grants execution permission.
+
 - Follow documented customer requirements.
 - Distinguish documented correction instructions from
   independently observed dataset values.

@@ -158,12 +158,7 @@ def main() -> None:
                 draft = draft_r_transformation(
                     proposal=proposal,
                     evidence=evidence_index,
-                    reviewer_context=(
-                            review.get("human_note")
-                            or "No scientific confirmation supplied. "
-                               "Preserve uncertain data and request "
-                               "clarification rather than guessing."
-                    ),
+                    reviewer_context=review.get("human_note") or "",
                 )
 
             except (RuntimeError, ValueError) as exc:
@@ -304,6 +299,7 @@ def main() -> None:
                     audit_path=Path(
                         "data/decision_memory/remediation_runs.jsonl"
                     ),
+                    operation_id=audit["operation_id"],
                 )
 
                 recorded = record_verified_outcome(
