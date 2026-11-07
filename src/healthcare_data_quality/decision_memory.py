@@ -8,6 +8,10 @@ from uuid import uuid4
 
 DECISIONS_PATH = Path("data/decision_memory/decisions.jsonl")
 
+CLARIFICATIONS_PATH = Path(
+    "data/decision_memory/clarifications.jsonl"
+)
+
 VALID_DECISIONS = {"accepted", "rejected", "deferred"}
 
 
@@ -253,3 +257,45 @@ def get_verified_outcome_context(
             }
 
     return list(outcomes.values())[-limit:]
+
+def record_clarification(
+    dataset_path: Path,
+    original_proposal: dict,
+    revised_proposal: dict,
+    question: str,
+    answer: str,
+    reviewer: str,
+    storage_path: Path = CLARIFICATIONS_PATH,
+) -> dict:
+    if not answer.strip():
+        raise ValueError("Clarification answer is required")
+
+    if not reviewer.strip():
+        raise ValueError("Reviewer ID is required")
+
+    record = {
+        "clarification_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "dataset_fingerprint": fingerprint_dataset(dataset_path),
+        "original_proposal_id": fingerprint_proposal(original_proposal),
+        "revised_proposal_id": fingerprint_proposal(revised_proposal),
+        "reviewer": reviewer,
+        "question": question,
+        "answer": answer,
+        "answer_status": "unverified_reviewer_context",
+        "original_evidence_ids": original_proposal.get(
+            "evidence_ids", []
+        ),
+        "revised_evidence_ids": revised_proposal.get(
+            "evidence_ids", []
+        ),
+        "execution_authorized": False,
+        "execution_status": "not_executed",
+    }
+
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with storage_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return record

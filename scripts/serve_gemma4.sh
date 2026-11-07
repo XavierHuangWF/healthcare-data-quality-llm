@@ -20,7 +20,7 @@ exec "$VLLM" serve "$MODEL_DIR" \
     --served-model-name gemma4-12b \
     --host 127.0.0.1 \
     --port 8000 \
-    --max-model-len 4096 \
+    --max-model-len 8192  \
     --gpu-memory-utilization 0.90 \
     --max-num-seqs 1 \
     --language-model-only \

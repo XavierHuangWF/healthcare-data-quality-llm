@@ -5,8 +5,12 @@ from .investigation_report import build_evidence_index
 def validate_remediation_proposals(
     history: list[dict],
     proposals: list[dict],
+    baseline: dict | None = None,
 ) -> list[dict]:
-    evidence_index = build_evidence_index(history)
+    evidence_index = build_evidence_index(
+        history,
+        baseline=baseline,
+    )
     validated = []
 
     for proposal in proposals:
@@ -175,10 +179,20 @@ def validate_remediation_proposals(
                     if (
                         references_valid
                         and action_valid
+
                         and (
-                            proposal.get("action_kind") == "investigation"
-                            or operation_supported
+                                (
+                                        proposal.get("action_kind") == "investigation"
+
+                                        and (proposal.get("operation") or {}).get("kind", "none") == "none"
+
+                                )
+                                or (
+                                        proposal.get("action_kind") == "data_change"
+                                        and operation_supported
+                                )
                         )
+
                     )
                     else "rejected"
                 ),

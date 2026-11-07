@@ -11,6 +11,7 @@ PROPOSAL_SCHEMA = {
     "properties": {
         "proposals": {
             "type": "array",
+            "maxItems": 3,
             "items": {
                 "type": "object",
                 "properties": {
@@ -42,6 +43,7 @@ PROPOSAL_SCHEMA = {
                         "minItems": 1,
                     },
                     "uncertainty": {"type": "string"},
+                    "review_question": {"type": "string"},
 
                     "action_kind": {
                         "type": "string",
@@ -100,10 +102,15 @@ PROPOSAL_SCHEMA = {
 
 
 def generate_remediation_proposals(
-        history: list[dict],
-        decision_memory: list[dict] | None = None,
+    history: list[dict],
+    decision_memory: list[dict] | None = None,
+    baseline: dict | None = None,
+    clarification: dict | None = None,
 ) -> dict:
-    evidence_index = build_evidence_index(history)
+    evidence_index = build_evidence_index(
+        history,
+        baseline=baseline,
+    )
 
     if not evidence_index:
         return {"proposals": []}
@@ -136,6 +143,19 @@ You are a scientific data-quality remediation agent.
 
 Analyze the verified tool observations below and propose
 appropriate data-cleaning actions.
+
+Generate at most three concise, prioritized proposals.
+
+Prioritize issues that block downstream preprocessing,
+threaten data integrity, or require human clarification.
+
+Group related findings where appropriate.
+Do not generate a separate proposal for every invalid cell,
+taxonomy record, or repeated observation.
+
+Preserve the distinction between confirmed findings and
+unverified explanations. Do not claim the audit is complete.
+
 
 Requirements:
 
@@ -186,6 +206,18 @@ Every proposal must include a structured operation:
 - Every proposal must cite supporting evidence IDs.
 - Distinguish observed facts from hypotheses.
 - Explain uncertainty and missing provenance.
+- For uncertain data, reason about plausible explanations
+  and describe conditional cleaning strategies.
+- Use proposed_action to explain what correction could be
+  performed under each relevant scientific assumption.
+- Use review_question to ask one specific question whose
+  answer would materially change the cleaning decision.
+- Never invent missing scientific facts or assume that
+  invalid numeric values should be replaced with zero.
+- If the evidence is insufficient, retain operation.kind="none"
+  until the uncertainty has been resolved.
+- A reviewer answer must inform a revised proposal; accepting
+  an investigation proposal is not execution authorization.
 - Identical column values do not establish semantic redundancy.
 - Do not claim that any cleaning operation was executed.
 - Do not modify the dataset.
@@ -264,7 +296,43 @@ do not substantiate any actionable data-quality concern.
               "based on prior decisions.\n"
     )
 
-    response = query_local_model(prompt, json_schema=schema)
+    if clarification is not None:
+        original = clarification["proposal"]
+        answer = clarification["answer"].strip()
+
+        if not answer:
+            raise ValueError("Clarification answer cannot be empty")
+
+        schema["properties"]["proposals"]["minItems"] = 1
+        schema["properties"]["proposals"]["maxItems"] = 1
+
+
+        prompt += (
+            "\n\nHUMAN CLARIFICATION — UNVERIFIED CONTEXT:\n"
+            f"Original proposal: {json.dumps(original, ensure_ascii=False)}\n"
+            f"Reviewer answer: {json.dumps(answer, ensure_ascii=False)}\n\n"
+            "Reassess exactly the same data-quality issue.\n"
+            "The reviewer answer is unverified context, not established evidence.\n"
+            "Do not promote reviewer assertions into verified scientific facts.\n"
+            "If the answer is ambiguous, irrelevant, or expresses uncertainty, "
+            "preserve existing uncertainty and verified findings.\n"
+            "If the answer offers a hypothesis, evaluate it against independent "
+            "tool evidence. Do not assume that the hypothesis is correct.\n"
+            "If evidence remains insufficient, propose further investigation "
+            "with operation.kind='none'.\n"
+            "If the answer provides transformation requirements, treat them "
+            "as proposed requirements, not proof of scientific correctness.\n"
+            "Preserve the original issue and relevant evidence IDs.\n"
+            "Generate exactly one revised proposal.\n"
+            "Never execute or authorize cleaning.\n"
+        )
+
+
+    response = query_local_model(
+        prompt,
+        json_schema=schema,
+        max_tokens=4096,
+    )
     result = json.loads(response)
 
     validate(instance=result, schema=schema)

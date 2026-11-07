@@ -9,6 +9,44 @@
 **Local model API:** `http://127.0.0.1:8000` · **Streamlit UI:** `http://127.0.0.1:8501`  
 **Git branches:** `backend` = agent/kernel/CLI; `main` = UI + tested backend. **Same folder, switch branches**; do not create another project directory.
 
+
+### Export my current backend source for ChatGPT review
+
+Run from the project root in the PyCharm WSL terminal.
+
+This packages the **current working files**, including uncommitted code changes, without connecting to GitHub.
+
+```bash
+git branch --show-current
+git status --short
+
+ARCHIVE="/mnt/c/Users/Xavier/Downloads/hdq-backend-source-$(date +%Y%m%d-%H%M%S).zip"
+
+git ls-files --cached --others --exclude-standard -- \
+  src scripts tests app.py README.md .gitignore \
+  | sort -u \
+  | zip -q "$ARCHIVE" -@
+
+python -m zipfile -t "$ARCHIVE"
+python -m zipfile -l "$ARCHIVE"
+
+echo "Source archive: $ARCHIVE"
+```
+
+Upload the resulting ZIP from Windows Downloads to ChatGPT.
+
+**Included:** Source code, scripts, tests, application, README, and Git ignore rules.
+
+**Excluded:** Dataset folders, local models, virtual environments, Git history, and ignored files.
+
+**Important:**
+- The `zip` utility must be installed in WSL.
+- Inspect the archive listing before uploading. Files within the included directories could still contain confidential information.
+- This exports the working tree, unlike `git archive HEAD`, which excludes uncommitted changes.
+- Never include confidential datasets, patient records, credentials, API keys, or private logs.
+- Do not commit or push merely to package code for review.
+
+
 ### Terminal A — Start Gemma / vLLM first (keep running)
 
 ```bash
@@ -106,7 +144,7 @@ This records Accept / Reject / Defer decisions in persistent decision memory.
 
 IMPORTANT: Human review does not authorize or execute cleaning. Supported cleaning operations currently require additional authorization, execution, and independent verification steps.
 
-#### Target workflow — NOT YET IMPLEMENTED
+#### Unified interactive backend — IMPLEMENTED, END-TO-END VALIDATION PENDING
 
 The final customer-facing CLI should require only one command:
 
@@ -116,7 +154,19 @@ PYTHONPATH=src python scripts/run_workflow.py \
   --interactive
 ```
 
-`run_workflow.py` is a proposed entry point and must not be presented as an existing executable.
+scripts/run_workflow.py is the executable interactive backend entry point.
+
+The backend integrates dataset auditing, LLM-directed investigation,
+evidence-grounded proposals, human review, R draft generation,
+Bubblewrap-isolated synthetic verification, separate authorization,
+supported remediation, and audit recording.
+
+Individual components and authorization gates have passed targeted
+tests. The complete interactive workflow still requires an end-to-end
+integration test using a synthetic dataset.
+
+Synthetic verification does not establish scientific correctness
+or authorize changes to customer data.
 
 The unified interactive workflow must:
 
@@ -155,7 +205,9 @@ Do not create separate cleaning, authorization, or memory engines for the two in
 - Only the currently supported remediation operations may execute.
 - A successful investigation does not imply the dataset has been cleaned.
 
-The unified interactive workflow is the next major backend development milestone.
+Next milestone: complete synthetic end-to-end backend validation,
+then integrate the verified shared backend with the Streamlit UI
+on the main branch.
 
 
 ### Terminal B — Start the Streamlit UI instead

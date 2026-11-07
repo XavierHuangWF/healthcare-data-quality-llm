@@ -1,4 +1,3 @@
-
 import argparse
 import json
 from datetime import datetime, timezone
@@ -8,30 +7,18 @@ from uuid import uuid4
 from healthcare_data_quality.decision_memory import fingerprint_dataset
 from healthcare_data_quality.tools.column_inspection import compare_columns
 
-
 AUTHORIZATION_PATH = Path(
     "data/decision_memory/operation_authorizations.jsonl"
 )
 
 
-def main():
-    parser = argparse.ArgumentParser()
-
-
-    parser.add_argument("source", type=Path)
-    parser.add_argument("output", type=Path)
-    parser.add_argument("--keep-position", type=int, default=105)
-    parser.add_argument("--drop-position", type=int, default=106)
-    parser.add_argument("--decision-id", required=True)
-    args = parser.parse_args()
-
-
-    source = args.source
-    output = args.output
-
-    keep_position = args.keep_position
-    drop_position = args.drop_position
-
+def authorize_duplicate_removal(
+        source: Path,
+        output: Path,
+        keep_position: int,
+        drop_position: int,
+        decision_id: str,
+) -> dict | None:
     if (
             keep_position < 1
             or drop_position < 1
@@ -57,7 +44,6 @@ def main():
 
     source_hash = fingerprint_dataset(source)
 
-
     decisions_path = Path(
         "data/decision_memory/decisions.jsonl"
     )
@@ -70,8 +56,8 @@ def main():
             json.loads(line)
             for line in f
             if line.strip()
-            and json.loads(line).get("decision_id")
-            == args.decision_id
+               and json.loads(line).get("decision_id")
+               == decision_id
         ]
 
     if len(matches) != 1:
@@ -102,13 +88,13 @@ def main():
     target = decision.get("target_ref") or {}
 
     if (
-        target.get("kind") != "column_pair"
-        or target.get("positions") != [keep_position, drop_position]
+            target.get("kind") != "column_pair"
+            or target.get("positions") != [keep_position, drop_position]
     ):
         raise PermissionError("Review target does not match operation")
 
     if "identical_columns" not in decision.get(
-        "verified_fact_types", []
+            "verified_fact_types", []
     ):
         raise PermissionError(
             "Required duplicate-column evidence missing"
@@ -118,7 +104,6 @@ def main():
 
     if not isinstance(proposal_id, str) or not proposal_id:
         raise PermissionError("Missing proposal ID")
-
 
     latest_decision = None
 
@@ -130,22 +115,20 @@ def main():
             entry = json.loads(line)
 
             if (
-                entry.get("dataset_fingerprint") == source_hash
-                and entry.get("proposal_id") == proposal_id
+                    entry.get("dataset_fingerprint") == source_hash
+                    and entry.get("proposal_id") == proposal_id
             ):
                 latest_decision = entry
 
     if (
-        latest_decision is None
-        or latest_decision.get("decision_id") != args.decision_id
+            latest_decision is None
+            or latest_decision.get("decision_id") != decision_id
     ):
         raise PermissionError(
             "Review decision has been superseded"
         )
 
-
-    print("Prior accepted review verified:", args.decision_id)
-
+    print("Prior accepted review verified:", decision_id)
 
     print("\nPROPOSED REMEDIATION")
     print("Operation: drop_duplicate_column")
@@ -183,7 +166,7 @@ def main():
     record = {
         "authorization_id": str(uuid4()),
         "operation_id": str(uuid4()),
-        "review_decision_id": args.decision_id,
+        "review_decision_id": decision_id,
         "proposal_id": proposal_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source_fingerprint": source_hash,
@@ -202,7 +185,7 @@ def main():
     )
 
     with AUTHORIZATION_PATH.open(
-        "a", encoding="utf-8"
+            "a", encoding="utf-8"
     ) as f:
         f.write(json.dumps(record) + "\n")
 
@@ -211,6 +194,26 @@ def main():
     print("Operation ID:", record["operation_id"])
     print("Execution status: not_executed")
     print("No dataset changes performed.")
+    return record
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("source", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--keep-position", type=int, default=105)
+    parser.add_argument("--drop-position", type=int, default=106)
+    parser.add_argument("--decision-id", required=True)
+
+    args = parser.parse_args()
+
+    authorize_duplicate_removal(
+        source=args.source,
+        output=args.output,
+        keep_position=args.keep_position,
+        drop_position=args.drop_position,
+        decision_id=args.decision_id,
+    )
 
 
 if __name__ == "__main__":

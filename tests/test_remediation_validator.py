@@ -199,3 +199,33 @@ assert reverse_result["validation"]["status"] == "rejected"
 assert reverse_result["execution_authorized"] is False
 
 print("REVERSED COLUMN REMOVAL REJECTED: PASS")
+
+
+
+# An investigation must never contain an executable operation.
+from copy import deepcopy
+
+control_proposal = deepcopy(reverse_proposal)
+control_proposal["target_ref"]["positions"] = [2, 4]
+control_proposal["operation"]["keep_position"] = 2
+control_proposal["operation"]["drop_position"] = 4
+
+control = validate_remediation_proposals(
+    reverse_history, [control_proposal]
+)[0]
+
+assert control["validation"]["operation_supported"] is True
+
+inconsistent = deepcopy(control_proposal)
+inconsistent["action_kind"] = "investigation"
+
+result = validate_remediation_proposals(
+    reverse_history, [inconsistent]
+)[0]
+
+assert result["validation"]["status"] == "rejected", (
+    result["validation"]
+)
+assert result["execution_authorized"] is False
+
+print("ACTION/OPERATION CONSISTENCY: PASS")
