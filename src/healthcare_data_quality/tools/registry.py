@@ -16,7 +16,7 @@ from ..duplicate_validation import (
 from .microbiome import observe_matrix_structure
 from .context import STRUCTURE_CONTEXT
 from .provenance import inspect_provenance
-
+from ..r_sandbox import run_r_sandbox
 @dataclass(frozen=True)
 class ToolSpec:
     description: str
@@ -30,6 +30,22 @@ class ToolSpec:
         }
     )
 
+def investigate_with_r(path: Path, r_function: str) -> list[dict]:
+    """Execute model-generated R analysis in the isolated sandbox."""
+
+    source_csv = path.read_text(encoding="utf-8-sig")
+
+    observation_csv = run_r_sandbox(
+        r_function=r_function,
+        synthetic_csv=source_csv,
+    )
+
+    return [{
+        "status": "sandbox_executed",
+        "format": "csv",
+        "observations": observation_csv[:8000],
+        "truncated": len(observation_csv) > 8000,
+    }]
 
 TOOL_REGISTRY: dict[str, ToolSpec] = {
     "find_duplicate_ids": ToolSpec(
@@ -145,6 +161,31 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
                 },
             },
             "required": ["left", "right"],
+            "additionalProperties": False,
+        },
+
+    ),
+    "investigate_with_r": ToolSpec(
+        description=(
+            "Generate a dataset-specific read-only R investigation. "
+            "Supply R code defining clean_dataset(input_df). "
+            "The function must return a data.frame containing "
+            "concise investigation findings, not a cleaned dataset. "
+            "Inspect any columns, values, duplicates, distributions, "
+            "or relationships relevant to the current uncertainty. "
+            "Do not modify the source data."
+        ),
+        function=investigate_with_r,
+        requires_context=STRUCTURE_CONTEXT,
+        arguments_schema={
+            "type": "object",
+            "properties": {
+                "r_function": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+            },
+            "required": ["r_function"],
             "additionalProperties": False,
         },
     ),
