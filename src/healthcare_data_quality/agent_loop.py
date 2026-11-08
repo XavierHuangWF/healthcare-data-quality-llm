@@ -52,6 +52,7 @@ def run_investigation(
     }
 
     history = []
+    failed_tool_calls = []
     notify("Dataset profiling completed.")
     saved_tools = []
 
@@ -94,6 +95,7 @@ def run_investigation(
             "status": status,
             "history": history,
             "report": report,
+            "failed_tool_calls": failed_tool_calls,
         }
 
         if reason is not None:
@@ -205,6 +207,14 @@ Do not assume particular column names or dataset semantics.
 
 Previous tool observations:
 {json.dumps(history)}
+
+Failed tool executions (these are NOT valid evidence):
+{json.dumps(failed_tool_calls, ensure_ascii=False)}
+
+If generated R code failed, diagnose the failure and produce a
+corrected function. The clean_dataset(input_df) function must
+return exactly one data.frame, not a list or another R object.
+Do not repeat the same failed code.
 
 Available read-only tools and their argument schemas:
 {json.dumps(available)}
@@ -386,12 +396,45 @@ Stop when no further useful investigation is available.
             f"Running {action}..."
         )
 
-        observations = execute_tool(
-            action,
-            datasets[dataset_id],
-            dataset_contexts[dataset_id],
-            arguments=tool_arguments,
-        )
+        try:
+            observations = execute_tool(
+                action,
+                datasets[dataset_id],
+                dataset_contexts[dataset_id],
+                arguments=tool_arguments,
+            )
+
+        except RuntimeError as exc:
+            if action not in {
+                "investigate_with_r",
+                "reuse_saved_r_investigation",
+            }:
+                raise
+            stderr = getattr(exc.__cause__, "stderr", None)
+
+            diagnostic = (
+                stderr.strip()[-1500:]
+                if isinstance(stderr, str) and stderr.strip()
+                else str(exc)
+            )
+            failed_tool_calls.append({
+                "step": step + 1,
+                "tool": action,
+                "arguments": tool_arguments,
+                "error": diagnostic,
+                "repair_guidance": (
+                    "Check the R syntax and execution contract. "
+                    "clean_dataset(input_df) must return exactly "
+                    "one data.frame, not a list. "
+                    "Revise the R code or select another tool."
+                ),
+            })
+
+            notify(
+                f"Step {step + 1}/{max_steps}: "
+                "R execution failed; Gemma will reconsider."
+            )
+            continue
 
         history.append({
             "step": step + 1,

@@ -9,7 +9,7 @@ MODEL_NAME = "gemma4-12b"
 def query_local_model(
         prompt: str,
         json_schema: dict | None = None,
-        max_tokens: int = 1536,
+        max_tokens: int = 4096,
 ) -> str:
     payload = {
         "model": MODEL_NAME,
