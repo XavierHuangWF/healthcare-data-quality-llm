@@ -53,6 +53,7 @@ def run_investigation(
 
     history = []
     failed_tool_calls = []
+    remaining_evidence = []
     notify("Dataset profiling completed.")
     saved_tools = []
 
@@ -90,12 +91,73 @@ def run_investigation(
                 "recommended_next_step": "No observations collected.",
             }
         )
+        coverage = {
+            "status": "not_assessed",
+            "missing_evidence": [],
+            "reason": "",
+        }
 
+        if user_request.strip():
+            if not history:
+                coverage = {
+                    "status": "incomplete",
+                    "missing_evidence": ["No successful observations collected."],
+                    "reason": "Investigation produced no usable evidence.",
+                }
+            else:
+                coverage_schema = {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["complete", "incomplete", "uncertain"],
+                        },
+                        "missing_evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "reason": {"type": "string"},
+                    },
+                    "required": [
+                        "status",
+                        "missing_evidence",
+                        "reason",
+                    ],
+                    "additionalProperties": False,
+                }
+
+                evidence = [
+                    {
+                        "tool": item["tool"],
+                        "observations": item["observations"],
+                    }
+                    for item in history
+                ]
+
+                coverage = json.loads(
+                    query_local_model(
+                        prompt=(
+                            "Evaluate whether the successful tool observations "
+                            "fully answer the user's investigation request. "
+                            "Use only observed evidence, not tool descriptions, "
+                            "reasoning claims, or failed executions. "
+                            "Check every requested output. Missing, empty, "
+                            "or ambiguous results must not count as complete. "
+                            "Do not invent evidence.\n\n"
+                            f"User request:\n{user_request}\n\n"
+                            f"Successful observations:\n"
+                            f"{json.dumps(evidence, ensure_ascii=False)}"
+                        ),
+                        json_schema=coverage_schema,
+                        max_tokens=800,
+                    )
+                )
         result = {
             "status": status,
             "history": history,
             "report": report,
             "failed_tool_calls": failed_tool_calls,
+            "coverage_assessment": coverage,
         }
 
         if reason is not None:
@@ -170,6 +232,12 @@ You are investigating an unfamiliar scientific dataset.
 
 User's current request:
 {json.dumps(user_request, ensure_ascii=False)}
+ Outstanding evidence requirements from the previous assessment:
+ {json.dumps(remaining_evidence, ensure_ascii=False)}
+
+ If evidence requirements remain unresolved, investigate them
+ before stopping. Generate a new R investigation tool if existing
+ tools cannot collect the required observations.
 
 Use this request to prioritize which data-quality issues
 to investigate and which read-only tools to select.
@@ -296,10 +364,29 @@ Stop when no further useful investigation is available.
             }
 
             if action == "stop":
-                return finish(
+                candidate = finish(
                     "model_stopped",
                     decision["reason"],
                 )
+
+                coverage = candidate["coverage_assessment"]
+
+                if (
+                        coverage["status"] != "complete"
+                        and step + 1 < max_steps
+                ):
+                    remaining_evidence = (
+                            coverage["missing_evidence"]
+                            or [coverage["reason"]]
+                    )
+
+                    notify(
+                        "Investigation incomplete; "
+                        "Gemma will investigate missing evidence."
+                    )
+                    break
+
+                return candidate
 
             if action not in available:
                 raise ValueError(f"Unauthorized tool: {action}")
@@ -390,7 +477,8 @@ Stop when no further useful investigation is available.
 
         else:
             return finish("no_new_action")
-
+        if action == "stop":
+            continue
         notify(
             f"Step {step + 1}/{max_steps}: "
             f"Running {action}..."
