@@ -298,6 +298,8 @@ with TemporaryDirectory() as tmp:
             str(source),
             str(output),
             str(audit_path),
+            "--operation-id",
+            audit["operation_id"],
             "--outcome-log",
             str(workspace / "remediation_outcomes.jsonl"),
         ],

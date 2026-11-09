@@ -203,9 +203,312 @@ def consolidated_qc_release_status(
         return "source_changed"
 
     return "ready"
+def _sha256_file(path: Path) -> str:
+    """Hash a dataset without loading large files into memory."""
+    digest = sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_scientific_recommendations(audit: dict) -> list[dict]:
+    """Create a non-executable, evidence-linked advisory view of proposals.
+
+    This is intentionally NOT an independent scientific correctness verdict.
+    Resolved evidence IDs establish provenance, not whether an LLM's prose
+    is supported by that evidence. The remediation validator retains sole
+    ownership of executable operation eligibility.
+    """
+    evidence = build_evidence_index(
+        audit.get("history") or [],
+        baseline=audit.get("baseline"),
+    )
+    recommendations = []
+
+    for index, proposal in enumerate(audit.get("proposals") or [], start=1):
+        evidence_ids = proposal.get("evidence_ids") or []
+        resolved = [ref for ref in evidence_ids if ref in evidence]
+        unresolved = [ref for ref in evidence_ids if ref not in evidence]
+        citations_resolve = bool(evidence_ids) and not unresolved
+        issue = (proposal.get("issue") or "").strip()
+        method = (proposal.get("proposed_action") or "").strip()
+        advisory_status = (
+            "provisional_for_client_discussion"
+            if citations_resolve and issue and method
+            else "insufficient_documentation"
+        )
+
+        referenced_tools = {evidence[ref].get("tool") for ref in resolved}
+        flags = [
+            "Citations identify source observations; scientific interpretation "
+            "and suitability of the method are not independently verified."
+        ]
+        scope = {"status": "not_evaluated"}
+
+        if "find_invalid_counts" in referenced_tools:
+            numeric = proposal.get("numeric_coverage")
+            if (isinstance(numeric, dict) and
+                    type(numeric.get("total_invalid_cells")) is int and
+                    type(numeric.get("covered_invalid_cells")) is int and
+                    type(numeric.get("uncovered_invalid_cells")) is int):
+                total = numeric["total_invalid_cells"]
+                covered = numeric["covered_invalid_cells"]
+                uncovered = numeric["uncovered_invalid_cells"]
+                if total >= 0 and 0 <= covered <= total and uncovered == total - covered:
+                    scope = {
+                        "status": (
+                            "complete_for_invalid_cells"
+                            if total > 0 and uncovered == 0 else "partial"
+                        ),
+                        "covered_invalid_cells": covered,
+                        "total_invalid_cells": total,
+                        "uncovered_invalid_cells": uncovered,
+                    }
+                else:
+                    scope = {"status": "unverified_numeric_coverage"}
+            else:
+                scope = {"status": "unverified_numeric_coverage"}
+
+            if scope["status"] == "partial":
+                flags.append(
+                    "The proposal covers only part of the observed invalid "
+                    "count cells; it must not be described as dataset-wide QC."
+                )
+            elif scope["status"] == "unverified_numeric_coverage":
+                flags.append(
+                    "The number of invalid count cells covered by this "
+                    "method has NOT been independently established."
+                )
+            flags.append(
+                "Missing counts must not silently become zero; negative and "
+                "fractional counts require scientific source review before "
+                "CLR/rCLR or downstream preprocessing."
+            )
+
+        if "compare_columns" in referenced_tools or "inspect_provenance" in referenced_tools:
+            flags.append(
+                "Matching sample columns do not prove duplicate sample "
+                "identity; confirm specimen IDs and collection provenance "
+                "before dropping any column."
+            )
+
+        if "find_duplicate_taxa" in referenced_tools:
+            flags.append(
+                "Check whether repeated taxon labels represent identical "
+                "features, different assignments, or technical records "
+                "before combining or deleting them."
+            )
+
+        if ({"find_unclassified_species", "inspect_taxonomy_structure",
+             "inspect_taxonomy_naming"} & referenced_tools):
+            flags.append(
+                "Do not invent missing taxonomic classifications or "
+                "silently discard unclassified taxa; require a documented "
+                "reference taxonomy and mapping policy."
+            )
+
+        if unresolved or not evidence_ids:
+            flags.append(
+                "Missing or unknown evidence citations prevent even "
+                "provisional evidence-linked presentation."
+            )
+
+        validation = proposal.get("validation") or {}
+        recommendations.append({
+            "recommendation_id": f"R{index}",
+            "advisory_status": advisory_status,
+            "issue": issue,
+            "suggested_method": method,
+            "rationale": (proposal.get("rationale") or "").strip(),
+            "uncertainty": (proposal.get("uncertainty") or "").strip(),
+            "evidence_ids": list(evidence_ids),
+            "unresolved_evidence_ids": unresolved,
+            "all_evidence_ids_resolve": citations_resolve,
+            "numeric_scope": scope,
+            "scientific_review_flags": flags,
+            "requires_client_review": True,
+            "execution_eligible": validation.get("status") == "needs_human_review",
+            "execution_validator_status": validation.get("status", "unvalidated"),
+            "execution_authorized": False,
+        })
+
+    return recommendations
+
+
+def render_scientific_recommendations_markdown(audit: dict) -> str:
+    """Append a deliberately non-authorizing advisory section to QC report."""
+    recommendations = audit.get("scientific_recommendations") or []
+    lines = [
+        "\n## Provisional scientific recommendations (not execution approval)",
+        "",
+        "These are model-generated suggestions. Resolvable citations do NOT",
+        "establish that a finding or method is scientifically correct.",
+        "The execution validator is a separate safety gate; no cleaning is",
+        "authorized by this report.",
+        "",
+    ]
+    if not recommendations:
+        lines.extend(["No recommendations generated; this does not imply clean data.", ""])
+
+    for recommendation in recommendations:
+        ident = recommendation["recommendation_id"]
+        lines.extend([
+            f"### {ident}: {recommendation['advisory_status']}",
+            "",
+            f"**Issue:** {recommendation['issue']}",
+            "",
+            f"**Method to discuss:** {recommendation['suggested_method']}",
+            "",
+            f"**Uncertainty:** {recommendation['uncertainty'] or 'Not specified'}",
+            "",
+            "**Evidence IDs:** " + ", ".join(map(str, recommendation["evidence_ids"])),
+            "",
+            "**Numeric scope:** `" + json.dumps(recommendation["numeric_scope"], sort_keys=True) + "`",
+            "",
+            f"**Separate execution-validation result:** `{recommendation['execution_validator_status']}`",
+            "",
+            "**Required scientific review:**",
+        ])
+        lines.extend(f"- {flag}" for flag in recommendation["scientific_review_flags"])
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def display_investigation_only_report(
+        audit: dict,
+        datasets: list[Path],
+) -> None:
+    """Present evidence and recommendations without requesting any approval.
+
+    This is a *reporting* boundary: no human review, code generation, R
+    execution, authorization, or remediation is reached by the default CLI.
+    Full evidence, including rejected proposals, remains in the saved JSON.
+    """
+    print("\n" + "=" * 64)
+    print("INVESTIGATION-ONLY CLIENT REHEARSAL")
+    print("=" * 64)
+    print("No R cleaning code will be generated or executed in this mode.")
+    print("No review decisions, execution authorizations, or cleaned outputs")
+    print("will be created. These findings are recommendations, not approval.")
+
+    print("\nDatasets:")
+    for index, dataset in enumerate(datasets, start=1):
+        print(f"  dataset_{index}: {dataset}")
+
+    status = audit.get("status", "unknown")
+    print(f"\nGemma investigation status: {status}")
+    if status == "no_new_action":
+        print("  INCOMPLETE: No further usable investigation action was selected.")
+        print("  This is NOT confirmation that all dataset issues are resolved.")
+    elif status != "complete":
+        print("  Investigation status does not establish full QC coverage.")
+
+    print("\nDeterministic baseline checks (primary dataset only):")
+    checks = audit.get("baseline", {}).get("checks", {})
+    incomplete_checks = []
+    for name, check in checks.items():
+        check_status = check.get("status", "unknown")
+        count = len(check.get("observations", []))
+        print(f"  {name}: {check_status} ({count} observations)")
+        if check_status != "completed":
+            incomplete_checks.append(name)
+        if check.get("downstream_blocked") is True:
+            print("    WARNING: Downstream preprocessing is blocked.")
+        if isinstance(check.get("counts_by_type"), dict):
+            print("    Counts by type:", json.dumps(
+                check["counts_by_type"], ensure_ascii=False, sort_keys=True,
+            ))
+
+    if incomplete_checks:
+        print(f"  COVERAGE GAP: {len(incomplete_checks)} checks not completed.")
+    if len(datasets) > 1:
+        print("  NOTE: Baseline summary above covers dataset_1 only.")
+        print("  Additional dataset profiles/evidence are stored in the audit JSON;")
+        print("  full independent cross-dataset QC is not yet demonstrated.")
+
+    history = audit.get("history", [])
+    print(f"\nEvidence-bearing investigation steps: {len(history)}")
+    print("  Inspect the audit JSON for individual observations and provenance.")
+
+    recommendations = audit.get("scientific_recommendations") or []
+    executable_candidates = sum(
+        recommendation["execution_eligible"]
+        for recommendation in recommendations
+    )
+    print(f"\nScientific recommendations drafted: {len(recommendations)}")
+    print("  These are PROVISIONAL methods for client discussion, not validated cleaning.")
+    print(f"  Separate executable-remediation candidates: {executable_candidates}")
+    print("  A rejected execution proposal can still reference a genuine QC issue.")
+
+    for recommendation in recommendations:
+        print("\n" + "-" * 64)
+        print(
+            f"RECOMMENDATION {recommendation['recommendation_id']} — "
+            f"{recommendation['advisory_status']}"
+        )
+        print("Issue:", recommendation["issue"] or "Not specified")
+        print("Method for discussion:", recommendation["suggested_method"] or "Not specified")
+        print("Model uncertainty:", recommendation["uncertainty"] or "Not specified")
+        print("Evidence IDs:", ", ".join(map(str, recommendation["evidence_ids"])) or "None")
+        print("All cited IDs resolve:", recommendation["all_evidence_ids_resolve"])
+        print("  Resolving citations is NOT the same as confirming the claim.")
+        scope = recommendation["numeric_scope"]
+        if scope.get("status") == "complete_for_invalid_cells":
+            print(
+                "Count-QC scope: ", scope["covered_invalid_cells"], "/",
+                scope["total_invalid_cells"], "observed invalid cells.", sep=""
+            )
+            print("  This alone does not mean the entire dataset is clean.")
+        elif scope.get("status") == "partial":
+            print(
+                "PARTIAL COUNT-QC SCOPE: ", scope["covered_invalid_cells"], "/",
+                scope["total_invalid_cells"], " invalid cells covered; ",
+                scope["uncovered_invalid_cells"], " excluded.", sep=""
+            )
+        elif scope.get("status") == "unverified_numeric_coverage":
+            print("Count-QC scope: NOT independently quantified.")
+
+        print("Client review needed:")
+        for flag in recommendation["scientific_review_flags"]:
+            print("  -", flag)
+        print(
+            "Execution validator (separate):",
+            recommendation["execution_validator_status"],
+        )
+        print("Execution authorized: False")
+
+    error = audit.get("proposal_generation_error")
+    if error:
+        print("\nPROPOSAL GENERATION INCOMPLETE:", error)
+    elif not recommendations:
+        print("\nNo recommendations generated. This does NOT mean the data are clean.")
+
+    print("\nCLIENT DEMO STOP POINT: investigation report and suggestions only.")
+    print("No cleaning attempted and no derived dataset created by this mode.")
+    print("Full baseline details, evidence, and proposal validation: audit JSON.")
+
+
+def _assert_read_only_agent_available() -> None:
+    """Fail closed if File 2 has not been installed in this project."""
+    from inspect import signature
+    from healthcare_data_quality.agent_loop import run_investigation
+
+    parameter = signature(run_investigation).parameters.get(
+        "allow_r_investigation"
+    )
+    if parameter is None or parameter.default is not False:
+        raise RuntimeError(
+            "Investigation-only mode requires the updated "
+            "src/healthcare_data_quality/agent_loop.py (File 2), "
+            "with allow_r_investigation=False by default. "
+            "No investigation was started."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Interactive healthcare data-quality workflow"
+        description="Investigation-first healthcare data-quality workflow"
     )
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument(
@@ -215,11 +518,23 @@ def main() -> None:
         default=[],
         help="Additional dataset for the agent to investigate",
     )
-    parser.add_argument("--interactive", action="store_true")
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Retained for compatibility; investigation-only mode needs no input",
+    )
+    parser.add_argument(
+        "--enable-remediation",
+        action="store_true",
+        help=(
+            "Explicitly enable the legacy human-review/R-draft/execution "
+            "workflow. NOT for investigation-only client rehearsals."
+        ),
+    )
     args = parser.parse_args()
 
-    if not args.interactive:
-        parser.error("--interactive is required")
+    if args.enable_remediation and not args.interactive:
+        parser.error("--interactive is required with --enable-remediation")
 
     if not args.input.is_file():
         parser.error(f"Dataset not found: {args.input}")
@@ -228,11 +543,42 @@ def main() -> None:
         if not dataset.is_file():
             parser.error(f"Additional dataset not found: {dataset}")
 
+    if not args.enable_remediation:
+        _assert_read_only_agent_available()
+
+    datasets = [args.input, *args.dataset]
+    source_hashes = (
+        {p.resolve(): _sha256_file(p) for p in datasets}
+        if not args.enable_remediation else {}
+    )
+
+    if args.enable_remediation:
+        print(
+            "[Agent] WARNING: Legacy remediation enabled explicitly. "
+            "The workflow may generate R and request execution authorization."
+        )
+    else:
+        print("[Agent] Investigation-only mode: execution is disabled.")
+
     result = run_initial_audit(
         args.input,
         progress_callback=terminal_progress,
         additional_datasets=args.dataset,
     )
+
+    if source_hashes:
+        for path, expected_hash in source_hashes.items():
+            if _sha256_file(path) != expected_hash:
+                raise RuntimeError(
+                    f"Dataset changed during investigation: {path}"
+                )
+
+    # Derive a non-executable scientific advisory view before persistence.
+    # Legacy execution proposals and their independent validation are unchanged.
+    if not args.enable_remediation:
+        result["scientific_recommendations"] = (
+            build_scientific_recommendations(result)
+        )
 
     report_dir = Path("data/reports")
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -252,12 +598,23 @@ def main() -> None:
 
     qc_path = report_path.with_suffix(".md")
 
-    qc_path.write_text(
-        render_qc_summary(result),
-        encoding="utf-8",
-    )
+    qc_content = render_qc_summary(result)
+    if not args.enable_remediation:
+        qc_content += render_scientific_recommendations_markdown(result)
+
+    qc_path.write_text(qc_content, encoding="utf-8")
 
     print(f"QC report saved: {qc_path.resolve()}")
+
+    # Fail closed before ALL legacy review, draft-generation, authorization,
+    # sandbox, and data-changing paths. This is the default client demo mode.
+    if not args.enable_remediation:
+        display_investigation_only_report(result, datasets)
+        if result.get("proposal_generation_error"):
+            raise SystemExit(2)
+        return
+
+    # The older execution path is retained but must be explicitly requested.
     offer_tool_memory(result["history"])
     if args.dataset:
         print("\n[Agent] Multi-dataset investigation completed.")

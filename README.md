@@ -1,5 +1,7 @@
 # Healthcare Data Quality LLM
 
+> **Current engineering priority (2026-11-09): investigation-first client POC.** Complete verifiable, dataset-wide QC findings and explainable cleaning recommendations before developing more R generation or executing new R transformations. The existing interactive workflow and sandbox demonstrations are retained as historical/experimental capabilities, **not** the success criterion for the next client meeting. See [Investigation-first roadmap](#development-roadmap-and-acceptance-criteria) and [Client rehearsal blockers](#client-rehearsal-blockers-and-investigation-only-goal).
+
 ## Personal developer quick-start — commands I use most
 
 > **Personal developer notes (not secret).** These commands are my fast reference for launching and testing this project in **WSL Ubuntu** from the **single** PyCharm project folder. They are not the end-user setup instructions. **If this README is committed to a public GitHub repository, these notes will be public too; put secrets and truly private configuration in an ignored local file instead.** All model inference is local; the Streamlit page is a **local web UI**, not an Internet-hosted service. See the detailed sections below for prerequisites, permission safeguards, and troubleshooting.
@@ -57,7 +59,7 @@ source /home/xavier/.venv/bin/activate
 bash scripts/serve_gemma4.sh
 ```
 
-> `scripts/serve_gemma4.sh` is a local launcher seen during development but was **not included in the reviewed source archive**. Confirm that it exists, points at the downloaded local model, and serves the expected OpenAI-compatible API; otherwise use my established vLLM startup command. Do **not** launch a hosted-model service instead. Keep this terminal running.
+> `scripts/serve_gemma4.sh` **is included in the 2026-11-09 source archive**. Confirm its local model path and vLLM configuration against the current WSL environment before starting it; do **not** substitute a hosted API. Keep this terminal running.
 
 **Check the server from another terminal:**
 
@@ -92,7 +94,7 @@ python -m json.tool /tmp/hdq_investigation.json | less
 
 The CLI uses the same `src/healthcare_data_quality/` engine as the UI. The progress messages on **stderr** should stay visible even when the JSON on **stdout** is redirected. Press `q` to exit `less`.
 
-**Use a different local dataset for investigation (read-only):**
+**Use a different local dataset for exploratory investigation (original CSV preserved, but R-executing investigation tools are not yet disabled):**
 
 ```bash
 PYTHONPATH=src python scripts/run_investigation.py \
@@ -125,7 +127,7 @@ python -m json.tool /tmp/hdq_customer_audit.json | less
 ```
 
 The current implementation:
-- Profiles the dataset and invokes LLM-selected read-only tools.
+- Profiles the dataset and invokes LLM-selected investigation tools. Current source includes an R-executing investigation tool; a strict no-R mode is **not yet implemented**.
 - Collects tool observations and evidence-backed findings.
 - Identifies unresolved questions.
 - Generates and validates remediation proposals.
@@ -231,9 +233,11 @@ Limitations:
 - General-purpose cleaning operations remain incomplete.
 - Additional failure-path and dataset-diversity testing is required.
 
-Next milestone:
-Integrate the validated shared backend workflow into the
-Streamlit UI on `main`, without duplicating the workflow engine.
+Next milestone (revised 2026-11-09):
+Complete the investigation-only CLI experience, bounded tool use, deterministic QC coverage,
+model-grounded recommendations, and client-facing audit reporting **before** extending
+R-code generation, sandbox execution, or the Streamlit integration. Preserve the shared
+backend architecture; do not duplicate the engine.
 
 
 #### Shared backend requirement
@@ -253,7 +257,7 @@ Do not create separate cleaning, authorization, or memory engines for the two in
 - Only the currently supported remediation operations may execute.
 - A successful investigation does not imply the dataset has been cleaned.
 
-Next milestone: integrate the synthetic-validated shared backend workflow into the Streamlit UI on the main branch. Broader dataset coverage and failure-path testing remain necessary.
+Next milestone: a complete, **investigation-only** client rehearsal on the `backend` branch. The UI and R-execution phases follow only after the investigation and recommendation acceptance gates pass. The current CLI is **not yet** a strictly no-R investigation mode.
 
 
 ### Terminal B — Start the Streamlit UI instead
@@ -323,6 +327,7 @@ PYTHONPATH=src python scripts/verify_remediation.py \
   data/synthetic/poc_duplicate_columns.csv \
   data/derived/poc_cleaned.csv \
   data/decision_memory/remediation_runs.jsonl \
+  --operation-id YOUR_OPERATION_ID \
   --outcome-log data/decision_memory/remediation_outcomes.jsonl
 ```
 
@@ -368,7 +373,7 @@ The project combines deterministic Python checks, a locally hosted LLM, a tool-u
 5. [Repository layout](#repository-layout)
 6. [Prerequisites and installation](#prerequisites-and-installation)
 7. [Start and verify the local LLM](#start-and-verify-the-local-llm)
-8. [Quick start: read-only investigation in the terminal](#quick-start-read-only-investigation-in-the-terminal)
+8. [Quick start: exploratory investigation in the terminal](#quick-start-exploratory-investigation-in-the-terminal)
 9. [Complete CLI POC: review, authorize, remediate, verify](#complete-cli-poc-review-authorize-remediate-verify)
 10. [Operate the Streamlit application](#operate-the-streamlit-application)
 11. [Understanding the investigation results](#understanding-the-investigation-results)
@@ -418,7 +423,7 @@ Steps 2, 4, 6, and 7 are **only partially connected in the current UI**; use the
 - **Deterministic facts first:** Python tools count, compare, validate, and fingerprint; the LLM interprets and prioritizes evidence rather than pretending to perform exact arithmetic.
 - **Evidence before conclusions:** A claim cites actual observations, such as `T2.O1`, and should not exceed what those observations establish.
 - **Science-aware uncertainty:** Identical values or equal-looking IDs do not establish equivalent scientific meaning.
-- **Read-only by default:** Agent tools inspect data; they are not authorized to modify a dataset.
+- **Source-data preservation by default:** Investigation tools are not authorized to modify source CSVs. However, the current agent can select `investigate_with_r`, which executes R in an investigation path; a strictly **no-code-execution** investigation mode remains to be built.
 - **Separate human gates:** Accepting an investigation recommendation is **not** the same as authorizing its execution.
 - **Narrow, scoped execution:** Authorization binds the source fingerprint, target columns, operation, and output path. A derived copy is created rather than editing the source.
 - **Independent post-change verification:** Reinspect the output and verify that all retained cells remain unchanged.
@@ -485,7 +490,7 @@ The project uses **one Git repository and one working folder** with separate `ba
 | --- | --- | --- |
 | CSV header/row-width inspection | **Implemented** | Duplicate names, blank names, inconsistent widths, row/column counts |
 | Per-column profiling | **Implemented** | Missing/nonmissing counts, numeric prevalence, distinct-value counts, examples |
-| Read-only LLM agent loop | **Implemented** | Uses registered tools; selects actions based on profile and observations |
+| LLM investigation agent loop | **Implemented; no-R restriction pending** | Uses registered tools; selects actions based on profile and observations; can select an R-executing investigation tool |
 | Evidence-indexed report | **Implemented** | `findings`, `unresolved_questions`, `recommended_next_step` |
 | Remediation proposal generation | **Implemented** | Produces proposals from investigation history; includes prior review context |
 | Deterministic proposal validation | **Implemented, narrow scope** | Verifies references, targets, and selected operation prerequisites |
@@ -664,7 +669,7 @@ If the endpoint is unavailable, do not troubleshoot the agent first—start or r
 
 Model inference is designed to use loopback networking only. Initial installation/model downloads may require Internet access; **normal inference must not depend on an external LLM API**. Do not expose the local LLM service publicly by changing its binding address without appropriate security controls.
 
-## Quick start: read-only investigation in the terminal
+## Quick start: exploratory investigation in the terminal
 
 This is the preferred path for developing and testing the backend kernel.
 
@@ -700,7 +705,7 @@ PYTHONPATH=src python src/healthcare_data_quality/dataset_profiler.py \
   data/synthetic/poc_duplicate_columns.csv
 ```
 
-### 3. Run the complete *current* read-only agent investigation
+### 3. Run the *current* exploratory investigation (not a strict no-R mode)
 
 Start the local LLM first, then:
 
@@ -864,11 +869,14 @@ A technical cell-preservation check is **not** independent validation of scienti
 
 ### Stage 5 — Independently verify the derived dataset
 
+Replace `YOUR_OPERATION_ID` with the **actual Operation ID** recorded at authorization/execution; it is not the Authorization ID.
+
 ```bash
 PYTHONPATH=src python scripts/verify_remediation.py \
   data/synthetic/poc_duplicate_columns.csv \
   data/derived/poc_cleaned.csv \
   data/decision_memory/remediation_runs.jsonl \
+  --operation-id YOUR_OPERATION_ID \
   --outcome-log data/decision_memory/remediation_outcomes.jsonl
 ```
 
@@ -1084,7 +1092,7 @@ Memory records may contain reviewer identifiers, notes, and dataset fingerprints
 | Dataset situation | Recommended current entry point | Caveat |
 | --- | --- | --- |
 | Any well-formed CSV | `ingestion.py` / `dataset_profiler.py` | Structural checks alone do not establish quality |
-| Unknown scientific CSV | `scripts/run_investigation.py` | Read-only exploratory audit with limited tool budget |
+| Unknown scientific CSV | `scripts/run_investigation.py` | Exploratory audit with limited tool budget; preserves source CSV but is **not** a no-R execution guarantee |
 | Metadata with `SampleID`, `NPDNum` | `duplicate_validation.py` and registered duplicate tools | Duplicate IDs do not prove duplicate subjects |
 | Taxonomy-style table | `taxonomy_validation.py` | Interpret findings in the correct scientific context |
 | Two datasets with subject identifiers | `identifier_matching.py` | Utility produces candidates; not an authorized auto-merge |
@@ -1220,7 +1228,7 @@ This README is shared documentation. Update it on `backend` for backend behavior
 5. **Sensitive-text risk:** Prompts, error logs, model input, and UI previews may still contain dataset-derived information. Local hosting does not automatically make the workflow compliant with any specific privacy law or institutional data-use agreement.
 6. **Dataset integrity:** SHA-256 fingerprints identify exact input/output bytes. The executor preserves original source content by writing a derived output path and checking it; independent verification checks retained CSV values.
 7. **Separation of roles:** Human review and operation authorization are distinct states. Production use will require authenticated identities, role-based permissions, audit integrity, and session/workspace isolation.
-8. **Least-authority tools:** Only validated, context-eligible, read-only tools may run during investigation. The cleaning executor is a separate controlled path.
+8. **Least-authority tools (target state):** A future `investigation_only` mode must exclude **all R-executing tools**, cleaning code generation, authorization, and execution. The current agent can select `investigate_with_r` during investigation; therefore **do not describe the current code as guaranteeing no R execution**. The cleaning executor remains a separate controlled path.
 9. **No trust escalation from memory:** Previous approval and prior technical success are not blanket permission for future datasets.
 10. **Data governance before production:** Organizational approvals, access controls, retention/deletion policy, software validation, backups, monitoring, incident response, and a threat model are still required.
 
@@ -1235,6 +1243,14 @@ Run from the repository root with `PYTHONPATH=src`, or export `PYTHONPATH="$PWD/
 ### `Connection refused` / local model errors / no response
 
 Verify the server process, `http://127.0.0.1:8000/v1/models`, `MODEL_URL`, and `MODEL_NAME`. A 180-second request timeout can result from slow inference or a stalled model; do not mistake the spinner for a guarantee of forward progress.
+
+### `vLLM HTTP 400` / model context length exceeded
+
+The client rehearsal exceeded Gemma's configured 12,288-token context when producing remediation proposals. Restrict retrieved history to a relevance-selected, token-budgeted subset, summarize duplicated instruction text, cap tool-evidence excerpts, and reserve output tokens. Preserve **all evidence IDs and verifiable source records** in the persisted audit; prompt truncation must not erase evidence or create a false coverage claim. Increasing `--max-model-len` is not the first remedy on a 16 GB GPU.
+
+### `investigate_with_r` repeatedly selected with invalid tool arguments
+
+The live agent selected `investigate_with_r` twice with invalid arguments, then ended at `no_new_action`. Treat this as a **failed investigation branch** and an unresolved coverage gap, not completed analysis. The planned investigation-only mode will not offer this tool; read-only tools must expose strict argument schemas and actionable validation feedback.
 
 ### `Incomplete generation` or JSON parsing errors
 
@@ -1282,53 +1298,110 @@ GitHub HTTPS Git operations require token-based authentication. When appropriate
 
 ## Development roadmap and acceptance criteria
 
-This roadmap separates working prototypes from required engineering work. It does not imply fixed release dates.
+**Decision recorded 2026-11-09:** We are preparing a client-facing **investigation and recommendation POC**, not an autonomous data-cleaning release. Finish investigation, coverage, evidence, human clarification, and scientifically defensible proposed methods **before** R generation and execution. The backend remains the source of truth, and the `main` UI branch will eventually consume the same controller. The sequence below is the intended implementation order, **not a claim that these features are already working**.
 
-### Phase A — Backend kernel coverage (next priority)
+### Client rehearsal blockers and investigation-only goal
 
-- Define an explicit quality-check catalog and applicability policy.
-- Execute all safe, applicable deterministic baseline checks automatically, **independent of whether the model happens to select them**.
-- Track each check as `completed`, `needs_more_evidence`, `not_applicable`, `unsupported`, or `failed` rather than pretending four tool calls equal comprehensive coverage.
-- Let the LLM investigate unusual or ambiguous findings with bounded, nonrepeating, read-only tool calls.
-- Implement structured escalation: additional evidence → documentation request → human clarification → validated proposal.
-- Emit truthful progress events and coverage summaries for both the CLI and UI.
+The first real-dataset interactive rehearsal exposed several distinct problems:
 
-**Acceptance criterion:** For every uploaded test dataset, a machine-readable coverage report identifies each applicable check, its status, evidence, and reason for any gap. No percentage is invented for an open-ended agent loop.
+1. **Tool selection:** `investigate_with_r` was proposed with invalid arguments twice, exhausting the remaining investigation attempts. `no_new_action` did **not** mean that all checks were covered.
+2. **Prompt size:** the proposal-generation request exceeded the model's **12,288-token** context. Limiting submitted prior decisions to three allowed a saved-audit proposal-generation run to complete, but this is a mitigation, **not** a complete token-budget solution.
+3. **Incomplete recommendation:** a proposed numeric QC rule addressed only a small subset of the invalid-count evidence while appearing as a broader cleaning approach. Every proposed rule needs **global scope, coverage and omission checks**.
+4. **R sandbox failure:** after human review and R draft creation, sandbox preview failed; the release gate correctly blocked the consolidated candidate and left the original intact. **R sandbox investigation is deferred**, not declared fixed.
+5. **Review workflow:** an accepted **recommendation** is not proof that a full dataset is valid and must not transition into implicit cleaning authority.
 
-### Phase B — Generalize evidence and safe remediation
+**Next demo mode — to implement:** a single command that performs automatic deterministic checks, optional strictly non-executing Gemma investigation, evidence-based findings, uncertainty assessment, and proposed cleaning *methods*. It must stop **before** R code generation, sandbox execution, derived CSV creation, and execution authorization. Do not assume a currently documented command already enforces this boundary. The current `run_workflow.py --interactive` can still continue into review and R draft generation; the current investigation agent can select `investigate_with_r`.
 
-- Support uploaded data dictionaries and dataset-specific provenance with explicit trust boundaries.
-- Add domain-review workflows for subject-ID reconciliation, duplicate subjects, categorical normalization, and multi-dataset matching.
-- Add separate, deterministic executors and independent verifiers *per* supported operation.
-- Record exact before/after hashes, row/column effects, retained-data invariants, and human approval scope.
-- Treat generated R code as a reviewed artifact; introduce schema validation, tests, constrained execution, and reproducibility before enabling it.
+**Successful meeting demonstration:** show the client's original data-quality problems, the evidence and affected records, a defensible proposed correction or escalation for each category, and an explicit blocker list for downstream preprocessing. The demo **must not claim** that data was cleaned or transformed.
 
-**Acceptance criterion:** Each newly supported data-change operation has negative-path tests, exact targets, an explicit authorization record, rollback/recovery handling, and independent post-change verification.
+### Phase A — Enforce a non-executing investigation controller (first code milestone)
 
-### Phase C — Complete the customer UI
+- Add an explicit `investigation_only` execution policy enforced **server-side/in the backend**, not merely by a prompt or UI label. Disable R-executing tools including `investigate_with_r`, code generation, review-to-execution transitions, execution and data writes other than audit artifacts.
+- Separate **automatic applicable deterministic QC checks** from discretionary LLM tool selection. The model can request further investigation, but cannot skip required baseline categories.
+- Introduce a tool capability/side-effect registry: `read_only_data`, `executes_code`, `writes_data`, `requires_authorization`; check permissions before dispatch.
+- Define a machine-readable category coverage ledger: `completed`, `needs_more_evidence`, `not_applicable`, `unsupported`, `failed`, with evidence identifiers and failed-tool attempts.
+- Add bounded retries with validation feedback for malformed tool arguments. Do not retry a structurally invalid call unchanged and do not report `no_new_action` as full coverage.
+- Enforce an explicit request-token budget (model context minus output reserve) for prompts, decision-memory retrieval, evidence summaries and follow-up questions. Keep the complete underlying audit on disk.
+- Test that investigation mode never executes R, never produces cleaned output, and terminates with an honest completed/partial/failed status.
 
-- Provide one unified findings screen with verified facts, suspected problems, affected records, uncertainties, and detailed evidence on demand.
-- Automatically run the comprehensive audit after upload without requiring users to select investigation buttons.
-- Show an actual activity log (tool/stage events), elapsed time, and explicit incomplete-coverage warnings.
-- Allow clarification/document upload and targeted re-investigation when uncertainty cannot be resolved internally.
-- Surface existing Accept/Reject/Defer, separate execution authorization, derived-copy transformation, verification, audit, and downloads through reusable backend functions.
-- Refresh review and outcome memory without repeating unnecessary model calls.
+**Acceptance gate A:** synthetic and representative client datasets produce comprehensive, reproducible coverage records; invalid tool calls are isolated and clearly reported; no R code is executed and no data-changing path is reachable.
 
-**Acceptance criterion:** A user can complete the same authorized POC from the UI as from the CLI, and both paths yield equivalent audit/verification records.
+### Phase B — Complete client-defined QC coverage on both datasets
 
-### Phase D — Security, testing, and deployment readiness
+**Microbiome count matrix**
 
-- Pin dependencies, provide environment bootstrap scripts and model/server configuration docs.
-- Add realistic synthetic dataset families, schema-validation/robustness tests, and targeted adversarial-input checks.
-- Define multi-tenant storage/workspace isolation, authenticated reviewers, authorization policies, concurrency control, and privacy-preserving logging.
-- Implement trustworthy audit persistence, recovery from partial writes, cancellation/timeouts, and operational monitoring.
-- Assess domain-specific regulatory and institutional requirements before handling confidential customer data.
+- Preserve raw duplicate column headers and distinguish taxonomy rows, biological sample columns, controls/blanks, unrelated fields, and data orientation before any matrix conversion.
+- Audit every raw count for missing/non-numeric, negative and fractional values with sample/taxon coordinates; detect all-zero samples and taxa. **Never coerce missing counts to zero**.
+- Identify duplicate sample IDs/columns and duplicate taxa, **including duplicates with conflicting counts**; propose a safe resolution or human verification without automatic summation/removal.
+- Validate seven taxonomy levels, inconsistent separators/prefixes, incomplete versus unclassified species, suspected nested/mixed-level taxa and species-level L7 intent. Produce a seven-level taxonomy table and preserve original labels.
+- Generate a full original-taxa QC inventory; once ambiguity and invalid counts are resolved, compute total samples, zero/nonzero counts and prevalence from validated **biological** samples, excluding controls and resolved duplicates from the denominator.
 
-**Acceptance criterion:** Documented security review, reproducible deployment, validated permissions, safe handling of concurrent operations, and evidence-based acceptance criteria for relevant quality categories.
+**Metadata and reconciliation**
+
+- Detect abnormal variable categories, inconsistent casing/whitespace/separators/ID prefixes, duplicate SampleID and NPDNum, conflicting duplicate records, suspected typos, and unusual continuous values.
+- Produce sample-level evidence for each discrepancy; **do not automatically merge conflicting records** or normalize ambiguous identifiers.
+- Reconcile the microbiome and metadata sets with exact, case-normalized and suspected fuzzy matches **reported as separate confidence classes**. Require human confirmation for suspected typos.
+
+**Acceptance gate B:** run a **separate evaluation harness** against the client's private instructions and expected answer, reporting true positives, misses, false positives, row/column locations, and blocker status. Never put the expected answer into Gemma's prompt or retrieval corpus; otherwise the test would be contaminated. Coverage must be measured across the complete dataset, not only the columns Gemma happened to inspect.
+
+### Phase C — Evidence-grounded cleaning-method recommendations (no execution)
+
+- Produce one normalized issue record per distinct defect family (with individual affected observations linked), rather than presenting a single narrowly targeted QC flag as global resolution.
+- For each issue, show **observed facts → affected records/fields → likely cause or competing hypotheses → proposed cleaning/validation method → options and risks → confidence → required client decision → downstream blockers**.
+- Distinguish safe deterministic formatting suggestions from semantic assumptions. Require documentation or domain-owner review before resolving suspected ID typos, conflicting clinical metadata, duplicate taxa with different counts, or unknown invalid count semantics.
+- Add a proposal coverage validator that compares scope against the entire deterministic evidence ledger. A partial recommendation may be useful but must be **labelled partial**, with omitted observations identified.
+- Let Gemma issue targeted clarifications and revise recommendations without losing earlier evidence or decision provenance. Human acceptance of a method is **not** execution authorization.
+- Offer a stable, reviewable client report and machine-readable JSON; separate `confirmed`, `suspected`, `needs_human_review`, `blocked`, and `not_applicable` statements.
+
+**Acceptance gate C:** a reviewer can explain every recommendation, locate supporting evidence, see unresolved issues and defer decisions; unsupported changes never appear as approved or ready to execute.
+
+### Phase D — Improve Gemma with offline memory, skills and local RAG
+
+- **Knowledge tiers:** (1) immutable audit/evidence ledger; (2) curated, versioned QC policy and domain definitions; (3) human-confirmed case decisions; (4) independently verified outcomes; (5) unverified model hypotheses. Keep these separate so prior model text cannot become authoritative evidence.
+- Create a local library of small, **reviewed** cleaning recipes, applicable schemas, expected preconditions, examples of valid/invalid outcomes, and verification tests. Examples should include ID standardization, duplicate conflict resolution, missing-count policy, taxonomy harmonization and matrix eligibility checks.
+- Chunk approved reference documents and synthetic/approved examples, attach source path, version, content hash, intended dataset/domain, retrieval permissions and review status; use fully **offline** embeddings and a local vector/keyword index.
+- Retrieve only the few relevant chunks and prior verified cases for each current issue; deduplicate, rank, impose an input-token budget and cite exact chunk IDs in proposals. Use retrieval to **inform**, never automatically approve or execute.
+- Apply data minimization: do not persist raw patient identifiers, sensitive row contents or confidential client documents in a global/shared index. Keep client-specific indexes and memory isolated and access-controlled; provide retention/forgetting mechanisms for derived embeddings and records.
+- Defend against prompt injection in retrieved documents, past model outputs and tool observations. Retrieved text is evidence/data, **not an instruction overriding system policy**.
+- Measure impact with a held-out test set: issue recall, false correction rate, coverage, citation support, tool error rate, token use and repeat-run consistency. Compare against the deterministic baseline and a no-RAG version.
+
+**Acceptance gate D:** every remembered/retrieved recommendation has a verifiable source and authorization scope; offline execution and confidentiality boundaries are maintained; measurable improvements justify the extra system complexity.
+
+### Phase E — Reliable R drafting and static verification (deferred)
+
+- Re-enable **code generation only after** Phases A–D achieve their acceptance gates and a specific transformation has a reviewed scope and scientific policy.
+- Use a local recipe library, deterministic transformation contracts, retrieved approved R examples and constrained synthesis rather than unconstrained code generation from a broad prompt.
+- Require structured outputs: original/derived column IDs, preconditions, exact row/column effects, package dependencies, immutable input hash, uncertainty and independent verification invariants.
+- Build static checks for prohibited I/O, network calls, shell/process execution, code injection, unbound paths, unknown package behavior and unsanctioned modification. Use separately maintained synthetic fixtures; do not trust model-generated tests alone.
+- Preserve R scripts as **draft artifacts** until validated and authorized. Do not infer semantic correctness from a syntactically valid R program.
+
+**Acceptance gate E:** supported R drafts pass static/schema validation, synthetic behavior tests and an independent human-review gate; dangerous or ambiguous drafts are rejected by default. **No client R sandbox execution yet.**
+
+### Phase F — R sandbox, authorized transformations and scientific preprocessing (later)
+
+- Restore the isolated R preview and troubleshoot Bubblewrap failures only when the generation/validation gates are ready. Keep separate human authorization, immutable source inputs, derived-copy writes, replay protection and independent verification.
+- Resolve all invalid count data, duplicate-sample ambiguity, taxonomy-level issues and control eligibility **before** producing the final microbiome matrix. Block prevalence filtering and CLR/rCLR on unresolved invalid counts.
+- Compute prevalence from validated, unfiltered biological samples; use the client's exact 10% and 30% thresholds, and report taxa kept/removed at each threshold.
+- Produce the two filtered count matrices and four transformed outputs (CLR and rCLR at each threshold), plus seven-level taxonomy and all-original-taxa prevalence reports. Preserve sample and taxon labels, shape, transformations' prerequisites, and NA/NaN/infinite checks; handle all-zero profiles explicitly.
+- Verify original/derived hashes, exact transformations, dimensions, cell retention, expected invariants, scientific preconditions, and audit lineage. Do not release partially verified or unauthorized results.
+
+**Acceptance gate F:** fully authorized, reproducible transformations yield all client-specified outputs **only after all blockers clear**, with independent validation and no changes to the source files.
+
+### Phase G — UI, security and deployment readiness
+
+- Merge only tested backend work from `backend` into `main` **within the same project directory**; integrate the Streamlit UI through the shared workflow controller, not a second cleaning engine.
+- First expose the investigation-only demo: coverage, issues, methods, evidence, questions and downloadable reports. Add the later authorization/transformation screens only after Phases E–F.
+- Pin runtime dependencies, configure robust cancellation/timeouts, monitoring, access control, tenant isolation, private memory/index management, threat modeling and organizational approval for confidential data.
+
+**Acceptance gate G:** UI and CLI use equivalent evidence and authorization records; installation and demo workflows are repeatable; no unsupported privacy, clinical or regulatory-compliance claim is made.
+
+### One-step-at-a-time working agreement
+
+Work on the `backend` branch in the existing project directory. For each change: provide **one complete modified `.py` or `.md` file**, based on the most recently supplied ZIP/current source, with its original repository-relative path, concise rationale, reviewable file-level diff, one targeted verification command and a clear pass/fail criterion. Wait for confirmation before proposing the next file. Preserve existing user modifications unless the new ZIP establishes a new baseline. **Do not submit aggregate Git patches or overwrite other files implicitly.**
 
 ## Project provenance and maintainer
 
-This README expands the project's original five objectives and development approach while documenting the current Python CLI and Streamlit prototypes. The initial README described work in Python and R; the **reviewed executable code is primarily Python**, with R-based cleaning still an objective rather than a demonstrated feature.
+This README expands the project's original five objectives and development approach while documenting the current Python CLI and Streamlit prototypes. The initial README described work in Python and R. The current code has experimental R draft generation and sandbox verification, including a validated synthetic duplicate-column POC, but **general scientific R cleaning and client-ready execution are not demonstrated**.
 
 **Maintainer:** Xavier Huang
 **GitHub:** [XavierHuangWF](https://github.com/XavierHuangWF)

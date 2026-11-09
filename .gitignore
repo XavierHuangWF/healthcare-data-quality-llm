@@ -247,3 +247,5 @@ __marimo__/
 /models/
 
 data/decision_memory/
+# Generated local R execution artifacts
+/tools/generated_r/
