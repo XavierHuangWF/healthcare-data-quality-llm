@@ -74,7 +74,7 @@ def run_r_sandbox(r_function: str, synthetic_csv: str) -> str:
               'check.names=FALSE, stringsAsFactors=FALSE)\n'
               'output_df <- clean_dataset(input_df)\n'
               'stopifnot(is.data.frame(output_df))\n'
-              'write.csv(output_df, stdout(), row.names=FALSE)\n'
+              'write.csv(output_df, stdout(), row.names=FALSE, na="")\n'
     )
 
 

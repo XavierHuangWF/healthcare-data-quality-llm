@@ -27,7 +27,8 @@ from healthcare_data_quality.r_verification import verify_exact_cell_edits
 from healthcare_data_quality.r_verification import verify_qc_contract_from_evidence
 
 from healthcare_data_quality.r_verification import verify_numeric_qc_from_baseline
-
+import csv
+from io import StringIO
 
 def terminal_progress(message: str) -> None:
     print(f"[Agent] {message}", file=sys.stderr, flush=True)
@@ -131,7 +132,77 @@ def offer_tool_memory(history: list[dict]) -> None:
         )
 
         print(f"[Agent] Reusable tool candidate saved: {tool_path}")
+def merge_verified_qc_column(
+        original_csv: str,
+        current_csv: str,
+        verified_csv: str,
+        output_column: str,
+) -> str:
+    """Add one independently verified QC column to the cumulative result."""
 
+    def parse_csv(content: str) -> list[list[str]]:
+        rows = list(csv.reader(StringIO(content)))
+
+        if not rows:
+            raise ValueError("Empty CSV")
+
+        width = len(rows[0])
+
+        if any(len(row) != width for row in rows):
+            raise ValueError("Inconsistent CSV row widths")
+
+        return rows
+
+    original = parse_csv(original_csv)
+    current = parse_csv(current_csv)
+    verified = parse_csv(verified_csv)
+
+    width = len(original[0])
+
+    if not (len(original) == len(current) == len(verified)):
+        raise ValueError("Record counts differ")
+
+    if [row[:width] for row in current] != original:
+        raise ValueError("Cumulative result changed original data")
+
+    if [row[:width] for row in verified] != original:
+        raise ValueError("Verified candidate changed original data")
+
+    if len(verified[0]) != width + 1:
+        raise ValueError("Candidate must append exactly one column")
+
+    if verified[0][-1] != output_column:
+        raise ValueError("QC column does not match approved contract")
+
+    if output_column in current[0]:
+        raise ValueError("QC column already exists")
+
+    combined = [
+        row + [verified[index][-1]]
+        for index, row in enumerate(current)
+    ]
+
+    output = StringIO(newline="")
+    csv.writer(output).writerows(combined)
+
+    return output.getvalue()
+
+def consolidated_qc_release_status(
+        authorized_count: int,
+        verified_count: int,
+        original_hash: str,
+        current_hash: str,
+) -> str:
+    if authorized_count < 1:
+        return "not_authorized"
+
+    if verified_count != authorized_count:
+        return "verification_incomplete"
+
+    if current_hash != original_hash:
+        return "source_changed"
+
+    return "ready"
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive healthcare data-quality workflow"
@@ -266,11 +337,15 @@ def main() -> None:
             result["history"],
             baseline=result["baseline"],
         )
-
+        original_csv = args.input.read_text(encoding="utf-8-sig")
+        original_source_hash = sha256(args.input.read_bytes()).hexdigest()
+        cumulative_csv = original_csv
+        merged_qc_count = 0
+        authorized_qc_count = 0
         draft_dir = Path("data/cleaning_drafts")
         draft_dir.mkdir(parents=True, exist_ok=True)
 
-        for proposal in result["proposals"]:
+        for proposal in review_result["proposals"]:
             proposal_id = fingerprint_proposal(proposal)
             operation = proposal.get("operation") or {}
 
@@ -369,13 +444,23 @@ def main() -> None:
 
             elif draft["status"] == "draft_ready":
                 print(
-                    "[Agent] Cleaning proposal accepted. "
-                    "Automatically testing Gemma's R tool in the sandbox..."
+                    "\n[Agent] Cleaning proposal accepted, "
+                    "but execution is not yet authorized."
                 )
-                consent = "y"
+
+                print(
+                    "[Agent] R draft is ready for sandbox execution. "
+                    "The original dataset will not be overwritten."
+                )
+
+                consent = input(
+                    "Authorize executing this R transformation and "
+                    "saving a cleaned candidate if verification passes? [y/N]: "
+                ).strip().lower()
 
                 if consent == "y":
-                    source_hash = sha256(args.input.read_bytes()).hexdigest()
+                    authorized_qc_count += 1
+                    source_hash = original_source_hash
                     try:
                         preview = inspect_r_transformation(
                             r_function=draft["r_function"],
@@ -498,29 +583,37 @@ def main() -> None:
                             "[Agent] Independent QC verification: PASS",
                             f"({checked['flagged_records']} flagged records)",
                         )
-
-                        output_dir = Path("data/derived")
-                        output_dir.mkdir(parents=True, exist_ok=True)
-
-                        output_path = output_dir / (
-                            f"{args.input.stem}_{proposal_id[:12]}_"
-                            f"{timestamp}_cleaned_candidate.csv"
-                        )
-
-                        if output_path.resolve() == args.input.resolve():
-                            raise RuntimeError("Refusing to overwrite original dataset")
-
-                        with output_path.open("x", encoding="utf-8", newline="") as file:
-                            file.write(preview["output_csv"])
-
-                        if sha256(args.input.read_bytes()).hexdigest() != source_hash:
-                            output_path.unlink()
-                            raise RuntimeError(
-                                "Source dataset changed. Candidate output discarded."
+                        try:
+                            next_cumulative_csv = merge_verified_qc_column(
+                                original_csv=original_csv,
+                                current_csv=cumulative_csv,
+                                verified_csv=preview["output_csv"],
+                                output_column=contract["output_column"],
                             )
+                        except (ValueError, KeyError, TypeError) as exc:
+                            print(
+                                "[Agent] Cumulative QC merge rejected:",
+                                exc,
+                            )
+                            continue
 
-                        print("[Agent] CLEANED CANDIDATE SAVED:", output_path.resolve())
-                        print("[Agent] Original SHA-256:", source_hash)
+                        cumulative_csv = next_cumulative_csv
+                        merged_qc_count += 1
+
+                        print(
+                            "[Agent] Independently verified QC column "
+                            "added to cumulative result:",
+                            contract["output_column"],
+                        )
+                        print(
+                            "[Agent] Cumulative verified operations:",
+                            merged_qc_count,
+                        )
+                        print(
+                            "[Agent] Verified QC transformation staged "
+                            "for consolidated output."
+                        )
+                        print("[Agent] Original SHA-256:", original_source_hash)
                         print("[Agent] Technical sandbox execution: PASS")
                         print("[Agent] Independent QC contract verification: PASS")
                 else:
@@ -528,9 +621,66 @@ def main() -> None:
 
             print("[Agent] No generated R code executed on the source dataset.")
 
+    if authorized_qc_count:
+        release_status = consolidated_qc_release_status(
+            authorized_count=authorized_qc_count,
+            verified_count=merged_qc_count,
+            original_hash=original_source_hash,
+            current_hash=sha256(args.input.read_bytes()).hexdigest(),
+        )
+
+        if release_status == "verification_incomplete":
+            print(
+                "\n[Agent] CONSOLIDATED OUTPUT BLOCKED: "
+                f"{merged_qc_count}/{authorized_qc_count} "
+                "authorized transformations verified."
+            )
+            print(
+                "[Agent] No consolidated candidate released. "
+                "Original dataset unchanged."
+            )
+
+
+        elif release_status == "source_changed":
+            raise RuntimeError(
+                "Original dataset changed during cleaning. "
+                "Consolidated output blocked."
+            )
+
+        else:
+            output_dir = Path("data/derived")
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            output_path = output_dir / (
+                f"{args.input.stem}_{timestamp}_"
+                "consolidated_candidate.csv"
+            )
+
+            with output_path.open(
+                    "x", encoding="utf-8", newline=""
+            ) as file:
+                file.write(cumulative_csv)
+
+            if sha256(args.input.read_bytes()).hexdigest() != original_source_hash:
+                output_path.unlink()
+                raise RuntimeError(
+                    "Original dataset changed. "
+                    "Consolidated candidate discarded."
+                )
+
+            print(
+                "\n[Agent] CONSOLIDATED CANDIDATE SAVED:",
+                output_path.resolve(),
+            )
+            print(
+                "[Agent] Independently verified QC operations:",
+                merged_qc_count,
+            )
+            print("[Agent] Original SHA-256:", original_source_hash)
+            print("[Agent] Original dataset unchanged.")
     eligible_proposals = [
         proposal
-        for proposal in result["proposals"]
+        for proposal in review_result["proposals"]
         if eligible_for_authorization(
             proposal, accepted_ids, draft_statuses
         )

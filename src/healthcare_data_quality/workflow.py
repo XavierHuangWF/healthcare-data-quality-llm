@@ -20,6 +20,7 @@ OUTCOME_LOG = Path(
 def run_initial_audit(
         dataset_path: Path,
         progress_callback: Callable[[str], None] | None = None,
+        additional_datasets: list[Path] | None = None,
 ) -> dict:
     dataset_path = Path(dataset_path)
 
@@ -80,6 +81,7 @@ def run_initial_audit(
             f"{json.dumps(baseline_summary)}"
         ),
         progress_callback=progress_callback,
+        additional_datasets=additional_datasets,
     )
 
     history = investigation["history"]

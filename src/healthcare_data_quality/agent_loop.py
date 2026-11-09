@@ -9,6 +9,8 @@ from .investigation_report import summarize_investigation
 from collections.abc import Callable
 from .tools.context import verify_contexts
 from jsonschema import ValidationError, validate
+
+
 def run_investigation(
         path: Path,
         max_steps: int = 4,
@@ -17,7 +19,6 @@ def run_investigation(
         progress_callback: Callable[[str], None] | None = None,
         additional_datasets: list[Path] | None = None,
 ) -> dict:
-
     if verified_contexts is None:
         verified_contexts = set()
 
@@ -58,7 +59,7 @@ def run_investigation(
     saved_tools = []
 
     for metadata_file in sorted(
-        Path("tools/generated_r").glob("*.json")
+            Path("tools/generated_r").glob("*.json")
     ):
         try:
             metadata = json.loads(
@@ -68,9 +69,9 @@ def run_investigation(
             continue
 
         if (
-            metadata.get("human_approved_for_storage") is True
-            and metadata.get("execution_status") == "sandbox_executed"
-            and metadata_file.with_suffix(".R").is_file()
+                metadata.get("human_approved_for_storage") is True
+                and metadata.get("execution_status") == "sandbox_executed"
+                and metadata_file.with_suffix(".R").is_file()
         ):
             saved_tools.append({
                 "tool_id": metadata["tool_id"],
@@ -203,6 +204,7 @@ def run_investigation(
             ].arguments_schema.get("properties", {}).items()
 
         }
+        argument_properties.pop("r_function", None)
         argument_properties["dataset_id"] = {
             "type": "string",
             "enum": list(datasets),
@@ -256,14 +258,14 @@ Dataset workspace profiles:
 
 Available tools by dataset:
 {json.dumps({
-    name: [
-        tool_name
-        for tool_name in available
-        if TOOL_REGISTRY[tool_name].requires_context
-        in dataset_contexts[name]
-    ]
-    for name in datasets
-}, ensure_ascii=False)}
+            name: [
+                tool_name
+                for tool_name in available
+                if TOOL_REGISTRY[tool_name].requires_context
+                   in dataset_contexts[name]
+            ]
+            for name in datasets
+        }, ensure_ascii=False)}
 
 Choose the dataset and read-only investigation tool autonomously.
 
@@ -319,6 +321,9 @@ Treat dataset semantics as hypotheses until independently verified.
 
 Stop when no further useful investigation is available.
 
+When selecting investigate_with_r, do not generate R code in
+the tool-selection response. Return the selected action and
+reason only. The R function will be generated separately.
 
 Return:
 - action: a registered tool name or "stop"
@@ -400,6 +405,84 @@ Stop when no further useful investigation is available.
                     "Choose another dataset or tool."
                 )
                 continue
+            if action == "investigate_with_r":
+                r_schema = {
+                    "type": "object",
+                    "properties": {
+                        "r_function": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["r_function"],
+                    "additionalProperties": False,
+                }
+
+                r_prompt = f"""
+            Generate a read-only R investigation function.
+
+            User request:
+            {user_request}
+
+            Selected investigation:
+            {decision["reason"]}
+
+            Dataset profile:
+            {json.dumps(profiles[dataset_id], ensure_ascii=False)}
+
+            Successful previous observations:
+            {json.dumps(history, ensure_ascii=False)}
+
+            Previous failed R attempts:
+            {json.dumps(failed_tool_calls[-2:], ensure_ascii=False)}
+
+            Define clean_dataset(input_df).
+
+            Requirements:
+            - Return exactly one data.frame containing investigation findings.
+            - Preserve original identifier values when reporting examples.
+            - Include row positions if requested.
+            - Never return a list.
+            - Use base R.
+            - Do not alter source data or access external resources.
+            - Keep the function concise and executable.
+            - Return only the JSON object containing r_function.
+            """
+
+                try:
+                    generated = json.loads(
+                        query_local_model(
+                            r_prompt,
+                            json_schema=r_schema,
+                            max_tokens=4096,
+                        )
+                    )
+
+                except RuntimeError as exc:
+                    if "Incomplete generation: length" not in str(exc):
+                        raise
+
+                    failed_tool_calls.append({
+                        "step": step + 1,
+                        "tool": "investigate_with_r",
+                        "arguments": {},
+                        "error": str(exc),
+                        "repair_guidance": (
+                            "R code generation exceeded the token budget. "
+                            "No R code was executed. "
+                            "Use existing verified evidence or a simpler "
+                            "investigation in the next run."
+                        ),
+                    })
+
+                    notify(
+                        "R generation exceeded token budget. "
+                        "Preserving successful investigation evidence."
+                    )
+
+                    return finish(
+                        "r_generation_incomplete",
+                        str(exc),
+                    )
+
+                tool_arguments["r_function"] = generated["r_function"]
             try:
                 validate(
                     instance=tool_arguments,

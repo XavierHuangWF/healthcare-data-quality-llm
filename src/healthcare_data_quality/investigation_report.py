@@ -44,13 +44,32 @@ def build_evidence_index(history: list[dict], baseline: dict | None = None, ) ->
             }
 
             if len(observations) <= 5:
-                for index, observation in enumerate(
-                    observations, start=1
-                ):
-                    evidence[f"B.{name}.O{index}"] = {
-                        "tool": name,
-                        "observation": observation,
-                    }
+                selected_indices = list(range(len(observations)))
+
+            elif name == "find_invalid_counts":
+                first_by_type = {}
+
+                for index, observation in enumerate(observations):
+                    if isinstance(observation, dict):
+                        issue_type = observation.get("issue_type")
+                        first_by_type.setdefault(issue_type, index)
+
+                selected_indices = list(dict.fromkeys([
+                    *first_by_type.values(),
+                    *range(min(5, len(observations))),
+                ]))[:5]
+
+            elif name == "find_unclassified_species":
+                selected_indices = list(range(min(5, len(observations))))
+
+            else:
+                selected_indices = []
+
+            for index in selected_indices:
+                evidence[f"B.{name}.O{index + 1}"] = {
+                    "tool": name,
+                    "observation": observations[index],
+                }
     return evidence
 
 

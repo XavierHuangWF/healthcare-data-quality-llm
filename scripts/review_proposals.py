@@ -24,6 +24,7 @@ def revise_proposal_from_answer(
         investigation: dict,
         proposal: dict,
         answer: str,
+        dialogue: list[dict],
 ) -> dict:
     answer = answer.strip()
 
@@ -39,6 +40,7 @@ def revise_proposal_from_answer(
         clarification={
             "proposal": proposal,
             "answer": answer,
+            "dialogue": dialogue,
         },
     )
 
@@ -126,31 +128,87 @@ def review_interactively(
 
             if repeat != "y":
                 continue
-
+        dialogue = []
         while True:
+            execution_plan = proposal.get("execution_plan") or {}
+
+            print("\n" + "=" * 60)
+            print("EXACT CLEANING PLAN FOR APPROVAL")
+            print("=" * 60)
+
+            for field in (
+                    "transformation",
+                    "target_selection",
+                    "expected_result",
+                    "verification_rule",
+            ):
+                print(f"{field}:")
+                print(f"  {execution_plan.get(field, 'NOT SPECIFIED')}")
+                print()
 
             print(
-                "\nAvailable actions:"
-                "\n  [C] Clarify - Provide additional context and reconsider the proposal."
-                "\n  [A] Accept  - Accept the proposal for further validation; does NOT authorize execution."
-                "\n  [R] Reject  - Reject the proposal; no cleaning will occur."
-                "\n  [D] Defer   - Postpone the decision; no cleaning will occur."
-                "\n  [S] Skip    - Skip this proposal without recording a decision."
-                "\n  [Q] Quit    - End the review session."
+                "Requires clarification:",
+                execution_plan.get("requires_clarification", True),
             )
 
-            choice = input(
-                "\n[C]larify / [A]ccept / [R]eject / "
-                "[D]efer / [S]kip / [Q]uit: "
+            contract = proposal.get("verification_contract")
+
+            print("\nINDEPENDENT VERIFICATION CONTRACT")
+
+            if contract is None:
+                print("  Not available — automatic verification unsupported.")
+            else:
+                kind = contract.get("kind")
+                print(f"  kind: {kind}")
+
+                if kind == "numeric_qc_from_baseline":
+                    print("  NUMERIC QC CONDITIONS:")
+                    for condition in contract.get("conditions", []):
+                        print(
+                            f"    issue_type={condition['issue_type']}, "
+                            f"columns={condition['columns']}"
+                        )
+
+                elif kind == "flag_rows_from_evidence":
+                    for field in (
+                            "evidence_id",
+                            "observation_field",
+                            "record_field",
+                    ):
+                        print(f"  {field}: {contract.get(field, 'NOT SPECIFIED')}")
+
+                for field in (
+                        "output_column",
+                        "flagged_value",
+                        "other_value",
+                ):
+                    print(f"  {field}: {contract.get(field, 'NOT SPECIFIED')}")
+            print(
+                "\nGemma's proposed cleaning strategy:"
+                "\n  [Yes] Agree with this cleaning approach."
+                "\n  [No]  Explain your preferred approach; Gemma revises "
+                "its proposal and asks again."
+                "\n  [Q]   Quit without approving."
+            )
+
+            response = input(
+                "\nDo you agree with Gemma's cleaning proposal? "
+                "[Yes/No/Q]: "
             ).strip().lower()
 
+            choice = {
+                "yes": "a",
+                "y": "a",
+                "no": "c",
+                "n": "c",
+                "q": "q",
+            }.get(response, "")
+
             if choice == "c":
-                if not question:
-                    print("No clarification question available.")
-                    continue
+
 
                 print("Do not enter patient identifiers or confidential data.")
-                answer = input("Clarification answer: ").strip()
+                answer = input("Your feedback or instruction for Gemma: ").strip()
 
                 if not answer or answer.casefold() in AMBIGUOUS_CLARIFICATIONS:
                     print(
@@ -165,6 +223,7 @@ def review_interactively(
                         investigation=investigation,
                         proposal=proposal,
                         answer=answer,
+                        dialogue=dialogue,
                     )
                     clarification_record = record_clarification(
                         dataset_path=dataset_path,
@@ -177,6 +236,11 @@ def review_interactively(
                 except (RuntimeError, ValueError, KeyError) as exc:
                     print(f"Revision failed; original proposal retained: {exc}")
                     continue
+
+                dialogue.append({
+                    "reviewer_feedback": answer,
+                    "gemma_revised_proposal": revised,
+                })
 
                 proposal = revised
                 validation = revised["validation"]
@@ -212,12 +276,26 @@ def review_interactively(
         if choice == "s":
             continue
 
-        if (
-                choice == "a"
-                and validation["status"] != "needs_human_review"
-        ):
-            print("Cannot accept a rejected proposal.")
-            continue
+        if choice == "a":
+            if validation["status"] != "needs_human_review":
+                print(
+                    "Cannot accept: proposal validation "
+                    "has not passed."
+                )
+                continue
+
+            plan = proposal.get("execution_plan") or {}
+
+            if plan.get("requires_clarification", True):
+                print(
+                    "Cannot accept: the proposed cleaning strategy "
+                    "still requires clarification."
+                )
+                print(
+                    "Select No, explain the missing information, "
+                    "and let Gemma revise the proposal."
+                )
+                continue
 
         print("Do not enter patient identifiers or confidential data.")
         note = input("Reviewer note (optional): ").strip()

@@ -37,7 +37,7 @@ def query_local_model(
     )
 
     try:
-        with urlopen(request, timeout=180) as response:
+        with urlopen(request, timeout=600) as response:
             result = json.load(response)
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
