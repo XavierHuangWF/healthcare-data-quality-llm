@@ -29,7 +29,7 @@ def inspect_headers(path: Path) -> dict:
         "headers": headers,
         "total_columns": len(headers),
         "data_rows": row_count,
-        "blank_header_positions": positions.get("", []),
+        "blank_header_positions": [i for i, name in enumerate(headers, start=1) if not name.strip()],
         "duplicate_headers": {
             name: columns
             for name, columns in positions.items()

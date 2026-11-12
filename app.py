@@ -9,7 +9,6 @@ import csv
 import hashlib
 import json
 import sys
-from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -17,6 +16,17 @@ import pandas as pd
 import streamlit as st
 
 from healthcare_data_quality.ingestion import inspect_headers
+from healthcare_data_quality.finding_presentation import (
+    CHECK_NAMES,
+    STATUS_LABELS,
+    TOOL_NAMES,
+    baseline_issues,
+    header_findings,
+    header_issues,
+    history_observations,
+    readable_objective_title,
+    readable_objective_summary,
+)
 from healthcare_data_quality.workflow import run_initial_audit
 
 # Reuse the CLI's existing recommendation assessment, including its provenance
@@ -66,14 +76,19 @@ def ensure_local_inputs(files: list, fingerprint: str) -> list[Path]:
     return st.session_state.input_paths
 
 
-def preview_csv(path: Path, limit: int = 10) -> pd.DataFrame:
+def preview_csv(path: Path) -> pd.DataFrame:
+    """Display every CSV row and field without the old ten-row preview limit.
+
+    Prefix header labels with their original positions so unnamed and repeated
+    names remain distinguishable. Preserve all original cell strings.
+    """
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.reader(stream)
         columns = next(reader, [])
-        records = list(islice(reader, limit))
+        records = list(reader)
     width = max([len(columns)] + [len(record) for record in records])
     labels = [
-        f"{i + 1}: {columns[i] if i < len(columns) and columns[i] else '(unnamed)'}"
+        f"{i + 1}: {columns[i] if i < len(columns) and columns[i].strip() else '(unnamed)'}"
         for i in range(width)
     ]
     return pd.DataFrame(
@@ -82,77 +97,103 @@ def preview_csv(path: Path, limit: int = 10) -> pd.DataFrame:
     )
 
 
+def show_finding(title: str, explanation: str, evidence: list[dict], next_step: str = "") -> None:
+    """Reader-facing finding; structured evidence stays expandable."""
+    with st.container(border=True):
+        st.markdown(f"**{title}**")
+        st.write(explanation)
+        if next_step:
+            st.write("**What to check next:**", next_step)
+        if evidence:
+            with st.expander(f"View affected rows ({len(evidence):,})"):
+                st.dataframe(pd.DataFrame(evidence), hide_index=True, width="stretch")
+
+
+def render_header_findings(path: Path, details: dict) -> None:
+    repeated = header_findings(path, details)
+    missing_and_width = header_issues(details)
+    if not repeated and not missing_and_width:
+        st.success("No repeated or blank column names, or inconsistent row lengths, were found.")
+        return
+    st.markdown("#### Data structure findings")
+    for finding in repeated:
+        evidence = [{
+            "Repeated column name": finding["header"],
+            "First column": finding["columns"][0],
+            "Second column": finding["columns"][1],
+            "Matching rows": finding.get("matching_rows", 0),
+            "Different rows": finding.get("different_rows", 0),
+            "Rows not comparable": finding.get("uncomparable_rows", 0),
+        }] if len(finding["columns"]) == 2 else []
+        show_finding(finding["title"], finding["explanation"], evidence, finding["next_step"])
+    for finding in missing_and_width:
+        show_finding(finding["title"], finding["explanation"], finding["rows"], finding["next_step"])
+
+
 def render_baseline(dataset_id: str, baseline: dict) -> None:
     checks = baseline.get("checks") or {}
-    count_check = checks.get("find_invalid_counts") or {}
-    counts = count_check.get("counts_by_type") or {}
+    invalid = checks.get("find_invalid_counts") or {}
+    counts = invalid.get("counts_by_type") or {}
     invalid_total = sum(int(v) for v in counts.values())
-    duplicate_taxa = len((checks.get("find_duplicate_taxa") or {}).get("observations") or [])
-    unclassified = (checks.get("find_unclassified_species") or {}).get("unclassified_count")
-    invalid_col, duplicate_col, unclassified_col = st.columns(3)
-    invalid_col.metric("Invalid count cells", invalid_total if count_check.get("status") == "completed" else "N/A")
-    duplicate_col.metric("Duplicate taxon observations", duplicate_taxa if checks.get("find_duplicate_taxa", {}).get("status") == "completed" else "N/A")
-    unclassified_col.metric("Unclassified species rows", unclassified if unclassified is not None else "N/A")
-    if count_check.get("downstream_blocked"):
-        st.error("Count-dependent preprocessing is blocked until the invalid values and their scientific handling have been reviewed.")
-    if counts:
-        st.write("Invalid counts by type:", counts)
-    rows = []
-    for name, check in checks.items():
-        status = check.get("status", "unknown")
-        rows.append({
-            "Check": name,
-            "Status": status,
+    taxa = checks.get("find_duplicate_taxa") or {}
+    unclassified = checks.get("find_unclassified_species") or {}
+    repeated = checks.get("find_duplicate_ids") or {}
+
+    stats = st.columns(3)
+    stats[0].metric("Cells with count issues", f"{invalid_total:,}" if invalid.get("status") == "completed" else "Not applicable")
+    stats[1].metric("Repeated taxon labels", f"{len(taxa.get('observations') or []):,}" if taxa.get("status") == "completed" else "Not applicable")
+    stats[2].metric("Unclassified species rows", f"{unclassified.get('unclassified_count', 0):,}" if unclassified.get("status") == "completed" else "Not applicable")
+    if invalid.get("downstream_blocked"):
+        st.warning("Count-based analysis needs scientific review of the invalid values before preprocessing.")
+    if repeated.get("status") == "completed" and repeated.get("observations"):
+        st.caption(f"Repeated metadata identifiers: {len(repeated['observations']):,} groups")
+
+    findings = baseline_issues(baseline)
+    if not findings:
+        st.info("No issues were identified by the checks applicable to this dataset. This is not a guarantee that the data is error-free.")
+    else:
+        st.markdown(f"**Issues to review ({len(findings)})**")
+        for finding in findings:
+            show_finding(finding["title"], finding["explanation"],
+                         finding["evidence"], finding["next_step"])
+    with st.expander("Technical check results (advanced)"):
+        check_table = [{
+            "Check": CHECK_NAMES.get(name, name),
+            "Status": STATUS_LABELS.get(check.get("status"), "Not determined"),
             "Observations": len(check.get("observations") or []),
-            "Required context (if skipped)": check.get("required_context", ""),
-        })
-    if rows:
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption(
-        "A skipped check may be inapplicable to this dataset's verified structure; "
-        "it must not automatically be counted as a data-quality failure."
-    )
+            "Applicable to this file": check.get("status") == "completed",
+        } for name, check in checks.items()]
+        st.dataframe(pd.DataFrame(check_table), hide_index=True, width="stretch")
+        st.caption("Skipped checks are not automatically data-quality failures.")
 
 
 def render_objectives(ledger: dict) -> None:
-    counts = ledger.get("counts_by_status") or {}
-    st.write("**Objective completion:**", ledger.get("completion", "unknown"))
-    st.write("**Status counts:**", counts)
-    st.caption(
-        "Resolved means an evidence check ran successfully, not that the dataset "
-        "is scientifically validated or approved for cleaning."
-    )
     objectives = ledger.get("objectives") or []
     if not objectives:
-        st.warning("No investigation-objective ledger was returned.")
+        st.info("There are no investigation questions to display yet.")
         return
-    rows = [
-        {
-            "Objective ID": obj.get("objective_id", ""),
-            "Status": obj.get("status", "unknown"),
-            "Question / check": obj.get("title", ""),
-            "Finding": obj.get("finding", ""),
-            "Next action": obj.get("next_action", ""),
-        }
-        for obj in objectives
-    ]
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    st.caption("Evidence collected means an investigation step ran. It does not mean that cleaning was approved.")
+    table = [{
+        "Question / check": readable_objective_title(obj),
+        "Progress": STATUS_LABELS.get(obj.get("status"), "Not determined"),
+        "What the investigation found": readable_objective_summary(obj)[0],
+        "Next action": readable_objective_summary(obj)[1],
+    } for obj in objectives]
+    st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch")
     pending = [obj for obj in objectives if obj.get("status") == "requires_client_input"]
     if pending:
-        st.markdown("#### Questions to resolve with the client")
+        st.markdown("#### Scientific decisions requiring your input")
         for obj in pending:
-            with st.expander(obj.get("title", "Untitled question")):
-                st.write(obj.get("finding", ""))
-                st.write("**Needed:**", obj.get("next_action", ""))
-                refs = obj.get("evidence_refs") or []
-                if refs:
-                    st.caption("Evidence: " + ", ".join(map(str, refs)))
-    blocked = [obj for obj in objectives if obj.get("status") in {"blocked", "uninvestigated", "in_progress"}]
-    if blocked:
-        st.warning(
-            f"{len(blocked)} objectives are blocked, not yet investigated, or only partially investigated. "
-            "Do not describe this as a complete dataset investigation."
-        )
+            with st.expander(readable_objective_title(obj)):
+                summary, action = readable_objective_summary(obj)
+                st.write(summary or "The available evidence does not resolve this question.")
+                st.write("**What is needed:**", action or "Confirm the appropriate scientific interpretation.")
+                with st.expander("Technical evidence references"):
+                    st.write(obj.get("evidence_refs") or [])
+    unresolved = [obj for obj in objectives if obj.get("status") in {"blocked", "uninvestigated", "in_progress"}]
+    if unresolved:
+        st.warning(f"{len(unresolved)} investigation questions still need additional evidence or tool support.")
 
 
 def render_recommendations(recommendations: list[dict]) -> None:
@@ -165,80 +206,114 @@ def render_recommendations(recommendations: list[dict]) -> None:
         return
 
     for item in recommendations:
-        ident = item.get("recommendation_id", "R?")
         with st.container(border=True):
-            st.markdown(f"**{ident}**")
-            st.write("**Issue:**", item.get("issue") or "Unspecified issue")
+            st.markdown("**" + str(item.get("issue") or "Issue requiring review") + "**")
             status = item.get("advisory_status", "unknown")
-            st.caption("Recommendation status: " + status)
+            st.caption("Proposed method — scientific review required")
             st.write("**Suggested method:**", item.get("suggested_method") or "Not specified")
             if item.get("rationale"):
                 st.write("**Rationale:**", item["rationale"])
-            st.write("**Model uncertainty:**", item.get("uncertainty") or "Not specified")
-            evidence_ids = item.get("evidence_ids") or []
-            st.caption("Evidence references: " + (", ".join(map(str, evidence_ids)) or "None"))
-            if item.get("all_evidence_ids_resolve"):
-                st.caption("References resolve; factual and scientific claims still require checking.")
-            else:
-                st.error("One or more evidence references are absent or invalid.")
+            st.write("**Points to verify:**", item.get("uncertainty") or "Scientific suitability has not been confirmed.")
+            if not item.get("all_evidence_ids_resolve"):
+                st.error("Supporting evidence could not be fully verified; do not approve this method.")
             numeric = item.get("numeric_scope") or {}
             if numeric.get("status") == "partial":
-                st.error(
-                    f"PARTIAL numeric coverage: {numeric.get('covered_invalid_cells', '?')} of "
-                    f"{numeric.get('total_invalid_cells', '?')} invalid cells covered."
+                st.warning(
+                    f"This method addresses only {numeric.get('covered_invalid_cells', '?')} of "
+                    f"{numeric.get('total_invalid_cells', '?')} affected count cells. "
+                    "The remaining cells need a separate decision."
                 )
             elif numeric.get("status") == "complete_for_invalid_cells":
                 st.info(
-                    f"Numeric condition coverage: {numeric.get('covered_invalid_cells')} of "
-                    f"{numeric.get('total_invalid_cells')} invalid cells. This does not validate the method."
+                    f"This method covers all {numeric.get('total_invalid_cells')} identified count issues. "
+                    "A complete coverage count does not establish that the method is scientifically appropriate."
                 )
             elif numeric.get("status") == "unverified_numeric_coverage":
-                st.warning("The number of invalid count cells covered by this method has not been independently established.")
-            with st.expander("Required scientific review and execution-safety status"):
+                st.warning("It has not been verified how many affected cells this method would address.")
+            with st.expander("Scientific review and technical details"):
                 for warning in item.get("scientific_review_flags") or []:
                     st.write("- " + str(warning))
-                st.caption(
-                    "Separate execution validator: "
-                    + str(item.get("execution_validator_status", "unknown"))
-                    + "; execution authorized: No"
-                )
+                st.caption("Technical reference: " + str(item.get("recommendation_id", "")))
+                st.caption("Recommendation state: " + str(status))
+                evidence_ids = item.get("evidence_ids") or []
+                st.caption("Evidence references: " + (", ".join(map(str, evidence_ids)) or "None"))
+                st.caption("Execution validator: " + str(item.get("execution_validator_status", "unknown")))
+                st.caption("Execution authorized: No")
 
 
 def render_evidence(audit: dict) -> None:
     report = audit.get("report") or {}
-    st.markdown("#### Evidence-linked findings")
-    for index, finding in enumerate(report.get("findings") or [], start=1):
-        if not isinstance(finding, dict):
-            continue
-        with st.expander(f"Finding {index}"):
-            st.write("Claim:", finding.get("claim", "Unspecified"))
-            st.write("Evidence IDs:", finding.get("evidence_ids") or [])
-    if not report.get("findings"):
-        st.info("No narrative findings returned. Inspect the deterministic baseline and objective ledger instead.")
+    st.markdown("#### Findings from the investigation")
+    findings = [f for f in report.get("findings") or [] if isinstance(f, dict)]
+    if not findings:
+        st.info("No additional narrative findings were generated. See the baseline results above for independently checked issues.")
+    for index, finding in enumerate(findings, start=1):
+        with st.expander(f"Finding {index}: {finding.get('claim', 'Finding for review')}"):
+            st.write(finding.get("claim") or "No description provided.")
+            with st.expander("Technical evidence references"):
+                st.write(finding.get("evidence_ids") or [])
     questions = report.get("unresolved_questions") or []
     if questions:
-        st.markdown("#### Additional unresolved questions")
+        st.markdown("#### Questions that remain open")
         for question in questions:
             st.write("- " + str(question))
-    st.markdown("#### Read-only investigation history")
+    st.markdown("#### Investigation history")
+    st.caption("Steps show what was examined. They are not changes to the uploaded data.")
     history = audit.get("history") or []
     if not history:
-        st.info("No additional investigation tool observations were recorded.")
+        st.info("No additional investigation observations were recorded.")
     for step in history:
-        with st.expander(f"Step {step.get('step', '?')}: {step.get('tool', 'unknown')}"):
-            st.write("Reason:", step.get("reason") or "Not recorded")
-            st.write("Dataset:", step.get("dataset_id") or "dataset_1")
-            st.json(step.get("observations") or [])
+        tool = step.get("tool", "")
+        label = TOOL_NAMES.get(tool, "Additional investigation")
+        observations = step.get("observations") or []
+        with st.expander(f"{label} — {len(observations):,} evidence item(s)"):
+            if step.get("reason"):
+                st.write("**Why this was checked:**", step["reason"])
+            evidence = history_observations(tool, observations)
+            if evidence:
+                st.dataframe(pd.DataFrame(evidence), hide_index=True, width="stretch")
+                if tool == "compare_columns":
+                    examples = [
+                        {"CSV row": example.get("row", 0) + 1,
+                         "First column value": example.get("left"),
+                         "Second column value": example.get("right")}
+                        for obs in observations if isinstance(obs, dict)
+                        for example in (obs.get("difference_examples") or [])
+                        if isinstance(example, dict) and type(example.get("row")) is int
+                    ]
+                    if examples:
+                        st.markdown("**Examples of rows with different values**")
+                        st.dataframe(pd.DataFrame(examples), hide_index=True, width="stretch")
+                        st.caption("These are examples from the investigation, not a complete list of differences. All original rows are available in the Full dataset table.")
+                if tool in {"inspect_column", "inspect_columns"}:
+                    frequency_rows = [
+                        {"Column": obs.get("position"), "Column name": obs.get("name"),
+                         "Observed value": entry.get("value"), "Times observed": entry.get("count"),
+                         "Example CSV rows": ", ".join(map(str, entry.get("csv_rows") or []))}
+                        for obs in observations if isinstance(obs, dict)
+                        for entry in (obs.get("value_frequencies") or [])
+                        if isinstance(entry, dict)
+                    ]
+                    if frequency_rows:
+                        with st.expander("See observed values and where they occur"):
+                            st.dataframe(pd.DataFrame(frequency_rows), hide_index=True, width="stretch")
+                            st.caption("Common and rare values are sampled for inspection. The Full dataset table contains all original values.")
+            elif observations:
+                st.write("Supporting observations were recorded. Expand the technical details to inspect the complete source results.")
+            else:
+                st.write("No observations were returned in this step.")
+            with st.expander("Technical details (advanced)"):
+                st.json({"tool": tool, "step": step.get("step"),
+                         "dataset_id": step.get("dataset_id"),
+                         "arguments": step.get("arguments") or {},
+                         "observations": observations})
 
 
 def render_ui() -> None:
     st.set_page_config(page_title="Healthcare Data Quality AI", page_icon="🔬", layout="wide")
     st.title("Healthcare Data Quality AI")
-    st.caption("Local-first · Evidence-driven investigation · Client review rehearsal")
-    st.info(
-        "Investigation-only mode. No R code is generated or executed, no review "
-        "decision is recorded, and no source dataset is modified."
-    )
+    st.caption("Inspect the data, understand what needs attention, and review supporting evidence.")
+    st.info("Review-only demonstration: your original datasets will not be modified or cleaned.")
 
     uploaded = st.file_uploader(
         "Upload one or more CSV datasets",
@@ -271,7 +346,7 @@ def render_ui() -> None:
         st.error("At least one CSV has an empty header row.")
         return
 
-    st.subheader("Dataset preview")
+    st.subheader("Full dataset")
     options = {f"dataset_{i + 1} — {file.name}": i for i, file in enumerate(uploaded)}
     selected = st.selectbox("Inspect uploaded dataset", list(options))
     index = options[selected]
@@ -279,25 +354,23 @@ def render_ui() -> None:
     count_col, col_col, duplicate_col = st.columns(3)
     count_col.metric("Records", details["data_rows"])
     col_col.metric("Columns", details["total_columns"])
-    duplicate_col.metric("Repeated header names", len(details["duplicate_headers"]))
+    duplicate_col.metric("Repeated column names", sum(1 for name in details["duplicate_headers"] if name.strip()))
     try:
-        st.dataframe(preview_csv(paths[index]), hide_index=True, width="stretch")
+        full_table = preview_csv(paths[index])
+        st.caption(
+            f"Displaying all {len(full_table):,} records and {len(full_table.columns):,} columns. "
+            "Scroll vertically and horizontally; use the table's full-screen "
+            "control for a larger view. No preview rows or columns are omitted."
+        )
+        st.dataframe(full_table, hide_index=True, width="stretch", height=650)
     except (UnicodeError, csv.Error, OSError) as exc:
-        st.error(f"Could not preview this CSV: {exc}")
+        st.error(f"Could not display the complete CSV: {exc}")
         return
-    if details["duplicate_headers"]:
-        st.warning("Repeated headers found. Identical column values do not establish duplicate specimen identity.")
-        st.json(details["duplicate_headers"])
-    if details["ragged_records"]:
-        st.warning("Inconsistent record widths found.")
-        st.write(details["ragged_records"][:20])
-    if details["blank_header_positions"]:
-        st.warning("Blank headers:")
-        st.write(details["blank_header_positions"])
+    render_header_findings(paths[index], details)
 
     st.divider()
-    st.subheader("Agent investigation")
-    st.caption("The model must be running locally. Investigation starts only when you click the button below.")
+    st.subheader("Investigate data quality")
+    st.caption("Start a deeper review with the local AI model and automated data-quality checks.")
     if st.button("Run read-only investigation", type="primary"):
         status = st.empty()
         try:
@@ -305,16 +378,14 @@ def render_ui() -> None:
                 audit = run_initial_audit(
                     paths[0],
                     additional_datasets=paths[1:],
-                    progress_callback=lambda message: status.caption("[Agent] " + str(message)),
+                    progress_callback=lambda message: status.caption("Reviewing the data and collecting supporting evidence…"),
                 )
                 audit["scientific_recommendations"] = build_scientific_recommendations(audit)
         except Exception as exc:
             status.empty()
-            st.error(
-                f"Investigation failed ({type(exc).__name__}). "
-                "Check that the local Gemma/vLLM server is running and review the WSL logs. "
-                "No cleaning was attempted."
-            )
+            st.error("The investigation could not finish. Check that the local AI service is running. No data was changed.")
+            with st.expander("Technical troubleshooting"):
+                st.code(f"{type(exc).__name__}: {exc}")
             return
         status.empty()
         st.session_state.audit_result = audit
@@ -328,8 +399,9 @@ def render_ui() -> None:
     st.success("Investigation run finished; results are available for review.")
     objective_ledger = audit.get("investigation_objectives") or {}
     status = audit.get("status", "unknown")
-    st.write("**Agent stop reason:**", f"`{status}`")
-    st.write("**Objective-ledger assessment:**", objective_ledger.get("completion", "unknown"))
+    with st.expander("Investigation run status (advanced)"):
+        st.write("Agent stop reason:", status)
+        st.write("Objective assessment:", objective_ledger.get("completion", "unknown"))
     if objective_ledger.get("completion") != "evidence_checks_resolved_only":
         st.warning(
             "Investigation remains incomplete. Unresolved scientific questions, "
@@ -341,14 +413,13 @@ def render_ui() -> None:
         st.error("Gemma could not complete proposal generation; see the downloaded audit for details.")
 
     summary_tab, objective_tab, recommendation_tab, evidence_tab = st.tabs(
-        ["Baseline QC", "Investigation objectives", "Cleaning recommendations", "Evidence and audit"]
+        ["Data quality findings", "Questions and decisions", "Proposed methods", "Supporting evidence"]
     )
     with summary_tab:
         for dataset_id, baseline in (audit.get("dataset_baselines") or {"dataset_1": audit.get("baseline") or {}}).items():
             label_index = int(dataset_id.rsplit("_", 1)[-1]) - 1
             dataset_name = uploaded[label_index].name if label_index < len(uploaded) else dataset_id
-            st.subheader(dataset_id)
-            st.caption(dataset_name)
+            st.subheader(f"Dataset {label_index + 1}: {dataset_name}")
             render_baseline(dataset_id, baseline)
         if len(uploaded) > 1:
             st.warning("Full cross-dataset identifier reconciliation is not yet implemented as an investigation tool.")
