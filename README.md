@@ -251,7 +251,7 @@ source /home/xavier/.venv/bin/activate
 git status --short         # Save uncommitted backend changes first
 git switch main           # UI + latest MERGED backend version
 
-PYTHONPATH=src python -m streamlit run app.py \
+PYTHONPATH=src:scripts streamlit run app.py \
   --server.address 127.0.0.1 \
   --server.port 8501 \
   --browser.gatherUsageStats false
@@ -1210,7 +1210,7 @@ Start the local Gemma/vLLM server in terminal A and confirm `/v1/models` respond
 ### 2. Start Streamlit in terminal B
 
 ```bash
-PYTHONPATH=src python -m streamlit run app.py \
+PYTHONPATH=src:scripts streamlit run app.py \
   --server.address 127.0.0.1 \
   --server.port 8501 \
   --browser.gatherUsageStats false
