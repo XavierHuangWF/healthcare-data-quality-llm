@@ -9,6 +9,7 @@ MODEL_NAME = "gemma4-12b"
 def query_local_model(
         prompt: str,
         json_schema: dict | None = None,
+        max_tokens: int = 4096,
 ) -> str:
     payload = {
         "model": MODEL_NAME,
@@ -16,7 +17,7 @@ def query_local_model(
             {"role": "user", "content": prompt}
         ],
         "temperature": 0,
-        "max_tokens": 1536,
+        "max_tokens": max_tokens,
     }
 
     if json_schema is not None:
@@ -36,7 +37,7 @@ def query_local_model(
     )
 
     try:
-        with urlopen(request, timeout=180) as response:
+        with urlopen(request, timeout=600) as response:
             result = json.load(response)
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -47,8 +48,13 @@ def query_local_model(
     choice = result["choices"][0]
 
     if choice["finish_reason"] != "stop":
+        usage = result.get("usage") or {}
+
         raise RuntimeError(
-            f"Incomplete generation: {choice['finish_reason']}"
+            f"Incomplete generation: {choice['finish_reason']}; "
+            f"prompt_tokens={usage.get('prompt_tokens')}; "
+            f"completion_tokens={usage.get('completion_tokens')}; "
+            f"completion_details={usage.get('completion_tokens_details')}"
         )
 
     return choice["message"]["content"]

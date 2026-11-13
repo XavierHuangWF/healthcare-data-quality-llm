@@ -5,6 +5,7 @@ modifies a source dataset, or grants approval to remediate any finding.
 """
 
 import csv
+import re
 from itertools import combinations
 from pathlib import Path
 
@@ -232,7 +233,120 @@ def _issue(title: str, explanation: str, evidence: list[dict], next_step: str = 
     return {"title": title, "explanation": explanation, "evidence": evidence, "next_step": next_step}
 
 
-def baseline_issues(baseline: dict) -> list[dict]:
+# This project currently audits the classical seven-rank taxonomy format.
+# A missing *rank entry* is not evidence that the underlying taxon is unknown.
+EXPECTED_TAXONOMY_RANKS = (
+    ("Kingdom / Domain", "k__"),
+    ("Phylum", "p__"),
+    ("Class", "c__"),
+    ("Order", "o__"),
+    ("Family", "f__"),
+    ("Genus", "g__"),
+    ("Species", "s__"),
+)
+
+
+def _original_taxonomy_by_csv_row(path: Path | None, row_numbers: set[int]) -> dict[int, str]:
+    """Recover original text using CSV physical record numbering, preserving values verbatim."""
+    if not path or not row_numbers:
+        return {}
+    found: dict[int, str] = {}
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as source:
+        for csv_row, record in enumerate(csv.reader(source), start=1):
+            if csv_row in row_numbers:
+                found[csv_row] = record[0] if record else ""
+                if len(found) == len(row_numbers):
+                    break
+    return found
+
+
+def _taxonomy_structure_evidence(
+    incomplete: list[dict], source_path: Path | None
+) -> tuple[list[dict], list[dict]]:
+    """Show source taxonomy and the seven expected rank slots, without filling unknown taxa.
+
+    If all tokens are rank-prefixed and strictly ordered, the prefixes identify
+    which ranks are absent. Otherwise the assignment is explicitly positional,
+    and must not be mistaken for an authoritative taxonomic correction.
+    """
+    original_by_row = _original_taxonomy_by_csv_row(
+        source_path, {int(r["record"]) for r in incomplete if r.get("record") is not None}
+    )
+    prefix_to_index = {prefix[0]: i for i, (_, prefix) in enumerate(EXPECTED_TAXONOMY_RANKS)}
+    prefix_to_index["d"] = 0  # Some datasets mark Domain as d__ instead of k__.
+    rows: list[dict] = []
+    details: list[dict] = []
+
+    for record in incomplete:
+        csv_row = record.get("record")
+        original = original_by_row.get(csv_row, record.get("original_taxonomy"))
+        # The existing audit counts both semicolons and vertical bars as separators.
+        levels = [part.strip() for part in re.split(r"[;|]", original)] if original is not None else []
+        declared_count = record.get("level_count")
+        level_count = int(declared_count) if declared_count is not None else len(levels)
+
+        prefix_indices = []
+        for value in levels:
+            match = re.match(r"^([dkpcofgs])__", value, flags=re.IGNORECASE)
+            prefix_indices.append(prefix_to_index.get(match.group(1).lower()) if match else None)
+        unambiguous_prefixes = (
+            bool(levels)
+            and all(index is not None for index in prefix_indices)
+            and all(left < right for left, right in zip(prefix_indices, prefix_indices[1:]))
+        )
+        placement_note = (
+            "Rank prefixes identify the positions shown. Taxon names have not been validated."
+            if unambiguous_prefixes else
+            "Provisional left-to-right alignment: rank positions have not been confirmed against the source taxonomy."
+        )
+        assigned: dict[int, str] = {}
+        if unambiguous_prefixes:
+            assigned = dict(zip(prefix_indices, levels))
+        else:
+            assigned = {index: value for index, value in enumerate(levels[:7])}
+
+        missing_indices = [index for index in range(7) if index not in assigned]
+        missing = ", ".join(EXPECTED_TAXONOMY_RANKS[index][0] for index in missing_indices)
+        if original is None:
+            missing = (
+                f"{max(0, 7 - level_count)} rank(s) missing; exact positions unavailable "
+                "without the original classification"
+            )
+            placement_note = "Original classification unavailable; the missing rank positions cannot be established."
+        elif not missing:
+            missing = "Not identifiable by position; inspect the original classification"
+        rank_table = [
+            {
+                "Expected rank": rank_name,
+                "Expected prefix": prefix,
+                "Original entry (provisional rank)": (
+                    assigned.get(index, "Not provided") if original is not None else "Source unavailable"
+                ),
+                "Status": (
+                    "Present in source" if index in assigned else "Not provided in source"
+                ) if original is not None else "Cannot assess",
+            }
+            for index, (rank_name, prefix) in enumerate(EXPECTED_TAXONOMY_RANKS)
+        ]
+        rows.append({
+            "CSV row": csv_row,
+            "Original classification (verbatim)": original if original is not None else "Source text unavailable",
+            "Levels found": level_count,
+            "Expected levels": 7,
+            "Ranks not provided (provisional)": missing,
+        })
+        details.append({
+            "csv_row": csv_row,
+            "original": original,
+            "missing": missing,
+            "rank_table": rank_table,
+            "placement_note": placement_note,
+        })
+    return rows, details
+
+
+
+def baseline_issues(baseline: dict, source_path: Path | None = None) -> list[dict]:
     """Provide complete, tabular source evidence without exposing internal JSON keys."""
     checks = baseline.get("checks") or {}
     issues: list[dict] = []
@@ -300,31 +414,67 @@ def baseline_issues(baseline: dict) -> list[dict]:
         incomplete = structure.get("incomplete_taxonomy") or []
         alternate = structure.get("alternate_delimiters") or []
         if incomplete:
-            issues.append(_issue(
+            evidence, details = _taxonomy_structure_evidence(incomplete, source_path)
+            issue = _issue(
                 f"{len(incomplete):,} {'row has' if len(incomplete) == 1 else 'rows have'} incomplete taxonomic classifications",
-                "These rows do not contain the expected seven taxonomic levels.",
-                [{"CSV row": r.get("record"), "Classification levels found": r.get("level_count"),
-                  "Expected levels": 7} for r in incomplete],
-                "Review the taxonomy source and naming convention before attempting a mapping.",
-            ))
+                "The current file format expects seven ranks: Kingdom/Domain, Phylum, Class, "
+                "Order, Family, Genus and Species. The table shows the original classification "
+                "and which rank entries appear absent. Missing ranks are provisional when "
+                "the source does not explicitly identify rank positions.",
+                evidence,
+                "Check the original taxonomy database or annotation pipeline to identify missing "
+                "names. Do not assign species names or fill missing ranks automatically.",
+            )
+            issue["type"] = "taxonomy_structure"
+            issue["details"] = details
+            issues.append(issue)
+
         if alternate:
+            original_by_row = _original_taxonomy_by_csv_row(
+                source_path, {int(row) for row in alternate}
+            )
+
+            evidence = []
+
+            for row in alternate:
+                original = original_by_row.get(int(row))
+
+                suggested = (
+                    "; ".join(
+                        part.strip()
+                        for part in re.split(r"[;|]", original)
+                    )
+                    if original is not None
+                    else "Source unavailable"
+                )
+
+                evidence.append({
+                    "CSV row": row,
+                    "Original classification": (
+                        original if original is not None
+                        else "Source unavailable"
+                    ),
+                    "Problem": "Uses | instead of ;",
+                    "Expected separator": ";",
+                })
+
             issues.append(_issue(
-                f"{len(alternate):,} {'row uses' if len(alternate) == 1 else 'rows use'} a different taxonomy separator",
-                "These rows contain a vertical bar (|) instead of the usual semicolon-separated format.",
-                [{"CSV row": row, "Issue": "Different separator (|)"} for row in alternate],
-                "Confirm the expected taxonomy format before standardizing labels.",
+
+                f"{len(alternate):,} "
+                f"{'row uses' if len(alternate) == 1 else 'rows use'} "
+                "inconsistent taxonomy separators",
+
+                "The expected format uses semicolons (;) "
+                "between taxonomic ranks. The affected rows "
+                "use vertical bars (|). The proposed version "
+                "only standardizes separators and preserves "
+                "the original taxonomic names.",
+                evidence,
+                "Review the suggested format before making "
+                "any changes to the source data.",
             ))
-    check = checks.get("find_unclassified_species") or {}
-    if check.get("status") == "completed":
-        observations = check.get("observations") or []
-        if observations:
-            issues.append(_issue(
-                f"{len(observations):,} {'row has' if len(observations) == 1 else 'rows have'} no specific species assignment",
-                "The species-level classification is missing, unknown, or explicitly unclassified.",
-                [{"CSV row": r.get("record"), "Taxon / feature": r.get("original_taxonomy"),
-                  "Species entry": r.get("species_value")} for r in observations],
-                "Agree on how unknown species should be retained and reported.",
-            ))
+
+
     check = checks.get("inspect_taxonomy_naming") or {}
     if check.get("status") == "completed":
         counts = check.get("counts_by_style") or {}

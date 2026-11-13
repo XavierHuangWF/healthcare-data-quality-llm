@@ -16,7 +16,10 @@ from ..duplicate_validation import (
 from .microbiome import observe_matrix_structure
 from .context import STRUCTURE_CONTEXT
 from .provenance import inspect_provenance
-
+from ..r_sandbox import run_r_sandbox
+import json
+import re
+from hashlib import sha256
 @dataclass(frozen=True)
 class ToolSpec:
     description: str
@@ -30,7 +33,55 @@ class ToolSpec:
         }
     )
 
+def investigate_with_r(path: Path, r_function: str) -> list[dict]:
+    """Execute model-generated R analysis in the isolated sandbox."""
 
+    source_csv = path.read_text(encoding="utf-8-sig")
+
+    observation_csv = run_r_sandbox(
+        r_function=r_function,
+        synthetic_csv=source_csv,
+    )
+
+    return [{
+        "status": "sandbox_executed",
+        "format": "csv",
+        "observations": observation_csv[:8000],
+        "truncated": len(observation_csv) > 8000,
+    }]
+def reuse_saved_r_investigation(
+        path: Path,
+        tool_id: str,
+) -> list[dict]:
+    """Execute a previously approved R investigation tool."""
+
+    if not re.fullmatch(r"[0-9a-f]{16}", tool_id):
+        raise ValueError("Invalid saved tool ID")
+
+    tool_dir = Path("tools/generated_r")
+    code_path = tool_dir / f"{tool_id}.R"
+    metadata_path = tool_dir / f"{tool_id}.json"
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    r_code = code_path.read_text(encoding="utf-8")
+
+    actual_hash = sha256(r_code.encode("utf-8")).hexdigest()
+
+    if (
+            metadata.get("tool_id") != tool_id
+            or metadata.get("code_sha256") != actual_hash
+            or not actual_hash.startswith(tool_id)
+            or metadata.get("human_approved_for_storage") is not True
+            or metadata.get("execution_status") != "sandbox_executed"
+    ):
+        raise ValueError("Saved R tool failed integrity or approval checks")
+
+    observations = investigate_with_r(path, r_code)
+
+    for observation in observations:
+        observation["reused_tool_id"] = tool_id
+
+    return observations
 TOOL_REGISTRY: dict[str, ToolSpec] = {
     "find_duplicate_ids": ToolSpec(
         description="Detect repeated identifiers in metadata.",
@@ -145,6 +196,54 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
                 },
             },
             "required": ["left", "right"],
+            "additionalProperties": False,
+        },
+
+    ),
+    "investigate_with_r": ToolSpec(
+        description=(
+            "Generate a dataset-specific read-only R investigation. "
+            "Supply R code defining clean_dataset(input_df). "
+            "The function must return a data.frame containing "
+            "concise investigation findings, not a cleaned dataset. "
+            "Inspect any columns, values, duplicates, distributions, "
+            "or relationships relevant to the current uncertainty. "
+            "Do not modify the source data."
+        ),
+        function=investigate_with_r,
+        requires_context=STRUCTURE_CONTEXT,
+        arguments_schema={
+            "type": "object",
+            "properties": {
+                "r_function": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+            },
+            "required": ["r_function"],
+            "additionalProperties": False,
+        },
+    ),
+    "reuse_saved_r_investigation": ToolSpec(
+        description=(
+            "Reuse a previously approved R investigation tool. "
+            "Supply the tool_id from the saved-tool catalog. "
+            "Execute the saved function against the current dataset "
+            "and return fresh observations. "
+            "Previously successful execution does not establish "
+            "scientific correctness for a new dataset."
+        ),
+        function=reuse_saved_r_investigation,
+        requires_context=STRUCTURE_CONTEXT,
+        arguments_schema={
+            "type": "object",
+            "properties": {
+                "tool_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{16}$",
+                },
+            },
+            "required": ["tool_id"],
             "additionalProperties": False,
         },
     ),

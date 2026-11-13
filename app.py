@@ -109,6 +109,28 @@ def show_finding(title: str, explanation: str, evidence: list[dict], next_step: 
                 st.dataframe(pd.DataFrame(evidence), hide_index=True, width="stretch")
 
 
+def show_taxonomy_structure_finding(finding: dict) -> None:
+    """Show all original classifications and an explicit rank-by-rank expectation."""
+    with st.container(border=True):
+        st.markdown(f"**{finding['title']}**")
+        st.write(finding["explanation"])
+        st.markdown(
+            "**Expected seven-rank order:** "
+            "Kingdom/Domain → Phylum → Class → Order → Family → Genus → Species"
+        )
+        st.caption(
+            "A taxon may legitimately be identified only to genus or another higher rank. "
+            "Seven ranks are the expected file structure, not proof that a species name is known."
+        )
+        st.write("**Original classifications and missing ranks:**")
+        st.dataframe(pd.DataFrame(finding["evidence"]), hide_index=True, width="stretch")
+
+
+        if finding.get("next_step"):
+            st.write("**What to check next:**", finding["next_step"])
+
+
+
 def render_header_findings(path: Path, details: dict) -> None:
     repeated = header_findings(path, details)
     missing_and_width = header_issues(details)
@@ -130,7 +152,7 @@ def render_header_findings(path: Path, details: dict) -> None:
         show_finding(finding["title"], finding["explanation"], finding["rows"], finding["next_step"])
 
 
-def render_baseline(dataset_id: str, baseline: dict) -> None:
+def render_baseline(dataset_id: str, baseline: dict, source_path: Path | None = None) -> None:
     checks = baseline.get("checks") or {}
     invalid = checks.get("find_invalid_counts") or {}
     counts = invalid.get("counts_by_type") or {}
@@ -148,23 +170,62 @@ def render_baseline(dataset_id: str, baseline: dict) -> None:
     if repeated.get("status") == "completed" and repeated.get("observations"):
         st.caption(f"Repeated metadata identifiers: {len(repeated['observations']):,} groups")
 
-    findings = baseline_issues(baseline)
+    findings = baseline_issues(baseline, source_path=source_path)
     if not findings:
         st.info("No issues were identified by the checks applicable to this dataset. This is not a guarantee that the data is error-free.")
     else:
         st.markdown(f"**Issues to review ({len(findings)})**")
         for finding in findings:
-            show_finding(finding["title"], finding["explanation"],
-                         finding["evidence"], finding["next_step"])
+            if finding.get("type") == "taxonomy_structure":
+                show_taxonomy_structure_finding(finding)
+            else:
+                show_finding(finding["title"], finding["explanation"],
+                             finding["evidence"], finding["next_step"])
+
     with st.expander("Technical check results (advanced)"):
-        check_table = [{
-            "Check": CHECK_NAMES.get(name, name),
-            "Status": STATUS_LABELS.get(check.get("status"), "Not determined"),
-            "Observations": len(check.get("observations") or []),
-            "Applicable to this file": check.get("status") == "completed",
-        } for name, check in checks.items()]
-        st.dataframe(pd.DataFrame(check_table), hide_index=True, width="stretch")
-        st.caption("Skipped checks are not automatically data-quality failures.")
+        check_table = []
+
+        for name, check in checks.items():
+            status = check.get("status")
+            completed = status == "completed"
+
+            if status == "skipped_unverified_context":
+                display_status = "Not assessed"
+                if name in {"find_duplicate_ids", "find_duplicate_conflicts"}:
+                    reason = (
+                        "Requires metadata with SampleID and NPDNum columns."
+                    )
+                else:
+                    reason = (
+                            "Required dataset structure not verified: "
+                            + str(check.get("required_context", "unknown"))
+                    )
+            else:
+                display_status = STATUS_LABELS.get(
+                    status, "Not determined"
+                )
+                reason = ""
+
+            check_table.append({
+                "Check": CHECK_NAMES.get(name, name),
+                "Status": display_status,
+                "Observations": (
+                    len(check.get("observations") or [])
+                    if completed else "—"
+                ),
+                "Explanation": reason,
+            })
+
+        st.dataframe(
+            pd.DataFrame(check_table),
+            hide_index=True,
+            width="stretch",
+        )
+
+        st.caption(
+            "Not assessed means the check did not run. "
+            "It does not mean zero problems were found."
+        )
 
 
 def render_objectives(ledger: dict) -> None:
@@ -362,7 +423,19 @@ def render_ui() -> None:
             "Scroll vertically and horizontally; use the table's full-screen "
             "control for a larger view. No preview rows or columns are omitted."
         )
-        st.dataframe(full_table, hide_index=True, width="stretch", height=650)
+
+        full_table.index = pd.RangeIndex(
+            start=2,
+            stop=len(full_table) + 2,
+            name="CSV row"
+        )
+
+        st.dataframe(
+            full_table,
+            hide_index=False,
+            width="stretch",
+            height=650
+        )
     except (UnicodeError, csv.Error, OSError) as exc:
         st.error(f"Could not display the complete CSV: {exc}")
         return
@@ -420,7 +493,7 @@ def render_ui() -> None:
             label_index = int(dataset_id.rsplit("_", 1)[-1]) - 1
             dataset_name = uploaded[label_index].name if label_index < len(uploaded) else dataset_id
             st.subheader(f"Dataset {label_index + 1}: {dataset_name}")
-            render_baseline(dataset_id, baseline)
+            render_baseline(dataset_id, baseline, source_path=paths[label_index])
         if len(uploaded) > 1:
             st.warning("Full cross-dataset identifier reconciliation is not yet implemented as an investigation tool.")
     with objective_tab:

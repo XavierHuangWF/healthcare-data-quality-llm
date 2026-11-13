@@ -22,6 +22,7 @@ def verify_remediation(
     source: Path,
     output: Path,
     audit_path: Path,
+    operation_id: str,
 ) -> dict:
     if not source.is_file() or not output.is_file():
         raise FileNotFoundError("Source or output dataset missing")
@@ -44,11 +45,12 @@ def verify_remediation(
 
     matches = [
         record for record in records
-        if record.get("source_fingerprint") == source_hash
-        and record.get("output_fingerprint") == output_hash
-        and record.get("operation") == "drop_duplicate_column"
-        and record.get("execution_status")
-            == "copy_created_and_verified"
+        if record.get("operation_id") == operation_id
+           and record.get("source_fingerprint") == source_hash
+           and record.get("output_fingerprint") == output_hash
+           and record.get("operation") == "drop_duplicate_column"
+           and record.get("execution_status")
+           == "copy_created_and_verified"
     ]
 
     if len(matches) != 1:
@@ -188,6 +190,7 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("audit", type=Path)
     parser.add_argument("--outcome-log", type=Path, default=None)
+    parser.add_argument("--operation-id", required=True)
 
     args = parser.parse_args()
 
@@ -195,6 +198,7 @@ def main():
         args.source,
         args.output,
         args.audit,
+        operation_id=args.operation_id,
     )
 
 

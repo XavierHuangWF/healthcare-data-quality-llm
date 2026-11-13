@@ -1,37 +1,135 @@
-from pathlib import Path
-from ..dataset_profiler import profile_csv
 import csv
+from collections import Counter, defaultdict
+from itertools import groupby
+from pathlib import Path
+
+from ..dataset_profiler import profile_csv
+
+
+MAX_VALUE_DETAILS = 24
+MAX_PATTERN_DETAILS = 20
+MAX_EXAMPLE_ROWS = 3
+
+
+def _value_shape(value: str) -> str:
+    """Describe character classes without assuming a naming convention."""
+    classes = (
+        "A" if char.isupper() else
+        "a" if char.islower() else
+        "9" if char.isdigit() else
+        char
+        for char in value
+    )
+    parts = []
+    for char_class, group in groupby(classes):
+        count = sum(1 for _ in group)
+        parts.append(
+            f"{char_class}{{{count}}}" if count > 1 else char_class
+        )
+    return "".join(parts)
+
+
+def _bounded_items(
+    counter: Counter,
+    limit: int,
+) -> list[tuple[str, int]]:
+    """Retain common and rare entries, rather than dropping high-cardinality evidence."""
+    ranked = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    if len(ranked) <= limit:
+        return ranked
+
+    common_count = limit // 2
+    common = ranked[:common_count]
+    rare = sorted(
+        ranked[common_count:],
+        key=lambda item: (item[1], item[0]),
+    )[:limit - common_count]
+    return common + rare
+
 
 def inspect_column(path: Path, position: int) -> list[dict]:
-    profile = profile_csv(path)
-    columns = profile["columns"]
-    if not 1 <= position <= len(columns):
-        raise ValueError(
-            f"Invalid column position: {position}. "
-            f"Valid range: 1–{len(columns)}"
-        )
-    return [columns[position - 1]]
+    return inspect_columns(path, [position])
 
 
 def inspect_columns(path: Path, positions: list[int]) -> list[dict]:
     if not isinstance(positions, list):
         raise ValueError("positions must be a list")
-
     if not 1 <= len(positions) <= 4:
         raise ValueError("Specify between 1 and 4 columns")
-
     if any(type(pos) is not int for pos in positions):
         raise ValueError("Column positions must be integers")
-
     if len(set(positions)) != len(positions):
         raise ValueError("Duplicate positions are not allowed")
 
     columns = profile_csv(path)["columns"]
-
     if any(not 1 <= pos <= len(columns) for pos in positions):
         raise ValueError("Column position out of range")
 
-    return [columns[pos - 1] for pos in positions]
+    value_counts = {pos: Counter() for pos in positions}
+    value_rows = {pos: defaultdict(list) for pos in positions}
+    pattern_counts = {pos: Counter() for pos in positions}
+    pattern_examples = {pos: defaultdict(list) for pos in positions}
+
+    with path.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.reader(file)
+        next(reader)  # Already validated by profile_csv().
+        for csv_row, row in enumerate(reader, start=2):
+            if len(row) != len(columns):
+                raise ValueError(
+                    f"Record {csv_row}: inconsistent field count"
+                )
+            for pos in positions:
+                raw = row[pos - 1]
+                if not raw.strip():
+                    continue
+
+                value_counts[pos][raw] += 1
+                if len(value_rows[pos][raw]) < MAX_EXAMPLE_ROWS:
+                    value_rows[pos][raw].append(csv_row)
+
+                shape = _value_shape(raw)
+                pattern_counts[pos][shape] += 1
+                if len(pattern_examples[pos][shape]) < MAX_EXAMPLE_ROWS:
+                    pattern_examples[pos][shape].append({
+                        "value": raw,
+                        "csv_row": csv_row,
+                    })
+
+    results = []
+    for pos in positions:
+        observation = dict(columns[pos - 1])
+        values = value_counts[pos]
+        patterns = pattern_counts[pos]
+
+        observation["value_frequencies"] = [
+            {
+                "value": value,
+                "count": count,
+                "csv_rows": value_rows[pos][value],
+            }
+            for value, count in _bounded_items(
+                values, MAX_VALUE_DETAILS
+            )
+        ]
+        observation["value_frequencies_truncated"] = (
+            len(values) > MAX_VALUE_DETAILS
+        )
+        observation["format_patterns"] = [
+            {
+                "shape": shape,
+                "count": count,
+                "examples": pattern_examples[pos][shape],
+            }
+            for shape, count in _bounded_items(
+                patterns, MAX_PATTERN_DETAILS
+            )
+        ]
+        observation["format_patterns_truncated"] = (
+            len(patterns) > MAX_PATTERN_DETAILS
+        )
+        results.append(observation)
+
+    return results
 
 
 def compare_columns(

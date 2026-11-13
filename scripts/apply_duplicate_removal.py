@@ -19,15 +19,11 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("source", type=Path)
-    parser.add_argument("output", type=Path)
-    parser.add_argument("--authorization-id", required=True)
-    args = parser.parse_args()
-
-    source = args.source
-    output = args.output
+def apply_duplicate_removal(
+    source: Path,
+    output: Path,
+    authorization_id: str,
+) -> dict:
 
 
     if source.resolve() == output.resolve():
@@ -55,7 +51,7 @@ def main():
 
             record = json.loads(line)
 
-            if record.get("authorization_id") == args.authorization_id:
+            if record.get("authorization_id") == authorization_id:
                 matches.append(record)
 
     if len(matches) != 1:
@@ -308,7 +304,21 @@ def main():
     print("Columns:", len(transformed[0]))
     print("Original unchanged: True")
     print("Audit:", audit_path)
+    return audit
 
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("source", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--authorization-id", required=True)
+
+    args = parser.parse_args()
+
+    apply_duplicate_removal(
+        source=args.source,
+        output=args.output,
+        authorization_id=args.authorization_id,
+    )
 
 if __name__ == "__main__":
     main()
