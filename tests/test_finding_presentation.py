@@ -108,3 +108,59 @@ def test_whitespace_only_header_is_reported_as_unnamed(tmp_path):
     details = inspect_headers(path)
     assert details["blank_header_positions"] == [1]
     assert header_issues(details)[0]["title"] == "Column 1 has no header name"
+
+
+def test_taxonomy_shows_original_classification_and_unassigned_rank_slots(tmp_path):
+    from healthcare_data_quality.taxonomy_validation import inspect_taxonomy_structure
+
+    source = make_csv(tmp_path, ["Taxonomy", "Sample A"], [
+        ["Bacteria; Actinobacteria; Actinobacteria; Actinomycetales; Actinomycetaceae; Arcanobacterium", "5"],
+        ["Bacteria; Actinobacteria; Actinobacteria; Actinomycetales; Actinomycetaceae", "6"],
+        ["Bacteria; Actinobacteria (SGB12345678)", "7"],
+        ["Bacteria; Actinobacteria; Actinobacteria; Micrococcales; Micrococcaceae; Rothia", "8"],
+    ])
+    incomplete = inspect_taxonomy_structure(source)["incomplete_taxonomy"]
+    issues = baseline_issues({"checks": {"inspect_taxonomy_structure": {
+        "status": "completed", "observations": [{"incomplete_taxonomy": incomplete}]
+    }}}, source_path=source)
+    issue = issues[0]
+    assert issue["type"] == "taxonomy_structure"
+    assert [r["CSV row"] for r in issue["evidence"]] == [2, 3, 4, 5]
+    assert [r["Ranks not provided (provisional)"] for r in issue["evidence"]] == [
+        "Species", "Genus, Species", "Class, Order, Family, Genus, Species", "Species"
+    ]
+    assert issue["evidence"][0]["Original classification (verbatim)"].endswith("Arcanobacterium")
+    first = issue["details"][0]
+    assert first["rank_table"][5]["Original entry (provisional rank)"] == "Arcanobacterium"
+    assert first["rank_table"][6]["Original entry (provisional rank)"] == "Not provided"
+    assert "not been confirmed" in first["placement_note"]
+    assert issue["details"][2]["rank_table"][1]["Original entry (provisional rank)"] == (
+        "Actinobacteria (SGB12345678)"
+    )
+    assert issue["details"][2]["rank_table"][2]["Status"] == "Not provided in source"
+
+
+def test_taxonomy_prefixes_identify_missing_internal_ranks(tmp_path):
+    source = make_csv(tmp_path, ["Taxonomy", "Sample"], [
+        ["k__Bacteria; p__Actinobacteria; g__Rothia; s__mucilaginosa", "1"]
+    ])
+    issue = baseline_issues({"checks": {"inspect_taxonomy_structure": {
+        "status": "completed", "observations": [{"incomplete_taxonomy": [
+            {"record": 2, "level_count": 4}
+        ]}]
+    }}}, source_path=source)[0]
+    assert issue["evidence"][0]["Ranks not provided (provisional)"] == "Class, Order, Family"
+    assert issue["details"][0]["rank_table"][5]["Original entry (provisional rank)"] == "g__Rothia"
+    assert "prefixes identify" in issue["details"][0]["placement_note"]
+
+
+def test_taxonomy_legacy_audit_without_source_does_not_fabricate_original():
+    baseline = {"checks": {"inspect_taxonomy_structure": {
+        "status": "completed", "observations": [{"incomplete_taxonomy": [
+            {"record": 3, "level_count": 6}
+        ]}]
+    }}}
+    issue = baseline_issues(baseline)[0]
+    assert issue["evidence"][0]["Original classification (verbatim)"] == "Source text unavailable"
+    assert issue["details"][0]["original"] is None
+    assert "exact positions unavailable" in issue["evidence"][0]["Ranks not provided (provisional)"]
