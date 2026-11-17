@@ -55,6 +55,7 @@ from healthcare_data_quality.cleaning_workspace import (
     ask_gemma_about_cleaning, validate_header_plan,
     create_header_request, execute_confirmed_header_request,
 )
+from healthcare_data_quality.cleaning_authorization import file_sha256
 
 # Reuse the CLI's existing recommendation assessment, including its provenance
 # and partial-coverage rules. No CLI main() or remediation entry point is called.
@@ -625,10 +626,18 @@ def preview_csv(path: Path) -> pd.DataFrame:
     )
 
 
-def show_finding(title: str, explanation: str, evidence: list[dict], next_step: str = "") -> None:
+def numbered_finding_title(title: str, index: int | None = None) -> str:
+    """Display-only numbering matching the Supporting evidence check order."""
+    return f"Finding {index} · {title}" if index is not None else title
+
+
+def show_finding(
+    title: str, explanation: str, evidence: list[dict],
+    next_step: str = "", *, finding_index: int | None = None,
+) -> None:
     """Reader-facing finding; structured evidence stays expandable."""
     with st.container(border=True):
-        st.markdown(f"**{title}**")
+        st.markdown(f"**{numbered_finding_title(title, finding_index)}**")
         st.write(explanation)
         if next_step:
             st.write("**What to check next:**", next_step)
@@ -637,10 +646,10 @@ def show_finding(title: str, explanation: str, evidence: list[dict], next_step: 
                 st.dataframe(pd.DataFrame(evidence), hide_index=True, width="stretch")
 
 
-def show_taxonomy_structure_finding(finding: dict) -> None:
+def show_taxonomy_structure_finding(finding: dict, *, finding_index: int | None = None) -> None:
     """Show all original classifications and an explicit rank-by-rank expectation."""
     with st.container(border=True):
-        st.markdown(f"**{finding['title']}**")
+        st.markdown(f"**{numbered_finding_title(finding['title'], finding_index)}**")
         st.write(finding["explanation"])
         st.markdown(
             "**Expected seven-rank order:** "
@@ -660,14 +669,14 @@ def show_taxonomy_structure_finding(finding: dict) -> None:
 
 
 
-def render_header_findings(path: Path, details: dict) -> None:
+def render_header_findings(path: Path, details: dict, *, start_index: int = 1) -> None:
     repeated = header_findings(path, details)
     missing_and_width = header_issues(details)
     if not repeated and not missing_and_width:
         st.success("No repeated or blank column names, or inconsistent row lengths, were found.")
         return
     st.markdown("#### Data structure findings")
-    for finding in repeated:
+    for finding_index, finding in enumerate(repeated, start=start_index):
         evidence = [{
             "Repeated column name": finding["header"],
             "First column": finding["columns"][0],
@@ -676,12 +685,14 @@ def render_header_findings(path: Path, details: dict) -> None:
             "Different rows": finding.get("different_rows", 0),
             "Rows not comparable": finding.get("uncomparable_rows", 0),
         }] if len(finding["columns"]) == 2 else []
-        show_finding(finding["title"], finding["explanation"], evidence, finding["next_step"])
-    for finding in missing_and_width:
-        show_finding(finding["title"], finding["explanation"], finding["rows"], finding["next_step"])
+        show_finding(finding["title"], finding["explanation"], evidence, finding["next_step"],
+                     finding_index=finding_index)
+    for finding_index, finding in enumerate(missing_and_width, start=start_index + len(repeated)):
+        show_finding(finding["title"], finding["explanation"], finding["rows"],
+                     finding["next_step"], finding_index=finding_index)
 
 
-def render_baseline(dataset_id: str, baseline: dict, source_path: Path | None = None) -> None:
+def render_baseline(dataset_id: str, baseline: dict, source_path: Path | None = None) -> int:
     checks = baseline.get("checks") or {}
     invalid = checks.get("find_invalid_counts") or {}
     counts = invalid.get("counts_by_type") or {}
@@ -704,12 +715,13 @@ def render_baseline(dataset_id: str, baseline: dict, source_path: Path | None = 
         st.info("No issues were identified by the checks applicable to this dataset. This is not a guarantee that the data is error-free.")
     else:
         st.markdown(f"**Issues to review ({len(findings)})**")
-        for finding in findings:
+        for finding_index, finding in enumerate(findings, start=1):
             if finding.get("type") == "taxonomy_structure":
-                show_taxonomy_structure_finding(finding)
+                show_taxonomy_structure_finding(finding, finding_index=finding_index)
             else:
                 show_finding(finding["title"], finding["explanation"],
-                             finding["evidence"], finding["next_step"])
+                             finding["evidence"], finding["next_step"],
+                             finding_index=finding_index)
 
     with st.expander("Technical check results (advanced)"):
         check_table = []
@@ -756,6 +768,7 @@ def render_baseline(dataset_id: str, baseline: dict, source_path: Path | None = 
             "It does not mean zero problems were found."
         )
 
+    return len(findings)
 
 
 def render_recommendations(recommendations: list[dict], report: dict | None = None) -> None:
@@ -1041,117 +1054,364 @@ def render_finding_evidence(
 
 def render_cleaning_workspace(
     dataset_paths: list[Path], uploaded: list, audit: dict, context_key: str,
+    gemma_runs: list[dict] | None = None,
 ) -> None:
-    """Discuss potential cleaning with local Gemma; gate every supported change."""
-    st.subheader("Discuss data cleaning with Gemma")
+    """Show every finding as an independent review/consensus/approval workflow."""
+    from cleaning_review import (
+        ask_gemma_for_review_options, indexed_review_catalog, review_question,
+    )
+    from healthcare_data_quality.finding_cleaning import (
+        APPROVAL_PHRASE, allowed_positions, build_cleaning_findings,
+        execute_approved_scoped_plan, reviewed_python_code, validate_scoped_plan,
+    )
+
+    st.subheader("Clean data — review each finding with Gemma")
     st.caption(
-        "Ask about findings, scientific assumptions and possible corrections. "
-        "Gemma can suggest a plan, but cannot modify files or authorize an operation. "
-        "Currently only simple header renames can be applied to a verified new CSV copy. "
-        "All other cleaning methods are discussion-only."
+        "All findings and completed Gemma checks appear below. For each one, review "
+        "Gemma's proposed approach, agree or discuss an alternative, then inspect "
+        "the exact changes and generated Python before final authorization. "
+        "Only positions evidenced by that finding can be edited. Each approval creates "
+        "a separately verified working CSV; the original upload is never changed. "
+        "Execution currently supports exact cell replacements (up to 32 per approval) "
+        "and header renames; other proposed operations stay discussion-only."
     )
     if st.session_state.get("cleaning_context_key") != context_key:
         st.session_state.cleaning_context_key = context_key
-        st.session_state.cleaning_messages = []
-        st.session_state.cleaning_plan = None
+        st.session_state.cleaning_messages_by_finding = {}
+        st.session_state.cleaning_plans_by_finding = {}
+        st.session_state.cleaning_recommendations = {}
+        st.session_state.cleaning_review_statuses = {}
+        st.session_state.cleaning_decisions = []
         st.session_state.cleaning_result = None
-    messages = st.session_state.cleaning_messages
-    for item in messages:
-        with st.chat_message(item["role"]):
-            st.write(item["content"])
-    plan = st.session_state.get("cleaning_plan")
-    if plan:
-        st.markdown("#### Proposed change — independent review required")
-        st.warning(
-            "Gemma proposed this header rename. Confirm the new name against your data dictionary. "
-            "The original CSV will not be overwritten; only the listed headers may change."
-        )
-        st.dataframe(pd.DataFrame([
-            {"Column": change["position"], "Original header": change["before"],
-             "Proposed header": change["after"]}
-            for change in plan["changes"]
-        ]), hide_index=True, width="stretch")
-        st.caption(f"Dataset: {plan['dataset_id']} · Source SHA-256: {plan['source_sha256']}")
-        with st.form("cleaning_authorization_form"):
-            reviewer = st.text_input("Reviewer identifier", max_chars=120)
-            reviewed = st.checkbox("I verified the exact headers and approve this plan for a new copy")
-            phrase = st.text_input("Type AUTHORIZE HEADER CLEANING TO COPY")
-            approval = st.form_submit_button(
-                "Apply reviewed header renames to a new CSV copy", type="primary"
-            )
-        if approval:
-            if not reviewed or phrase != "AUTHORIZE HEADER CLEANING TO COPY" or not reviewer.strip():
-                st.error("Scientific review, reviewer identifier and exact confirmation are required.")
-            else:
-                try:
-                    index = int(plan["dataset_id"].split("_")[-1]) - 1
-                    checked = validate_header_plan(plan, dataset_paths)
-                    if checked != plan:
-                        raise ValueError("The proposed plan has changed; request a fresh review")
-                    base = Path.home() / ".local" / "share" / "healthcare-data-quality-llm" / "cleaning-workspace"
-                    path = base / uuid4().hex
-                    request = create_header_request(plan, dataset_paths[index], path)
-                    result = execute_confirmed_header_request(request, reviewer.strip(), phrase)
-                    output = Path(result["output"])
-                    st.session_state.cleaning_result = {
-                        "file_name": f"cleaned_{uploaded[index].name}",
-                        "data": output.read_bytes(), "verification": result,
-                    }
-                    st.session_state.cleaning_plan = None
-                    st.success("A new CSV copy was created and verified. Original source remains unchanged.")
-                except (OSError, ValueError, PermissionError, AssertionError) as exc:
-                    st.error(f"Cleaning was not completed: {exc}")
-        if st.button("Discard proposed change", key="discard_cleaning_plan"):
-            st.session_state.cleaning_plan = None
+        st.session_state.cleaning_working_paths = {}
+        st.session_state.cleaning_history = []
+    else:
+        # Compatible with an already-open Streamlit session from the earlier
+        # single-select cleaning UI. Retain its working dataset and change log,
+        # while introducing the new per-card review state if absent.
+        for key, empty in (
+            ("cleaning_messages_by_finding", {}),
+            ("cleaning_plans_by_finding", {}),
+            ("cleaning_recommendations", {}),
+            ("cleaning_review_statuses", {}),
+            ("cleaning_decisions", []),
+            ("cleaning_working_paths", {}),
+            ("cleaning_history", []),
+        ):
+            if key not in st.session_state:
+                st.session_state[key] = empty
+
+    catalog = build_cleaning_findings(
+        audit, dataset_paths, [file.name for file in uploaded],
+        gemma_runs if gemma_runs is not None else (st.session_state.get("exploration_runs") or []),
+    )
+    if not catalog:
+        st.info("No data quality findings or completed Gemma checks are available to review.")
+        return
+
+    # A single read-only Gemma call can populate the cards. Individual questions
+    # and approvals remain independent. No LLM call is made merely by rendering.
+    if st.button("Ask Gemma to suggest an approach for every finding", key="cleaning_suggest_all"):
+        try:
+            with st.spinner("Gemma is preparing read-only suggestions for the findings"):
+                suggestions = ask_gemma_for_review_options(catalog)
+            st.session_state.cleaning_recommendations.update(suggestions)
+            for finding_id in suggestions:
+                if (st.session_state.cleaning_review_statuses.get(finding_id)
+                        in {None, "Awaiting review", "Gemma suggestion ready"}):
+                    st.session_state.cleaning_review_statuses[finding_id] = "Gemma suggestion ready"
             st.rerun()
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            st.error(f"Could not obtain review suggestions: {exc}. No data was modified.")
+
+    history_all = st.session_state.cleaning_history
     completed = st.session_state.get("cleaning_result")
     if completed:
-        st.success("Verified derived CSV is available for download.")
-        st.download_button("Download cleaned CSV copy", data=completed["data"],
-                           file_name=completed["file_name"], mime="text/csv")
-        with st.expander("Verification record"):
+        st.markdown("**Current verified working dataset**")
+        st.download_button("Download current working CSV", data=completed["data"],
+                           file_name=completed["file_name"], mime="text/csv",
+                           key="cleaning_download_working")
+        with st.expander("Verified changes and reviewer decisions", expanded=False):
+            if history_all:
+                st.dataframe(pd.DataFrame(history_all), hide_index=True, width="stretch")
+            if st.session_state.cleaning_decisions:
+                st.dataframe(pd.DataFrame(st.session_state.cleaning_decisions),
+                             hide_index=True, width="stretch")
             st.json(completed["verification"])
-    question = st.chat_input("Ask Gemma how to handle a finding or propose a specific header rename")
-    if question:
-        st.session_state.cleaning_plan = None  # Never carry a stale model plan into a new turn.
-        baselines = audit.get("dataset_baselines") or {"dataset_1": audit.get("baseline") or {}}
-        facts = []
-        for dataset_id, baseline in baselines.items():
-            idx = int(dataset_id.rsplit("_", 1)[-1]) - 1
-            if idx < len(dataset_paths):
-                entries = dataset_finding_evidence(baseline, dataset_paths[idx],
-                                                   inspect_headers(dataset_paths[idx]))
-                facts.extend({"dataset_id": dataset_id, "finding": e["title"],
-                              "method": e["method"], "examples": (e["evidence"] or [])[:2]}
-                             for e in entries)
-        metadata = []
-        for index, source in enumerate(dataset_paths):
-            with source.open(encoding="utf-8-sig", newline="") as csv_source:
-                headers = next(csv.reader(csv_source))
-            metadata.append({"dataset_id": f"dataset_{index + 1}",
-                             "name": uploaded[index].name,
-                             "columns": [{"position": i + 1, "header": h}
-                                         for i, h in enumerate(headers)]})
-        st.session_state.cleaning_messages.append({"role": "user", "content": question})
-        try:
-            with st.spinner("Gemma is reviewing your question (no data will be changed)"):
-                response = ask_gemma_about_cleaning(
-                    question, messages[:-1], facts[:60], metadata,
+
+    numbered = indexed_review_catalog(catalog)
+    last_group = None
+    for label, finding in numbered:
+        fid = finding["id"]
+        ds_id = finding.get("dataset_id", "")
+        index = int(ds_id.rsplit("_", 1)[-1]) - 1 if ds_id.startswith("dataset_") else -1
+        source = (Path(st.session_state.cleaning_working_paths.get(ds_id, dataset_paths[index]))
+                  if 0 <= index < len(dataset_paths) else None)
+        group = ("Gemma investigations" if finding["source"] != "QC" else
+                 f"Dataset {index + 1}: {finding['name']}")
+        if group != last_group:
+            st.markdown(f"#### {group}")
+            last_group = group
+        status = st.session_state.cleaning_review_statuses.get(fid, "Awaiting review")
+        applied = [event for event in history_all if event["finding_id"] == fid]
+        if applied:
+            status = f"Applied ({len(applied)} version{'s' if len(applied) != 1 else ''})"
+        with st.expander(f"{label} · {finding['title']} — {status}", expanded=False):
+            st.caption(f"Source: {finding['source']} · {finding.get('name', '')}")
+            if finding.get("method"):
+                st.write("**Detection method:**", finding["method"])
+            st.write("**Scientific decision to resolve:**", review_question(finding))
+            evidence = finding.get("evidence") or []
+            if evidence:
+                if st.checkbox(f"Show original evidence ({len(evidence)} records)",
+                               key=f"review_evidence_{fid}"):
+                    st.dataframe(pd.DataFrame(evidence), hide_index=True, width="stretch")
+            cells, headers = allowed_positions(finding, source) if source else (set(), set())
+            if source:
+                version = sum(h["dataset_id"] == ds_id for h in history_all)
+                st.caption(f"Working dataset version {version} · {len(cells)} evidenced cells · "
+                           f"{len(headers)} evidenced headers")
+                if version:
+                    st.caption("These checks were recorded on the original upload. "
+                               "Current source values and file fingerprint are checked again "
+                               "before a proposed edit can be approved.")
+            else:
+                st.info("This completed check has no associated editable dataset. "
+                        "You can review or discuss it, but it cannot authorize a data change.")
+            if not cells and not headers and source:
+                st.caption("No editable cell/header positions are evidenced for this result. "
+                           "A correction requires a separate validated investigation.")
+
+            suggestion = st.session_state.cleaning_recommendations.get(fid)
+            if suggestion:
+                st.markdown("**Gemma's suggested approach — not approved**")
+                st.write(suggestion["suggestion"])
+                if suggestion.get("decision_needed"):
+                    st.write("**Decision needed from you:**", suggestion["decision_needed"])
+            else:
+                st.caption("No Gemma cleaning suggestion requested yet. No action is assumed.")
+
+            if st.button("Get / refresh Gemma suggestion", key=f"review_suggest_{fid}"):
+                _ask_gemma_for_finding(
+                    finding, source, uploaded, dataset_paths,
+                    "Recommend a scientifically defensible way to handle this specific "
+                    "result. Explain the alternatives and ask which policy or source "
+                    "evidence I want to use. Do not propose an edit yet.",
+                    suggestion_only=True,
                 )
-            reply = response["reply"]
-            if response["operation"] == "rename_headers":
-                try:
-                    planned = validate_header_plan(response, dataset_paths)
-                except ValueError as exc:
-                    reply += f"\n\nThe proposed operation is not executable: {exc}. Please clarify the exact header(s)."
-                else:
-                    st.session_state.cleaning_plan = planned
-                    reply += "\n\nA reviewed header-change plan is available below the conversation."
-            st.session_state.cleaning_messages.append({"role": "assistant", "content": reply})
-        except (OSError, ValueError, KeyError, RuntimeError) as exc:
-            st.session_state.cleaning_messages.append({"role": "assistant", "content":
-                f"Gemma did not produce a valid response: {exc}. No changes were made."})
-        st.rerun()
+                st.rerun()
+
+            if suggestion:
+                yes, no = st.columns(2)
+                if yes.button("Yes — develop this approach", key=f"review_yes_{fid}"):
+                    st.session_state.cleaning_review_statuses[fid] = "Agreed in principle"
+                    st.session_state.cleaning_decisions.append({
+                        "finding_id": fid, "decision": "approach_agreed_not_execution",
+                        "approach": suggestion["suggestion"],
+                    })
+                    _ask_gemma_for_finding(
+                        finding, source, uploaded, dataset_paths,
+                        "I agree in principle with the suggested approach for this result "
+                        "only. Prepare exact affected-cell changes only if the scientific "
+                        "policy, source values, and replacement values are already "
+                        "unambiguous. Otherwise ask me for the missing decisions or values. "
+                        "This is NOT authorization to apply anything.",
+                    )
+                    st.rerun()
+                if no.button("No — discuss another approach", key=f"review_no_{fid}"):
+                    st.session_state.cleaning_review_statuses[fid] = "Alternative requested"
+                    st.session_state.cleaning_plans_by_finding.pop(fid, None)
+                    st.session_state.cleaning_decisions.append({
+                        "finding_id": fid, "decision": "suggestion_declined_no_edit",
+                        "approach": suggestion["suggestion"],
+                    })
+                    _ask_gemma_for_finding(
+                        finding, source, uploaded, dataset_paths,
+                        "I do not agree with that approach. Ask me what alternative "
+                        "scientific cleaning policy I prefer, and outline different "
+                        "choices without proposing file edits yet.",
+                        suggestion_only=True,
+                    )
+                    st.rerun()
+
+            with st.form(f"review_chat_form_{fid}", clear_on_submit=True):
+                message = st.text_area("Discuss this result with Gemma",
+                                       placeholder="Explain your decision or specify exact desired changes…",
+                                       key=f"review_message_{fid}", height=80)
+                send = st.form_submit_button("Send to Gemma")
+            if send and message.strip():
+                _ask_gemma_for_finding(finding, source, uploaded, dataset_paths,
+                                        message.strip())
+                st.rerun()
+            elif send:
+                st.warning("Enter a question or cleaning decision first.")
+
+            transcript = st.session_state.cleaning_messages_by_finding.get(fid, [])
+            if transcript:
+                st.markdown("**Gemma discussion**")
+                for item in transcript:
+                    with st.chat_message(item["role"]):
+                        st.write(item["content"])
+
+            plan = st.session_state.cleaning_plans_by_finding.get(fid)
+            if plan and source:
+                st.markdown("**Exact proposed changes — awaiting final approval**")
+                st.warning("Agreeing with Gemma is not approval to execute. "
+                           "Verify every affected value and scientific assumption below.")
+                st.dataframe(pd.DataFrame(plan["changes"]), hide_index=True, width="stretch")
+                if st.checkbox("Show generated Python for these exact changes",
+                               key=f"review_code_{fid}"):
+                    st.code(reviewed_python_code(plan), language="python")
+                phrase = ("AUTHORIZE HEADER CLEANING TO COPY"
+                          if plan["operation"] == "rename_headers" else APPROVAL_PHRASE)
+                with st.form(f"review_authorize_{fid}"):
+                    reviewer = st.text_input("Reviewer identifier", max_chars=120,
+                                             key=f"review_reviewer_{fid}")
+                    confirmed = st.checkbox("I approve ONLY these exact changes for this finding",
+                                             key=f"review_checked_{fid}")
+                    confirmation = st.text_input(f"Type {phrase}", key=f"review_confirm_{fid}")
+                    apply = st.form_submit_button("Approve and create verified working CSV")
+                if apply:
+                    if not confirmed or not reviewer.strip() or confirmation != phrase:
+                        st.error("Exact confirmation, reviewer identification, and approval are required.")
+                    else:
+                        try:
+                            checked = validate_scoped_plan(plan, finding, source)
+                            if checked != plan:
+                                raise ValueError("Reviewed plan is stale or was changed")
+                            base = (Path.home() / ".local" / "share" /
+                                    "healthcare-data-quality-llm" / "cleaning-workspace")
+                            workspace = base / uuid4().hex
+                            if plan["operation"] == "rename_headers":
+                                request = create_header_request(plan, source, workspace)
+                                result = execute_confirmed_header_request(
+                                    request, reviewer.strip(), confirmation)
+                            else:
+                                result = execute_approved_scoped_plan(
+                                    plan, finding, source, workspace,
+                                    reviewer.strip(), confirmation)
+                            output = Path(result["output"])
+                            st.session_state.cleaning_working_paths[ds_id] = str(output)
+                            st.session_state.cleaning_result = {
+                                "file_name": f"working_{uploaded[index].name}",
+                                "data": output.read_bytes(), "verification": result,
+                            }
+                            st.session_state.cleaning_history.append({
+                                "dataset_id": ds_id, "finding_id": fid,
+                                "finding": finding["title"], "operation": plan["operation"],
+                                "changes": len(plan["changes"]), "output": str(output),
+                                "source_sha256": plan["source_sha256"],
+                                "output_sha256": result["output_sha256"],
+                            })
+                            st.session_state.cleaning_review_statuses[fid] = "Applied"
+                            st.session_state.cleaning_decisions.append({
+                                "finding_id": fid, "decision": "approved_and_verified",
+                                "output_sha256": result["output_sha256"],
+                            })
+                            # Any pending proposal against the previous dataset
+                            # version is invalid after this approval.
+                            for other in catalog:
+                                if other.get("dataset_id") == ds_id:
+                                    st.session_state.cleaning_plans_by_finding.pop(other["id"], None)
+                            st.rerun()
+                        except (OSError, ValueError, PermissionError, AssertionError, csv.Error) as exc:
+                            st.error(f"No cleaning was applied: {exc}")
+                if st.button("Reject these changes — keep the data unchanged",
+                             key=f"review_reject_plan_{fid}"):
+                    st.session_state.cleaning_plans_by_finding.pop(fid, None)
+                    st.session_state.cleaning_review_statuses[fid] = "Plan rejected"
+                    st.session_state.cleaning_decisions.append({
+                        "finding_id": fid, "decision": "precise_plan_rejected_no_edit",
+                        "changes": len(plan["changes"]),
+                    })
+                    st.rerun()
+
+            if st.button("Mark reviewed — no change required now",
+                         key=f"review_no_action_{fid}"):
+                st.session_state.cleaning_plans_by_finding.pop(fid, None)
+                st.session_state.cleaning_review_statuses[fid] = "Reviewed — no change"
+                st.session_state.cleaning_decisions.append({
+                    "finding_id": fid, "decision": "no_change_authorized_or_executed",
+                })
+                st.rerun()
+
+
+def _ask_gemma_for_finding(finding: dict, source: Path | None, uploaded: list,
+                            dataset_paths: list[Path], question: str,
+                            *, suggestion_only: bool = False) -> None:
+    """One finding, one chat history; model output never bypasses edit validation."""
+    from healthcare_data_quality.finding_cleaning import (
+        allowed_positions, validate_scoped_plan,
+    )
+    fid = finding["id"]
+    ds_id = finding.get("dataset_id", "")
+    index = int(ds_id.rsplit("_", 1)[-1]) - 1 if ds_id.startswith("dataset_") else -1
+    evidence = finding.get("evidence") or []
+    valid_cells, valid_headers = allowed_positions(finding, source) if source else (set(), set())
+    thread = st.session_state.cleaning_messages_by_finding.setdefault(fid, [])
+    old_thread = list(thread)
+    thread.append({"role": "user", "content": question})
+    st.session_state.cleaning_plans_by_finding.pop(fid, None)
+    scoped = {"finding_id": fid, "dataset_id": ds_id,
+              "title": finding["title"], "source": finding["source"],
+              "method": finding.get("method"), "evidence": evidence[:32],
+              "allowed_cell_positions": sorted(valid_cells)[:64],
+              "allowed_header_positions": sorted(valid_headers),
+              "all_affected_positions_count": len(valid_cells),
+              "latest_working_version": bool(st.session_state.cleaning_working_paths.get(ds_id))}
+    recommendation = st.session_state.cleaning_recommendations.get(fid)
+    if recommendation:
+        # Batch recommendations are not part of the per-finding conversation.
+        # Include the chosen suggestion as untrusted context before asking the
+        # model to develop it; otherwise "I agree" has no referent.
+        scoped["suggestion_under_discussion"] = {
+            "suggestion": str(recommendation.get("suggestion", ""))[:2200],
+            "decision_needed": str(recommendation.get("decision_needed", ""))[:1400],
+        }
+    metadata = []
+    if source and 0 <= index < len(dataset_paths):
+        with source.open(encoding="utf-8-sig", newline="") as stream:
+            reader = csv.reader(stream)
+            headers = next(reader)
+            needed_rows = {r for r, _ in sorted(valid_cells)[:32]}
+            samples = {r: row for r, row in enumerate(reader, 2) if r in needed_rows}
+        scoped["current_source_cell_examples"] = [
+            {"row": row, "column": col, "value": samples[row][col - 1]}
+            for row, col in sorted(valid_cells)[:32]
+            if row in samples and col <= len(samples[row])
+        ]
+        metadata = [{"dataset_id": ds_id, "name": uploaded[index].name,
+                     "columns": [{"position": i + 1, "header": h}
+                                 for i, h in enumerate(headers)]}]
+    try:
+        with st.spinner("Gemma is reviewing this finding (read-only)"):
+            response = ask_gemma_about_cleaning(
+                question, old_thread, [scoped], metadata, selected_finding=scoped)
+        reply = response["reply"]
+        if suggestion_only or response["operation"] == "none":
+            if suggestion_only:
+                st.session_state.cleaning_recommendations[fid] = {
+                    "suggestion": reply, "decision_needed": "Confirm an approach or discuss alternatives."
+                }
+            st.session_state.cleaning_review_statuses[fid] = (
+                "Gemma suggestion ready" if suggestion_only else "Discussion updated"
+            )
+        else:
+            try:
+                if not source:
+                    raise ValueError("No attributable dataset is available")
+                plan = validate_scoped_plan(response, finding, source)
+                st.session_state.cleaning_plans_by_finding[fid] = plan
+                st.session_state.cleaning_review_statuses[fid] = "Exact plan awaiting approval"
+                reply += ("\n\nA validated, finding-scoped edit plan is ready to inspect. "
+                          "No changes have been applied.")
+            except (ValueError, KeyError, csv.Error) as exc:
+                reply += ("\n\nGemma's proposed edit was rejected by the "
+                          "scope validator: " + str(exc) + ". No data was changed.")
+        thread.append({"role": "assistant", "content": reply})
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        thread.append({"role": "assistant", "content":
+                       f"Gemma did not return a valid response: {exc}. No changes were made."})
 
 
 def prepare_exploration_state(baseline_key: str) -> str:
@@ -1811,8 +2071,9 @@ def render_ui() -> None:
             label_index = int(dataset_id.rsplit("_", 1)[-1]) - 1
             dataset_name = uploaded[label_index].name if label_index < len(uploaded) else dataset_id
             st.subheader(f"Dataset {label_index + 1}: {dataset_name}")
-            render_baseline(dataset_id, baseline, source_path=paths[label_index])
-            render_header_findings(paths[label_index], header_reports[label_index])
+            displayed_findings = render_baseline(dataset_id, baseline, source_path=paths[label_index])
+            render_header_findings(paths[label_index], header_reports[label_index],
+                                   start_index=displayed_findings + 1)
         if len(uploaded) > 1:
             st.warning("Full cross-dataset identifier reconciliation is not yet implemented as an investigation tool.")
         # No separate exploratory page: render novel, verified Gemma findings
