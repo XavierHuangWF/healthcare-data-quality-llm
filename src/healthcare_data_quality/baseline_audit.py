@@ -9,7 +9,6 @@ from .tools.context import CANDIDATE_TAXONOMY_CONTEXT
 
 from .taxonomy_validation import find_duplicate_taxa
 from .taxonomy_validation import inspect_taxonomy_structure
-from .taxonomy_validation import find_unclassified_species
 from .taxonomy_validation import inspect_taxonomy_naming
 
 
@@ -95,20 +94,6 @@ def run_baseline_audit(dataset_path: Path) -> dict:
         }
     else:
         checks["inspect_taxonomy_structure"] = {
-            "status": "skipped_unverified_context",
-            "required_context": CANDIDATE_TAXONOMY_CONTEXT,
-        }
-
-    if CANDIDATE_TAXONOMY_CONTEXT in contexts:
-        unclassified = find_unclassified_species(dataset_path)
-
-        checks["find_unclassified_species"] = {
-            "status": "completed",
-            "observations": unclassified,
-            "unclassified_count": len(unclassified),
-        }
-    else:
-        checks["find_unclassified_species"] = {
             "status": "skipped_unverified_context",
             "required_context": CANDIDATE_TAXONOMY_CONTEXT,
         }

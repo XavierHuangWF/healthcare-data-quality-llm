@@ -300,12 +300,11 @@ def build_scientific_recommendations(audit: dict) -> list[dict]:
                 "before combining or deleting them."
             )
 
-        if ({"find_unclassified_species", "inspect_taxonomy_structure",
-             "inspect_taxonomy_naming"} & referenced_tools):
+        if ({"inspect_taxonomy_structure", "inspect_taxonomy_naming"} & referenced_tools):
             flags.append(
-                "Do not invent missing taxonomic classifications or "
-                "silently discard unclassified taxa; require a documented "
-                "reference taxonomy and mapping policy."
+                "The taxonomy file requires exactly seven rank positions; "
+                "NA is a valid value at any rank and must not be treated as "
+                "a data-quality error by itself. Preserve original labels."
             )
 
         if unresolved or not evidence_ids:
@@ -564,6 +563,7 @@ def main() -> None:
         args.input,
         progress_callback=terminal_progress,
         additional_datasets=args.dataset,
+        generate_proposals=args.enable_remediation,
     )
 
     if source_hashes:

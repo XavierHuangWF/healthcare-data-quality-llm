@@ -239,7 +239,7 @@ _DOMAIN_TOOLS = {
     },
     "taxonomy": {
         "find_duplicate_taxa", "inspect_taxonomy_structure",
-        "find_unclassified_species", "inspect_taxonomy_naming",
+        "inspect_taxonomy_naming",
     },
     "identifiers_and_columns": {
         "find_duplicate_ids", "find_duplicate_conflicts",
@@ -435,7 +435,9 @@ OUTPUT CONTRACT (follow the supplied JSON schema exactly):
   when recommending whole-dataset anomaly coverage. Use exact types
   'missing', 'negative', and 'fractional'. Do NOT use
   flag_rows_from_evidence on individual find_invalid_counts examples.
-- Taxonomy: do not fabricate species assignments, silently merge taxa,
+- Taxonomy: exactly seven rank positions are expected and NA is valid
+  at any position; its presence is not itself a data-quality issue.
+  Do not fabricate species assignments, silently merge taxa,
   or assume that 'unclassified' means unusable. Recommend defensible QC
   annotation or normalization only when its exact mapping is evidenced.
 - Duplicated/conflicting metadata IDs: preserve originals and do not

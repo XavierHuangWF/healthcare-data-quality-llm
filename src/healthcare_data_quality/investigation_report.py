@@ -2,6 +2,7 @@ import json
 from collections import Counter, defaultdict
 
 from .llm_client import query_local_model
+from .evidence_claim_validation import verify_report_claims
 
 
 def _summarize_all_invalid_counts(
@@ -119,7 +120,6 @@ def build_evidence_index(history: list[dict], baseline: dict | None = None, ) ->
                 "downstream_blocked",
                 "incomplete_count",
                 "alternate_delimiter_count",
-                "unclassified_count",
                 "counts_by_style",
             ):
                 if field in check:
@@ -170,9 +170,6 @@ def build_evidence_index(history: list[dict], baseline: dict | None = None, ) ->
                     *first_by_type.values(),
                     *range(min(5, len(observations))),
                 ]))[:5]
-
-            elif name == "find_unclassified_species":
-                selected_indices = list(range(min(5, len(observations))))
 
             else:
                 selected_indices = []
@@ -234,6 +231,10 @@ For every factual finding:
 - Cite one or more supporting evidence IDs.
 - Never invent evidence IDs.
 - Do not claim more than the cited observations establish.
+- If you can, use a directly measured fact rather than a new inference.
+- Evidence citations only establish where a statement came from; an independent
+  deterministic checker will flag your prose unless it exactly matches a
+  supported observed fact. Never assume your interpretation is verified.
 
 The "records" values represent 1-based CSV record
 numbers, including the header. They are not
@@ -251,11 +252,4 @@ Requirements:
     response = query_local_model(prompt, json_schema=schema)
     report = json.loads(response)
 
-    for finding in report["findings"]:
-        for evidence_id in finding["evidence_ids"]:
-            if evidence_id not in evidence_index:
-                raise ValueError(
-                    f"Unknown evidence reference: {evidence_id}"
-                )
-
-    return report
+    return verify_report_claims(report, evidence_index)

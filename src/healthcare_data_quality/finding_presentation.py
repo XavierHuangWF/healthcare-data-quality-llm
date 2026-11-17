@@ -95,6 +95,10 @@ def header_findings(path: Path, header_report: dict) -> list[dict]:
             "matching_rows": counts["matching"],
             "different_rows": counts["different"],
             "uncomparable_rows": counts["uncomparable"],
+            "source_check": "compare_repeated_headers",
+            "evidence": [{"Column A": left, "Column B": right, "Repeated header": name,
+                          "Matching rows": counts["matching"], "Differing rows": counts["different"],
+                          "Incomparable rows": counts["uncomparable"]}],
         })
     remaining = len(pairs) - len(inspected)
     if remaining:
@@ -104,6 +108,7 @@ def header_findings(path: Path, header_report: dict) -> list[dict]:
             "next_step": "Review the repeated-header groups or run a targeted comparison.",
             "header": "",
             "columns": [],
+            "source_check": "compare_repeated_headers", "evidence": [],
         })
     return findings
 
@@ -118,7 +123,7 @@ def header_issues(header_report: dict) -> list[dict]:
             "title": title,
             "explanation": "The header cells are empty. The original column positions are preserved in the dataset view.",
             "next_step": "Confirm the intended variable name(s) from the data dictionary before renaming.",
-            "type": "blank_headers",
+            "type": "blank_headers", "source_check": "inspect_headers",
             "rows": [{"Column": p, "Header name": "(blank)"} for p in blanks],
         })
     ragged = header_report.get("ragged_records") or []
@@ -128,7 +133,7 @@ def header_issues(header_report: dict) -> list[dict]:
             "title": f"{len(ragged):,} data rows have an unexpected number of columns",
             "explanation": f"Each CSV row should contain {expected:,} fields. These rows contain more or fewer fields.",
             "next_step": "Check the original CSV export before interpreting or cleaning these rows.",
-            "type": "ragged_records",
+            "type": "ragged_records", "source_check": "inspect_headers",
             "rows": [{"CSV row": csv_row, "Fields found": actual, "Expected": expected}
                      for csv_row, actual in ragged],
         })
@@ -142,7 +147,6 @@ CHECK_NAMES = {
     "find_invalid_counts": "Missing or invalid counts",
     "find_duplicate_taxa": "Repeated taxon labels",
     "inspect_taxonomy_structure": "Taxonomic hierarchy",
-    "find_unclassified_species": "Unclassified species",
     "inspect_taxonomy_naming": "Taxonomy naming consistency",
 }
 
@@ -173,6 +177,7 @@ COUNT_TYPE_LABELS = {
     "negative": "Negative count",
     "fractional": "Fractional count",
     "non_numeric": "Non-numeric value",
+    "unexpected_column": "Unexpected extra field",
 }
 
 
@@ -229,8 +234,10 @@ def readable_objective_summary(objective: dict) -> tuple[str, str]:
     return description, next_action
 
 
-def _issue(title: str, explanation: str, evidence: list[dict], next_step: str = "") -> dict:
-    return {"title": title, "explanation": explanation, "evidence": evidence, "next_step": next_step}
+def _issue(title: str, explanation: str, evidence: list[dict], next_step: str = "",
+           source_check: str = "") -> dict:
+    return {"title": title, "explanation": explanation, "evidence": evidence,
+            "next_step": next_step, "source_check": source_check}
 
 
 # This project currently audits the classical seven-rank taxonomy format.
@@ -369,6 +376,7 @@ def baseline_issues(baseline: dict, source_path: Path | None = None) -> list[dic
                 f"The affected measurements were identified in {len(subset):,} cells. No values were changed.",
                 table,
                 "Confirm the scientific missing-data and count-handling policy before preprocessing.",
+                source_check="find_invalid_counts",
             ))
     check = checks.get("find_duplicate_taxa") or {}
     if check.get("status") == "completed":
@@ -380,6 +388,7 @@ def baseline_issues(baseline: dict, source_path: Path | None = None) -> list[dic
                 [{"Taxon / feature": r.get("taxon"), "CSV rows": ", ".join(map(str, r.get("records") or [])),
                   "Values identical": "Yes" if r.get("counts_identical") else "No"} for r in observations],
                 "Confirm whether repeated labels represent the same taxon before merging or removing rows.",
+                source_check="find_duplicate_taxa",
             ))
     check = checks.get("find_duplicate_ids") or {}
     if check.get("status") == "completed":
@@ -392,6 +401,7 @@ def baseline_issues(baseline: dict, source_path: Path | None = None) -> list[dic
                   "CSV rows": ", ".join(map(str, r.get("records") or [])),
                   "Records": len(r.get("records") or [])} for r in observations],
                 "Check specimen identifiers and source records before deciding whether to merge records.",
+                source_check="find_duplicate_ids",
             ))
     check = checks.get("find_duplicate_conflicts") or {}
     if check.get("status") == "completed":
@@ -407,7 +417,12 @@ def baseline_issues(baseline: dict, source_path: Path | None = None) -> list[dic
                 "Records sharing a sample identifier contain different values in the listed fields.",
                 evidence,
                 "Check the authoritative metadata source. Do not automatically select one record.",
+                source_check="find_duplicate_conflicts",
             ))
+    # NA is a valid entry in any of the seven taxonomic rank positions.
+    # This UI intentionally never treats unassigned species as a QC issue,
+    # including when loading an audit created by a previous code version.
+
     check = checks.get("inspect_taxonomy_structure") or {}
     if check.get("status") == "completed":
         structure = (check.get("observations") or [{}])[0]
@@ -416,14 +431,15 @@ def baseline_issues(baseline: dict, source_path: Path | None = None) -> list[dic
         if incomplete:
             evidence, details = _taxonomy_structure_evidence(incomplete, source_path)
             issue = _issue(
-                f"{len(incomplete):,} {'row has' if len(incomplete) == 1 else 'rows have'} incomplete taxonomic classifications",
-                "The current file format expects seven ranks: Kingdom/Domain, Phylum, Class, "
-                "Order, Family, Genus and Species. The table shows the original classification "
-                "and which rank entries appear absent. Missing ranks are provisional when "
-                "the source does not explicitly identify rank positions.",
+                f"{len(incomplete):,} {'row has' if len(incomplete) == 1 else 'rows have'} an incorrect number of taxonomy levels",
+                "Each classification must contain exactly seven rank positions: Kingdom/Domain, "
+                "Phylum, Class, Order, Family, Genus and Species. NA is a valid value in "
+                "any position, including multiple positions. Only the number of positions "
+                "is assessed here; species identification is not required.",
                 evidence,
-                "Check the original taxonomy database or annotation pipeline to identify missing "
-                "names. Do not assign species names or fill missing ranks automatically.",
+                "Review the classifications with fewer or more than seven positions. "
+                "Do not replace NA or invent taxon names.",
+                source_check="inspect_taxonomy_structure",
             )
             issue["type"] = "taxonomy_structure"
             issue["details"] = details
@@ -439,15 +455,6 @@ def baseline_issues(baseline: dict, source_path: Path | None = None) -> list[dic
             for row in alternate:
                 original = original_by_row.get(int(row))
 
-                suggested = (
-                    "; ".join(
-                        part.strip()
-                        for part in re.split(r"[;|]", original)
-                    )
-                    if original is not None
-                    else "Source unavailable"
-                )
-
                 evidence.append({
                     "CSV row": row,
                     "Original classification": (
@@ -459,11 +466,7 @@ def baseline_issues(baseline: dict, source_path: Path | None = None) -> list[dic
                 })
 
             issues.append(_issue(
-
-                f"{len(alternate):,} "
-                f"{'row uses' if len(alternate) == 1 else 'rows use'} "
-                "inconsistent taxonomy separators",
-
+                f"{len(alternate):,} {'row uses' if len(alternate) == 1 else 'rows use'} inconsistent taxonomy separators",
                 "The expected format uses semicolons (;) "
                 "between taxonomic ranks. The affected rows "
                 "use vertical bars (|). The proposed version "
@@ -472,24 +475,109 @@ def baseline_issues(baseline: dict, source_path: Path | None = None) -> list[dic
                 evidence,
                 "Review the suggested format before making "
                 "any changes to the source data.",
+                source_check="inspect_taxonomy_structure",
             ))
+
 
 
     check = checks.get("inspect_taxonomy_naming") or {}
     if check.get("status") == "completed":
         counts = check.get("counts_by_style") or {}
-        used = {k: v for k, v in counts.items() if v}
+        used = {k: v for k, v in counts.items() if v and k != "not_assessable"}
+
         if len(used) > 1:
-            names = {"fully_prefixed": "Named with taxonomy prefixes",
-                     "unprefixed": "Named without prefixes", "mixed": "Mix of prefixed and unprefixed levels"}
+            names = {
+                "fully_prefixed": "Fully prefixed",
+                "unprefixed": "Unprefixed",
+                "mixed": "Mixed prefixes",
+            }
+
+            # Identify the predominant naming convention.
+            majority = max(used, key=used.get)
             source = (check.get("observations") or [{}])[0]
+
+            # Show only rows using a different convention.
+            affected = sorted(
+                (int(row), style)
+                for style, rows in source.items()
+                if style in used and style != majority
+                for row in rows
+            )
+
+            originals = _original_taxonomy_by_csv_row(
+                source_path,
+                {row for row, _ in affected},
+            )
+
+            evidence = []
+
+            for row, style in affected:
+                original = originals.get(row)
+
+                levels = (
+                    [v.strip() for v in re.split(r"[;|]", original)]
+                    if original is not None else []
+                )
+
+                prefixed = []
+                unprefixed = []
+                na_ranks = []
+
+                for (rank, prefix), value in zip(
+                    EXPECTED_TAXONOMY_RANKS, levels
+                ):
+                    if value.upper() == "NA":
+                        na_ranks.append(rank)
+                    elif value.lower().startswith(prefix):
+                        prefixed.append(f"{rank} ({prefix})")
+                    else:
+                        unprefixed.append(rank)
+
+                evidence.append({
+                    "CSV row": row,
+                    "Naming format": names.get(style, style),
+                    "Original classification": (
+                        original if original is not None
+                        else "Source unavailable"
+                    ),
+                    "Prefixed ranks": (
+                        ", ".join(prefixed) or "None"
+                    ),
+                    "Unprefixed ranks": (
+                        ", ".join(unprefixed) or "None"
+                    ),
+                    "NA ranks (valid)": (
+                        ", ".join(na_ranks) or "None"
+                    ),
+                })
+
+            summary = "; ".join(
+                f"{names.get(style, style)}: {count:,} rows"
+                for style, count in used.items()
+            )
+
             issues.append(_issue(
-                "Taxonomic classifications use different naming formats",
-                "; ".join(f"{names.get(k, k)}: {v:,} rows" for k, v in used.items()) + ".",
-                [{"CSV row": row, "Naming format": names.get(k, k)}
-                 for k, rows in source.items() for row in rows],
-                "Confirm the accepted taxonomy naming convention before any change.",
+                ("Taxonomic classifications use different naming formats "
+                 f"({len(affected):,} {'row uses' if len(affected) == 1 else 'rows use'} "
+                 "a different format)"),
+                (
+                    f"{summary}. "
+                    f"The predominant format is "
+                    f"{names[majority].lower()}. "
+                    "The table identifies rows using a different "
+                    "format and shows their original classifications. "
+                    "Different prefixes do not necessarily indicate "
+                    "incorrect biological classifications."
+                ),
+                evidence,
+                (
+                    "Confirm the required naming convention before "
+                    "standardizing any classifications. NA is an "
+                    "acceptable value at any taxonomic rank."
+                ),
+                source_check="inspect_taxonomy_naming",
             ))
+
     return issues
 
 

@@ -81,8 +81,8 @@ def test_other_issue_categories_are_friendly_and_evidence_is_preserved():
     assert "identifier values" in titles
     assert "metadata fields" in titles
     assert "taxon labels" in titles
-    assert "species" not in titles
-    assert "classification" in titles
+    assert "unassigned species" not in titles
+    assert "taxonomy levels" in titles
     assert "taxonomy separator" in titles
     assert "naming formats" in titles
     assert "1 row uses" in titles
