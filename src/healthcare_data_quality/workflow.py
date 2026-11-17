@@ -179,7 +179,8 @@ def build_investigation_objective_ledger(
             )
 
         naming_styles = checks.get("inspect_taxonomy_naming", {}).get("counts_by_style", {})
-        if sum(int(value > 0) for value in naming_styles.values()) > 1:
+        if sum(int(value > 0) for style, value in naming_styles.items()
+               if style != "not_assessable") > 1:
             add(
                 dataset_id, "decision:taxonomy_naming_convention",
                 "Choose a consistent representation for taxonomy labels",
@@ -189,14 +190,13 @@ def build_investigation_objective_ledger(
                 evidence_refs=[f"dataset_baselines.{dataset_id}.checks.inspect_taxonomy_naming"],
             )
 
-        if checks.get("inspect_taxonomy_structure", {}).get("incomplete_count", 0) or checks.get(
-                "find_unclassified_species", {}).get("unclassified_count", 0):
+        if checks.get("inspect_taxonomy_structure", {}).get("incomplete_count", 0):
             add(
                 dataset_id, "decision:taxonomy_mapping_policy",
-                "Establish taxonomy mapping and unknown-species handling",
+                "Review classifications with an incorrect number of taxonomy levels",
                 "requires_client_input", source="scientific_policy",
-                finding="Incomplete or unclassified taxonomic assignments were detected.",
-                next_action="Obtain accepted taxonomy reference/version and rules for retaining unknown taxa.",
+                finding="At least one classification has fewer or more than seven rank positions.",
+                next_action="Confirm the correct number of rank positions against the source; NA is a valid entry and must be preserved.",
                 evidence_refs=[f"dataset_baselines.{dataset_id}.checks.inspect_taxonomy_structure"],
             )
 
@@ -363,7 +363,10 @@ def run_initial_audit(
         dataset_path: Path,
         progress_callback: Callable[[str], None] | None = None,
         additional_datasets: list[Path] | None = None,
+        *,
+        generate_proposals: bool = False,
 ) -> dict:
+    """Run the audit. Proposal inference is opt-in, never part of read-only mode."""
     dataset_path = Path(dataset_path)
 
     ingestion = inspect_headers(dataset_path)
@@ -401,7 +404,6 @@ def run_initial_audit(
                 "downstream_blocked",
                 "incomplete_count",
                 "alternate_delimiter_count",
-                "unclassified_count",
                 "counts_by_style",
             ):
                 if field in check:
@@ -445,11 +447,6 @@ def run_initial_audit(
             investigation_priorities.append(
                 f"{dataset_id}: examine incomplete taxonomy assignments "
                 "and state what external reference would be needed."
-            )
-        if checks.get("find_unclassified_species", {}).get("unclassified_count", 0):
-            investigation_priorities.append(
-                f"{dataset_id}: characterize unclassified species; do not "
-                "invent species assignments."
             )
         if checks.get("find_duplicate_ids", {}).get("observation_count", 0):
             investigation_priorities.append(
@@ -550,34 +547,35 @@ def run_initial_audit(
 
     proposal_generation_error = None
 
-    try:
-        generated = (
-            generate_remediation_proposals(
-                history,
-                decision_memory=prior_decisions[-3:],
-                baseline=baseline,
+    if generate_proposals:
+        try:
+            generated = (
+                generate_remediation_proposals(
+                    history,
+                    decision_memory=prior_decisions[-3:],
+                    baseline=baseline,
+                )
+                if history
+                else {"proposals": []}
             )
-            if history
-            else {"proposals": []}
+        except RuntimeError as exc:
+            if "Incomplete generation: length" not in str(exc):
+                raise
+            proposal_generation_error = str(exc)
+            generated = {"proposals": []}
+            if progress_callback is not None:
+                progress_callback(
+                    "Proposal generation incomplete. Baseline audit results retained."
+                )
+        proposals = validate_remediation_proposals(
+            history=history,
+            proposals=generated["proposals"],
+            baseline=baseline,
         )
-    except RuntimeError as exc:
-        if "Incomplete generation: length" not in str(exc):
-            raise
-
-        proposal_generation_error = str(exc)
-        generated = {"proposals": []}
-
-        if progress_callback is not None:
-            progress_callback(
-                "Proposal generation incomplete. "
-                "Baseline audit results retained."
-            )
-
-    proposals = validate_remediation_proposals(
-        history=history,
-        proposals=generated["proposals"],
-        baseline=baseline,
-    )
+    else:
+        # Investigation-only mode does not invoke remediation generation,
+        # validation, R execution, or the human-authorization path.
+        proposals = []
 
     return {
         "status": investigation["status"],

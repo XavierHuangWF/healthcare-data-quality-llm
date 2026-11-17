@@ -2,6 +2,22 @@
 
 > **Current engineering status (2026-11-13): custom agent harness; investigation-first client POC.** The backend contains a policy-constrained, locally hosted LLM agent harness: baseline QC, a deterministic investigation-objective ledger, registered tools with JSON Schema validation, bounded model selection and tool execution, evidence retention, scoped decision memory, and separate remediation authorization/verification mechanisms. The **default** `scripts/run_workflow.py` mode investigates without R execution or source-data modification; legacy exploratory and explicitly enabled remediation modes have different safety boundaries. The latest reported merge was `5b19e96` into `main`; `backend` and `main` remain independent branch tips. Focused UI presentation tests were reported **10 passed** during integration; this is not equivalent to a full end-to-end or production validation. See [Agent harness: current implementation and boundaries](#agent-harness-current-implementation-and-boundaries) and [End-to-end system design and workflow](#end-to-end-system-design-and-workflow).
 
+## Supporting evidence: inspect the actual detection code
+
+In the Streamlit **Supporting evidence** tab, expand any **Dataset ... — check evidence** item to see the exact rule, measured quantities, and a small original-CSV example. Expand **View Python detection code (advanced)** to inspect the **currently installed** source functions behind that check, with their relative source paths. This source is read-only and is never executed by the evidence page. All code sections are collapsed by default.
+
+For a **Gemma investigation** (including a verified check that reported no additional issue), its corresponding evidence entry includes the recorded hypothesis, method, test result, and an optional **View executed Gemma Python test (advanced)** expander showing the code actually accepted for sandbox execution. The verification record confirms source-cell checking and repeatability, not scientific validity. The Gemma registered-tool narrative is not repeated in this tab; the full history remains in the downloadable audit JSON.
+
+**Version caveat:** For *old restored investigations*, the displayed deterministic Python functions reflect the source currently installed, which may differ from a previous version. Preserve the Git commit/source archive alongside exported audit JSON when exact historic code reproducibility is required. Gemma sandbox code is captured in its saved investigation record.
+
+## Investigation-only reporting safety (2026-11-13 patch)
+
+- **No remediation proposal inference by default.** `run_initial_audit(..., generate_proposals=False)` is the default for the CLI and Streamlit. `scripts/run_workflow.py --enable-remediation --interactive` explicitly opts in to the legacy proposal/review workflow. Default CLI and UI still invoke the local model to choose read-only objectives and summarize observations.
+- **Citations are not proof.** Each model-written finding carries a `claim_verification` object. `verified_exact_fact` means its complete text exactly matches a narrow, deterministic statement derived from a registered tool result. All other prose is flagged `requires_scientific_review`; evidence IDs can be valid without proving a model interpretation. Even a verified measured fact is not proof that a proposed scientific action is appropriate.
+- **Taxonomy NA is valid.** `NA` occupies a rank slot and does not by itself cause a seven-rank classification to fail the count check. Rank-prefix style is determined from assigned values only; all-NA entries are `not_assessable`. Unassigned species can be shown as informational findings without implying malformed taxonomy.
+- **Malformed CSV rows are not silently normalized.** Missing trailing sample fields, or extra unlabelled fields, appear in count evidence; the existing CSV structure checker also reports ragged records. Source data is never modified by these checks.
+- **Regression suite:** Run `PYTHONPATH=src:scripts python -m pytest -q tests/test_agent_guardrails.py tests/test_audit_regressions.py tests/test_evidence_claim_validation.py tests/test_investigation_only_gate.py tests/test_finding_presentation.py tests/test_investigation_report.py` from the repository root. R sandbox tests additionally require the local WSL `bwrap`/R environment.
+
 ## Personal developer quick-start — commands I use most
 
 > **Personal developer notes (not secret).** These commands are my fast reference for launching and testing this project in **WSL Ubuntu** from the **single** PyCharm project folder. They are not the end-user setup instructions. **If this README is committed to a public GitHub repository, these notes will be public too; put secrets and truly private configuration in an ignored local file instead.** All model inference is local; the Streamlit page is a **local web UI**, not an Internet-hosted service. See the detailed sections below for prerequisites, permission safeguards, and troubleshooting.
@@ -25,7 +41,7 @@ git status --short
 ARCHIVE="/mnt/c/Users/Xavier/Downloads/hdq-backend-source-$(date +%Y%m%d-%H%M%S).zip"
 
 git ls-files --cached --others --exclude-standard -- \
-  src scripts tests app.py README.md .gitignore \
+  src scripts tests app.py evidence_view.py README.md .gitignore \
   | sort -u \
   | zip -q "$ARCHIVE" -@
 
@@ -716,6 +732,13 @@ A valid future operation must bind **one source fingerprint, one explicit target
 
 For RAG, chunk only authorized documents, preserve chunk-to-source links, version/hash, reviewer status, domain and access scope; use **fully local** embeddings plus hybrid keyword/vector search. Retrieve a small, ranked, deduplicated set per objective. Keep tenant/case-specific documents and embeddings isolated, with retention/deletion capability. Do not index client answers used as a hidden evaluation key, and do not let retrieved text override tool/security policies.
 
+**Future reference-aware anomaly detection (2026-11-14 design decision; NOT IMPLEMENTED):** Prior cleaned datasets are read-only scientific references used **only to investigate a different, new, uncleaned dataset**. Do not repeatedly compare a dataset against its own cleaned version or reopen a completed cleaning case by default. The planned reference library has two tiers:
+
+1. **Same study or compatible protocol, different previously cleaned dataset:** retrieve reviewed expectations for schema, allowable levels, missingness, measurement distributions, cross-table relationships, and approved QC assumptions.
+2. **Scientifically comparable datasets from other studies:** retrieve transferable known anomaly patterns, validation methods, cohort/protocol-aware ranges, and hypotheses. Differences across studies are **candidate investigations**, never automatic data errors.
+
+**Proposed retrieval architecture:** Maintain a structured local reference-dataset registry with study and cohort descriptors, processing protocol, units, data dictionary, dataset version/fingerprint, provenance, approved QC decisions, and reviewer status. First perform deterministic study/schema/measurement-compatibility filtering; reject invalid comparisons (e.g., incompatible normalization, assay, units, clinical population or controls). Then expose **read-only statistical comparison tools** for distributions, categorical levels, missingness and cohort/batch differences; do not ask an embedding model to perform arithmetic on full CSVs. Add local RAG to retrieve reviewed data dictionaries, QC reports, decisions and scientifically validated investigation recipes, always with provenance. Gemma can plan which references and comparisons are meaningful, generate sandboxed exploratory analyses, and explain evidence; Python and independent scientific review determine what is supportable. Isolate research/client access, prevent leakage from prior cases, and do not retrieve private answer keys used for evaluation. Start with structured metadata search and direct comparisons; add embeddings/vector search only if corpus scale justifies it. None of this reference retrieval, statistical matching, or cross-study RAG is in the current runtime.
+
 ### 10. Deployment and source-code delivery boundary
 
 ```text
@@ -1228,7 +1251,7 @@ The `127.0.0.1` binding is deliberate: it limits the application to local access
 
 The reviewed UI supports a **CSV file** and currently rejects files larger than **20 MiB**. A local preview shows column names, sample rows, row count, column count, and structural issues. This is a POC ingestion constraint, not an enterprise file-size guarantee.
 
-The application also runs a read-only LLM investigation, presents findings and proposed actions, and exposes a human review form. The newer UI has an elapsed-time spinner, but true category-by-category progress/completeness and complete permission-to-execution controls are not yet finished.
+The application also runs a read-only LLM investigation, presents findings and proposed actions, and exposes a human review form. The newer UI shows a continuously updating elapsed-time counter, backend activity messages, and workflow-phase progress; category-by-category completeness metrics and comprehensive permission-to-execution controls remain unfinished.
 
 ### 4. Read the current results correctly
 
@@ -1587,7 +1610,7 @@ These are intentional safety checks. Do not replay an authorization, redirect an
 
 ### Streamlit spinner shows elapsed time but not tool activity
 
-The elapsed-time indicator is useful but does not prove the model is progressing. Backend CLI progress callbacks exist; full live UI activity-event propagation and coverage-state reporting are still being refined. Treat a long period without backend events as something to diagnose through the terminal/model logs, not evidence of successful analysis.
+The elapsed-time counter continues during blocked Gemma HTTP requests, but a ticking timer does not prove the model is progressing. The UI now displays existing backend progress callbacks and completed exploratory round counts; full coverage-state reporting still needs work. Treat a long period without backend events as something to diagnose through the terminal/model logs, not evidence of successful analysis.
 
 ### WSL logs `gio: http://127.0.0.1:8501: Operation not supported`
 
@@ -1668,6 +1691,8 @@ The first real-dataset interactive rehearsal exposed several distinct problems:
 - Retrieve only the few relevant chunks and prior verified cases for each current issue; deduplicate, rank, impose an input-token budget and cite exact chunk IDs in proposals. Use retrieval to **inform**, never automatically approve or execute.
 - Apply data minimization: do not persist raw patient identifiers, sensitive row contents or confidential client documents in a global/shared index. Keep client-specific indexes and memory isolated and access-controlled; provide retention/forgetting mechanisms for derived embeddings and records.
 - Defend against prompt injection in retrieved documents, past model outputs and tool observations. Retrieved text is evidence/data, **not an instruction overriding system policy**.
+- Build the **read-only, protocol-aware historical reference registry** described in Section 9: (a) separate cleaned datasets from the same study/protocol, and (b) compatible datasets from other studies. Require measurement, schema, preprocessing, protocol and cohort compatibility before statistical comparison; attach provenance and reviewer acceptance to every reference.
+- Add numeric/tabular comparison tools separate from document RAG. Let Gemma propose nonredundant comparisons, but independently verify calculations and distinguish true QC violations from legitimate between-study or biological variation. Do not re-clean historical reference datasets by default.
 - Measure impact with a held-out test set: issue recall, false correction rate, coverage, citation support, tool error rate, token use and repeat-run consistency. Compare against the deterministic baseline and a no-RAG version.
 
 **Acceptance gate D:** every remembered/retrieved recommendation has a verifiable source and authorization scope; offline execution and confidentiality boundaries are maintained; measurable improvements justify the extra system complexity.
@@ -1714,3 +1739,205 @@ This README expands the project's original five objectives and development appro
 **Contact:** william.techlover@gmail.com
 
 When updating this document, prefer **verified functionality and exact commands** over aspirational claims. Distinguish tested, partially implemented, and planned features; never include confidential dataset names, contents, private paths, patient information, model credentials, or customer evidence in public documentation.
+
+## Unified data-quality investigation (Streamlit, 2026-11-14)
+
+**Implemented in the current Streamlit app:** The old standalone
+**Exploratory discoveries** tab has been removed. **Data quality findings** now
+contains deterministic QC results followed by **Gemma investigation results**,
+with a separate **Supporting evidence** tab for provenance and the
+machine-readable report. The downloaded
+`healthcare_data_quality_combined_investigation.json` contains both the baseline
+audit and the evidence-verified exploratory runs. The underlying datasets and
+cached baseline audits remain unchanged.
+
+**One explicit run, two investigation phases:** On CSV upload, enable
+**Include Gemma's automatic exploratory analyses (isolated read-only Python)**
+(default enabled), then click **Run full investigation**. The app first runs
+the existing baseline audit and deterministic QC checks; then, provided
+Bubblewrap is available, Gemma plans additional nonredundant hypotheses and
+runs each generated analysis in the read-only, no-network sandbox. No additional
+click or per-hypothesis approval is required *during that single, explicitly
+authorized full investigation*. Uncheck the option to run baseline QC only.
+This changes the former per-hypothesis approval UI into an
+**investigation-scoped authorization**: do not deploy the new default without
+reviewing this permission change with the user/data custodian.
+
+Each verified round is checked against the original CSV source cells,
+reproduced in two independent sandbox runs, and saved to the private local
+cache. Automatic repairs are still limited to two revisions per hypothesis.
+Generated code cannot execute on the host or run without Bubblewrap. If the
+sandbox or local Gemma service is unavailable, the baseline remains available,
+and the UI reports the exploratory failure rather than claiming full success.
+A failed later round does not erase previously verified rounds.
+
+**Live progress display (implemented):** Clicking **Run full investigation**
+shows a local elapsed-time counter (MM:SS, or HH:MM:SS after one hour), a
+workflow phase bar, and the latest backend activity message. The clock is a
+tiny self-updating local HTML widget: it keeps ticking while a synchronous
+Gemma HTTP request or isolated Python execution blocks Streamlit's script.
+The phase bar covers deterministic QC, the registered-tool Gemma
+investigation, and (when enabled) sandboxed exploratory analyses. It tracks
+**which phase has started**, not the proportion of computation completed or
+estimated time remaining. In the exploratory phase, the UI displays the
+number of *verified* exploratory rounds completed; Gemma autonomously decides
+when to stop, and the 30-round ceiling remains a separate emergency bound.
+A failed model/sandbox step leaves the bar below completion and marks the
+status as incomplete. Once the run finishes or fails, the live clock is
+replaced with the final elapsed time. A ticking clock proves only that the
+browser is open, **not** that Gemma is making progress: inspect the last
+activity message and model-server logs when investigating a stall. The timer
+never accesses patient data and does not send any network requests. This UI
+change does not affect cache hashes, scientific findings or execution policy.
+
+**Gemma-directed stopping:** After each completed round, Gemma may return a
+structured `continue` or `stop` decision. A `stop` retains its rationale and
+unresolved scientific questions. `MAX_ROUNDS = 30` is still only an emergency
+safety ceiling; it is not the intended number of hypotheses. The old manual
+**Try another exploratory investigation** / **Investigate more despite
+Gemma's stop recommendation** control was removed from the results view:
+it confused the status of a finished run with a requirement to keep exploring.
+Users may start a new full investigation using **Run full investigation again**
+near the top. A recommendation to stop is not proof of scientific completeness,
+dataset cleanliness, or validated methodology.
+
+**Result status versus dataset certification (2026-11-15):** The results
+page now presents one readable overall outcome: **Investigation run finished —
+issues require review**, **Investigation run finished — no issues detected in
+completed checks**, or **Investigation partially completed — review results**.
+The status is derived from the deterministic finding list, CSV-header issues,
+verified Gemma candidate issues, and whether the exploratory run stopped
+normally, was interrupted, or exhausted its proposal retry budget. A
+controller pause is classified as partial coverage; it is not a Gemma
+certification of cleanliness. When the objective ledger includes blocked or
+unresolved checks, a separate **Coverage limitation** line remains visible.
+The user's uploaded files are never modified by this UI; human scientific
+review is needed before declaring data acceptable for preprocessing. The
+app cannot automatically certify a dataset as clean simply because no new
+Gemma candidate findings appeared. The optional manual continuation button
+has been removed from the results area. A complete fresh rerun can still be
+started from the main controls.
+
+**No-new-findings outcome (implemented):** Returning `findings=[]` is a valid,
+nonfailure result. When verified exploratory checks identify no additional
+candidate issues, the Data quality findings tab says so plainly and leaves
+existing deterministic QC issues available for review. A proposal-retry limit
+is tagged `stop_source="proposal_retry_exhausted"` and displayed as an
+**exploration pause**, never as an explicit Gemma stop recommendation. The
+Gemma continuation prompt explicitly permits stopping instead of inventing
+another hypothesis to fill a quota. The underlying technical explanation, Gemma stopping reason, and unresolved
+questions now appear within **Investigation run status (advanced)** rather than
+as a second prominent stop/continuation panel. **Only rounds containing novel
+candidate issues appear as finding cards.** Evidence-verified rounds that
+return `findings=[]` instead appear as compact, collapsed entries under
+**Completed Gemma checks (no additional findings)**, retaining their original
+round number, investigated hypothesis, summary, method, generated code, and
+verification record. For example, examining `Blank` negative-control columns
+may be a completed check even if all their values are zero; it is *not* an
+additional anomaly in that case. These checks remain in the same findings tab
+for transparent audit coverage without inflating issue counts. They also
+remain in private saved history and the combined downloadable JSON audit.
+Changing the display does not rerun Gemma, modify datasets, or invalidate
+existing cached reports. A zero-finding check does not establish that every
+possible abnormality was checked or that existing issues were scientifically
+resolved.
+
+**Deduplication (implemented):** The exploratory planner sees the known
+baseline QC catalog, and Python rejects already-answered proposals and filters
+repeated individual findings from verified results. It covers identified
+header, count, duplicate metadata/taxa, and taxonomy anomalies, including the
+previously reported negative counts and repeated `ABC99` headers. Genuinely
+novel cross-variable and cross-dataset hypotheses remain eligible. This is
+conservative rule-based duplicate suppression, not a guarantee against all
+semantic paraphrases or a scientific truth classifier.
+
+**Caching:** Baseline and exploration are persisted separately using dataset
+content and analysis-version fingerprints; a previously saved exploration
+restored with an earlier audit matches the same input/code configuration but
+may belong to a different prior audit instance. The UI labels this explicitly.
+The combined JSON export reflects the current session's available verified
+rounds and stop status. Changing any exploratory controller/source file changes
+the exploration-cache fingerprint, without unnecessarily invalidating baseline
+QC cache results. No cleaning/remediation code is authorized by this
+workflow, and the default investigation-only CLI is unchanged.
+
+**How to run and test:**
+
+```bash
+PYTHONPATH=src:scripts streamlit run app.py
+PYTHONPATH=src:scripts python -m pytest -q tests/test_exploratory_combined.py tests/test_exploratory_ui_cache.py tests/test_exploratory_discovery.py tests/test_exploratory_dedup.py
+```
+
+**Validation boundary:** Unit tests mock Gemma and the sandbox; validate
+end-to-end behavior separately on WSL/Linux with `bwrap` and your live local
+Gemma server. Source-cell reproducibility is not independent scientific or
+statistical validation. Comprehensive requirements-based coverage assessment
+remains future work.
+
+**Future historical-reference RAG plan (not implemented):** Keep previously
+cleaned datasets *distinct* from the new dataset under investigation. (1)
+Retrieve reviewed datasets from the same study or compatible protocol; (2)
+retrieve scientifically comparable cleaned datasets from other studies. Use a
+structured read-only reference registry and compatibility gate for study,
+cohort, assay, normalization, units, and schema, then deterministic statistical
+comparison. Add local RAG for approved data dictionaries, historical QC reports,
+methodological notes, and cleaning decisions; never use embeddings alone to
+perform arithmetic on CSVs. Gemma can plan new comparisons, while reproducible
+Python tools and scientific reviewers establish the defensible evidence. Do not
+reprocess a dataset against its own previously cleaned version as a routine
+workflow. See also [Section 9 — Model, retrieval, and memory design](#9-model-retrieval-and-memory-design).
+
+The earlier README references `EXPLORATORY_DISCOVERY_SETUP.md`, which was not
+present in the 2026-11-14 source ZIP. This README and the source/test modules
+are the available implementation guidance.
+
+## Saved investigation files and history manager (2026-11-14)
+
+**Implemented in the Streamlit UI:** `Manage saved files` opens a large modal alongside **Load previous result** and **Run full investigation again**, or below the upload control if no dataset has been selected. The modal inventories previously saved baseline audits and Gemma exploratory checkpoints, across *all* dataset cache keys. It displays saved timestamps automatically in the **browser viewer's local timezone** (including the daylight-saving offset), file type, user-editable display labels, file sizes, and whether a file matches the current upload. Timestamps inside JSON records and filenames remain in UTC. Streamlit's `st.context.timezone` supplies the browser's IANA timezone, with `timezone_offset` as fallback, and UTC as the final fallback. Streamlit does not automatically localize dataframe timestamps, so the application converts them before display.
+
+**Exact WSL storage locations** (these are persistent JSON results, **not temporary upload CSVs**):
+
+```text
+/home/<wsl-user>/.local/share/healthcare-data-quality-llm/
+  audit-cache/<analysis-and-data-sha256-key>/audit-<timestamp>-<random>.json
+  explorations/<exploration-sha256-key>/discovery-<timestamp>-<random>.json
+```
+
+On the developer's WSL installation, `<wsl-user>` is `xavier`. In a WSL terminal, use:
+
+```bash
+ls -lah ~/.local/share/healthcare-data-quality-llm/
+find ~/.local/share/healthcare-data-quality-llm -maxdepth 3 -type f \
+  \( -name 'audit-*.json' -o -name 'discovery-*.json' \) | sort
+```
+
+Source CSV uploads are instead placed in disposable `hdq-investigation-*` temporary directories while the Streamlit session processes them. Removing a saved investigation JSON does **not** delete the source dataset or decision-memory records.
+
+**Why one dataset can create multiple JSON files:** A full investigation writes a baseline `audit-...json` and, when enabled, Gemma `discovery-...json` recovery checkpoints. The latter are snapshots of exploratory progress, **not additional uploaded datasets**. When Gemma produces a verified round, the app saves a recoverable checkpoint. When the same invocation finishes, its final stopping decision is atomically saved **into that latest checkpoint** instead of writing an unnecessary duplicate end-of-run file. Investigations with multiple exploratory rounds may still generate intermediate recovery snapshots; the manager hides older snapshots **by default**, showing only the newest checkpoint per exploration key. Enable **Show intermediate Gemma checkpoints** to inspect, export, or delete older records. Preexisting duplicates are not automatically deleted. These changes do not modify the contents of the user's source CSVs or merge independent audit/Gemma evidence files.
+
+**Automatic loading by matching content:** The app determines the cache key from the exact uploaded CSV bytes (in their supplied order) **plus the analysis implementation/model revision fingerprint**. File names do not enter the persistent cache key. When more than one compatible audit exists, **Load previous result always uses the newest saved audit automatically**; users cannot select older audits for loading. The history-manager selection is strictly for reviewing/managing a saved file, not selecting which result is loaded.
+
+**Permitted management (direct table multi-selection):** click a row in the `Saved (local time)` table to select an audit or Gemma checkpoint (including clicking its timestamp). Each timestamp shows its timezone abbreviation and numeric UTC offset to disambiguate daylight-saving transitions; the original UTC time is never rewritten. Ctrl/Cmd-click adds or removes individual rows, while Shift-click selects a range. Selected rows are highlighted in the table; no additional dropdown is used. `Clear selected rows` resets the selection. Browser-side sorting does not change which record each selected row represents. The currently visible table contains up to 250 records. Selected records can be downloaded together as a ZIP (maximum 48 MiB total source JSON size); the archive preserves separate `audits/` and `gemma-checkpoints/` paths and each record's original SHA-256 directory. Multiple records can be deleted only after **two explicit confirmation steps**: check the irreversible-deletion acknowledgement and type the case-sensitive phrase `IWANTTODELETEIt` exactly in the **Final confirmation** field. The delete button is disabled until both are satisfied and at least one saved file is selected; the server-side delete handler rechecks those requirements. Changing the selected table rows (including clearing all rows) resets both confirmations, preventing a previous selection's authorization from carrying over. If deletion of any file fails, the manager reports the number of failures and preserves the remaining records. For a **single selected record**, the UI additionally supports read-only JSON preview (up to 2 MiB), direct JSON download (up to 12 MiB), and individual display-name/notes edits. Batch editing names/notes is intentionally not enabled to avoid overwriting separate investigation annotations. Labels/notes are written atomically into private adjacent `.meta` sidecar files, **never into the audit or exploration JSON**, preserving the original evidence and cache hashes. Deletion removes only the selected saved snapshots and their annotation sidecars; it does not affect source CSVs, unrelated cache entries, or the code repository. Deleted results cannot be restored by the app; make a backup before deletion. Larger records can be opened/copied manually from the WSL directory. Both JSON reports and notes may contain sensitive research data and must remain in approved local storage.
+
+**Known provenance limitation:** Exploratory checkpoints are currently keyed by matching dataset and analysis version, not by a unique baseline run ID. Restoring the most recent checkpoint might associate it with another run of the same dataset; the interface warns about this. A future change should explicitly link each exploratory checkpoint to its exact baseline audit run to prevent mixed-run reports. Cache directory names or user-edited labels are not proof of scientific validity.
+
+**Verification:** The saved-file manager has isolated tests in `tests/test_history_manager.py` covering cross-key inventory, newest-first ordering, multi-select ZIP packaging, annotation integrity, safe deletion, symlinks, input validation and automatic load selection. Run them with `PYTHONPATH=src:scripts python -m pytest -q tests/test_history_manager.py`. Live browser behavior in the target WSL Streamlit installation should also be checked.
+
+## New UI: finding-linked evidence and reviewed Gemma cleaning workspace (2026-11-16)
+
+In `app.py`, after the usual full investigation, there are now three tabs:
+
+1. **Data quality findings**: deterministic QC and Gemma's separately labeled exploratory candidate findings. Header/CSV structure findings are also presented here rather than detached from the results in the dataset preview.
+2. **Supporting evidence**: mirrors the **actual entries shown on the Data quality findings tab**, rather than rendering every saved agent narrative as an extra result. The dataset checks retain their exact finding order, detection rules, measured counts, and a few original CSV examples. Under **Gemma investigation evidence**, the UI shows only the saved sandbox investigations also displayed on the first tab, including completed checks with **no additional issues**; each includes its original test method, executed read-only Python, returned result, available candidate source-cell citations, and execution verification. The standalone **Gemma agent — how its reported results were obtained** and **Gemma sandbox exploration — executed tests** sections have been removed. Registered-tool agent claims and their `Tn.Om` citation history are retained in the downloadable complete audit JSON, but are not promoted into independent findings or duplicated in the supporting-evidence UI. This alignment is based on the same filtered result objects and stable round numbers, not hard-coded text/keyword rules or fresh LLM calls on Streamlit rerun. Saved output reproducibility is not scientific validation. This is a presentation-only change outside the baseline audit-cache fingerprint, so existing saved investigations can be viewed without re-running Gemma.
+3. **Clean data with Gemma**: local Gemma chat grounded in uploaded dataset headers and bounded evidence summaries. Its responses are structured as non-executable advice or an exact header-renaming proposal. The UI validates every proposed position and original name against the current CSV and requires separate reviewer identity, checked approval, and an exact authorization phrase. The existing `cleaning_authorization.py` gate and `cleaning_executor.py` derive and independently verify a new CSV copy, leaving the original unchanged. The result can be downloaded. No arbitrary LLM-generated code is run by the chat.
+
+**Execution limitations:** Only simple ASCII header renames are currently executable in the new UI. Counting-cell changes, zero/NA policy decisions, taxonomy changes, record merging, duplicate-column removal, arbitrary R/Python code generation and execution are **not** enabled by this chat. They remain discussion-only pending scientific policy, deterministic operation contracts, safeguards, and test coverage. The chat is not a general-purpose validated cleaning engine. Use only approved/de-identified datasets; the conversation is sent to the configured local vLLM endpoint (currently localhost), not to an online service. Review authorization logs in the private, Git-ignored `data/decision_memory/` directory and copy outputs under `~/.local/share/healthcare-data-quality-llm/cleaning-workspace/`.
+
+To test the new implementation and the rest of the portable codebase from the project root:
+
+```bash
+PYTHONPATH=.:src:scripts python -m pytest -q \
+  --ignore=tests/test_r_sandbox.py --ignore=tests/test_r_verification.py
+```
+
+The excluded R/Bubblewrap tests still require the configured WSL environment, and local Gemma/vLLM + Streamlit must be tested interactively on the host. This change does **not** make any claim that the full system is production-ready or that the scientific conclusions have been independently validated.

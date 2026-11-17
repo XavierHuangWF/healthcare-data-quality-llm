@@ -53,9 +53,30 @@ def authorize_cleaning_request(request_path: Path) -> dict | None:
         print("DEFERRED: Authorization declined")
         return None
 
-    # Detect changes made during human review.
-    verify_pending_request(request_path)
+    # Both CLI and Streamlit use the same non-interactive backend gate.
+    record = record_reviewed_header_authorization(
+        request_path, reviewer, confirmation,
+    )
 
+    print("\nCLEANING AUTHORIZATION: RECORDED")
+    print("Authorization ID:", record["authorization_id"])
+    print("Execution status: not_executed")
+
+    return record
+
+
+def record_reviewed_header_authorization(request_path: Path, reviewer: str, confirmation: str) -> dict:
+    """Non-interactive UI entry point using the SAME authorization record as the CLI.
+
+    Calling this requires a separate explicit confirmation event from the human;
+    neither a model reply nor a proposed plan can call this automatically.
+    """
+    if confirmation != "AUTHORIZE HEADER CLEANING TO COPY":
+        raise PermissionError("Exact execution confirmation is required")
+    reviewer = reviewer.strip()
+    if not reviewer or len(reviewer) > 120:
+        raise ValueError("A reviewer identifier is required")
+    request = verify_pending_request(request_path)
     record = {
         "authorization_id": str(uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -71,25 +92,10 @@ def authorize_cleaning_request(request_path: Path) -> dict | None:
         "execution_status": "not_executed",
         "plan_review": "accepted",
     }
-
-    authorization_path = Path(
-        "data/decision_memory/operation_authorizations.jsonl"
-    )
-
-    authorization_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with authorization_path.open(
-        "a", encoding="utf-8"
-    ) as file:
-        file.write(json.dumps(record) + "\n")
-
-    print("\nCLEANING AUTHORIZATION: RECORDED")
-    print("Authorization ID:", record["authorization_id"])
-    print("Execution status: not_executed")
-
+    log_path = Path("data/decision_memory/operation_authorizations.jsonl")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(record) + "\n")
     return record
 
 

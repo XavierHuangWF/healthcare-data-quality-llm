@@ -38,6 +38,11 @@ def find_duplicate_taxa(path: Path) -> list[dict]:
 
 
 def inspect_taxonomy_structure(path: Path) -> dict:
+    """Validate only the number of hierarchy positions (exactly 7).
+
+    NA is a valid rank entry everywhere, including repeated NA entries.
+    Names and biological taxon assignment are not validated here.
+    """
     incomplete = []
     alternate_delimiters = []
 
@@ -65,38 +70,6 @@ def inspect_taxonomy_structure(path: Path) -> dict:
     }
 
 
-def find_unclassified_species(path: Path) -> list[dict]:
-    findings = []
-
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
-        reader = csv.reader(file)
-        next(reader)
-
-        for record_number, row in enumerate(reader, start=2):
-            levels = [
-                level.strip()
-                for level in re.split(r"[;|]", row[0])
-            ]
-
-            # Incomplete hierarchies are reported separately.
-            if len(levels) != 7:
-                continue
-
-            species = re.sub(
-                r"^s__\s*", "", levels[6], flags=re.IGNORECASE
-            ).strip()
-
-            if species.upper() in {"NA", "N/A", "UNCLASSIFIED", "UNKNOWN", ""}:
-                findings.append({
-                    "record": record_number,
-                    "original_taxonomy": row[0],
-                    "species_value": levels[6],
-                    "classification": "unclassified_species",
-                })
-
-    return findings
-
-
 def inspect_taxonomy_naming(path: Path) -> dict:
     prefixes = ("k__", "p__", "c__", "o__", "f__", "g__", "s__")
 
@@ -104,6 +77,7 @@ def inspect_taxonomy_naming(path: Path) -> dict:
         "fully_prefixed": [],
         "unprefixed": [],
         "mixed": [],
+        "not_assessable": [],  # Every entry is NA; naming style is unknown.
     }
 
     with path.open("r", encoding="utf-8-sig", newline="") as file:
@@ -120,12 +94,19 @@ def inspect_taxonomy_naming(path: Path) -> dict:
             if len(levels) != 7:
                 continue
 
-            matches = [
-                value.lower().startswith(prefix)
-                for value, prefix in zip(levels, prefixes)
-            ]
+            # NA (at any rank, including multiple ranks) counts as one level
+            # but is neutral with respect to whether taxonomy labels use rank
+            # prefixes. The domain d__ alias is equivalent to k__ at rank 1.
+            matches = []
+            for index, (value, prefix) in enumerate(zip(levels, prefixes)):
+                if value.upper() == "NA":
+                    continue
+                valid_prefixes = ("k__", "d__") if index == 0 else (prefix,)
+                matches.append(any(value.lower().startswith(p) for p in valid_prefixes))
 
-            if all(matches):
+            if not matches:
+                style = "not_assessable"
+            elif all(matches):
                 style = "fully_prefixed"
             elif not any(matches):
                 style = "unprefixed"
@@ -151,14 +132,6 @@ if __name__ == "__main__":
         })
 
     print(f"Duplicate taxonomy groups: {len(duplicates)}")
-
-    unclassified = find_unclassified_species(Path(sys.argv[1]))
-
-    print(f"Unclassified species: {len(unclassified)}")
-    print("First 3 records:", [
-        item["record"] for item in unclassified[:3]
-    ])
-
 
     styles = inspect_taxonomy_naming(Path(sys.argv[1]))
 

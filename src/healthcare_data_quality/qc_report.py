@@ -6,7 +6,6 @@ SUMMARY_FIELDS = (
     "downstream_blocked",
     "incomplete_count",
     "alternate_delimiter_count",
-    "unclassified_count",
     "counts_by_style",
 )
 
