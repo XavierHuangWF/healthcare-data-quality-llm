@@ -7,6 +7,7 @@ source files are immutable and each accepted plan produces a new version.
 
 import csv
 import json
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -123,8 +124,27 @@ def validate_scoped_plan(plan: dict, finding: dict, source: Path) -> dict:
         if not allowed_headers or any(change["position"] not in allowed_headers for change in checked["changes"]):
             raise ValueError("Proposed header is outside this finding's affected columns")
         return {**checked, "dataset_id": finding["dataset_id"], "finding_id": finding["id"]}
+    if operation == "drop_column":
+        changes = plan.get("changes")
+        if not isinstance(changes, list) or len(changes) != 1 or not isinstance(changes[0], dict):
+            raise ValueError("A whole-column deletion must name exactly one column")
+        item = changes[0]
+        pos, before, after = item.get("position"), item.get("before"), item.get("after")
+        with Path(source).open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.reader(stream, strict=True))
+        if not rows or len(rows[0]) <= 1 or any(len(row) != len(rows[0]) for row in rows):
+            raise ValueError("A rectangular CSV with at least two columns is required")
+        if type(pos) is not int or not 1 <= pos <= len(rows[0]):
+            raise ValueError("Column position is invalid")
+        if not isinstance(before, str) or rows[0][pos - 1] != before or after != "":
+            raise ValueError("Column header mismatch or unsupported deletion payload")
+        if pos not in allowed_headers and not any(col == pos for _, col in allowed_cells):
+            raise ValueError("This column is not evidenced in the selected finding")
+        return {"operation": "drop_column", "dataset_id": finding["dataset_id"],
+                "finding_id": finding["id"], "source_sha256": file_sha256(source),
+                "changes": [{"position": pos, "before": before, "after": ""}]}
     if operation != "replace_cells":
-        raise ValueError("Only scoped cell replacements or header renames can be executed")
+        raise ValueError("Only scoped cell replacements, header renames or a whole-column deletion can be staged")
     changes = plan.get("changes")
     if not isinstance(changes, list) or not 1 <= len(changes) <= MAX_CELL_CHANGES:
         raise ValueError(f"Provide 1–{MAX_CELL_CHANGES} exact cell changes")
@@ -195,6 +215,104 @@ def expand_uniform_evidence_plan(plan: dict, finding: dict, source: Path, *,
     # value and SHA-256 checks as a regular plan. No LLM-generated code is run.
     verified = validate_scoped_plan(expanded, finding, source)
     return verified, len(verified["changes"]) - len(seed)
+
+
+# Bulk instruction normalization belongs to the trusted host, not a generative
+# model's JSON token budget. Only the explicitly selected, source-evidenced
+# blank COUNT cells may be modified. This never stages data or approves edits.
+_ALL_BLANKS_TO_NA_RE = re.compile(
+    r"\b(?:set|replace|fill|convert)\s+all\s+(\d+)\s+"
+    r"(?:empty|blank)\s+cells?\b[^.!?\n]{0,130}"
+    r"\b(?:to|with|as)\s+['\"]?NA\b", re.IGNORECASE,
+)
+_DIRECT_BLANKS_TO_NA_RE = re.compile(
+    r"\b(?:fill|replace|set|convert)\b[^.!?\n]{0,130}"
+    r"\b(?:empty|blank|missing)\b[^.!?\n]{0,130}"
+    r"\b(?:with|to|as)\s+['\"]?NA\b", re.IGNORECASE,
+)
+_SHORT_NA_RE = re.compile(
+    r"\s*(?:fill\s+(?:(?:all|the)\s+)?(?:(?:empty|blank|missing)\s+)?"
+    r"(?:cells?\s+)?(?:in|with|as|to)\s+NA|"
+    r"(?:set|replace|change)\s+(?:(?:all|the)\s+)?"
+    r"(?:(?:empty|blank|missing)\s+)?cells?\s+(?:to|with|as)\s+NA)"
+    r"[.!]?\s*", re.IGNORECASE,
+)
+
+
+def propose_evidenced_blank_fill(
+    message: str, recommendation: str, finding: dict, source: Path,
+    *, accepted_recommendation: bool = False,
+) -> dict | None:
+    """Turn a precise blank-to-NA request into a bounded, validated action.
+
+    No call to Gemma is required to enumerate 618 cells. The researcher must
+    explicitly request the operation or approve an Agent B recommendation;
+    evidence and immutable source values determine every cell coordinate.
+    Return None for unrecognized/compound instructions, so the usual Gemma
+    discussion handles them instead of silently omitting an action.
+    """
+    if finding.get("check_key") != "find_invalid_counts" or not finding.get("actionable", True):
+        return None
+    if not isinstance(message, str) or not isinstance(recommendation, str):
+        return None
+    # Do not reinterpret refusal, question, or multi-action requests as consent.
+    if ("?" in message
+            or message.lstrip().lower().startswith(("why ", "how ", "should ", "could ",
+                                                   "can ", "would ", "what "))
+            or re.search(r"\b(?:don't|do not|never|instead of|not fill)\b", message, re.I)
+            or re.search(r"\b(?:delete|drop|remove)\b[^.!?\n]{0,100}\bcolumn\b", message, re.I)):
+        return None
+
+    selected = _ALL_BLANKS_TO_NA_RE.search(recommendation)
+    direct = _ALL_BLANKS_TO_NA_RE.search(message)
+    if selected and accepted_recommendation:
+        matched = selected
+    elif direct:
+        matched = direct
+    elif selected and (_SHORT_NA_RE.fullmatch(message) or _DIRECT_BLANKS_TO_NA_RE.search(message)):
+        matched = selected
+    else:
+        return None
+
+    count_expected = int(matched.group(1))
+    if not 1 <= count_expected <= MAX_CELL_CHANGES:
+        raise ValueError(
+            f"Expected {count_expected} blank cells, exceeding the validated "
+            f"bulk limit of {MAX_CELL_CHANGES}; no partial edit was prepared"
+        )
+
+    allowed, _ = allowed_positions(finding, source)
+    if not allowed:
+        raise ValueError("This finding has no verified count-cell coordinates")
+    with Path(source).open(encoding="utf-8-sig", newline="") as stream:
+        records = list(csv.reader(stream, strict=True))
+    if not records or any(len(row) != len(records[0]) for row in records):
+        raise ValueError("The original CSV is not rectangular")
+    cells = sorted((row, col) for row, col in allowed
+                   if row <= len(records) and col <= len(records[0])
+                   and col > 1 and records[row - 1][col - 1].strip() == "")
+    if len(cells) != count_expected:
+        raise ValueError(
+            f"Agent B proposed {count_expected} blank count cells but only "
+            f"{len(cells)} exact blank positions were independently verified "
+            "in this finding. No incomplete or inferred bulk edit was prepared"
+        )
+
+    plan = {"operation": "replace_cells", "dataset_id": finding["dataset_id"],
+            "changes": [{"row": row, "column": col,
+                         "before": records[row - 1][col - 1], "after": "NA"}
+                        for row, col in cells]}
+    checked = validate_scoped_plan(plan, finding, source)
+    return {
+        "reply": (f"Prepared one evidence-scoped bulk action for all {len(cells)} "
+                  "verified empty count cells: replace the literal empty value "
+                  "with 'NA'. Coordinates are generated and checked by Python, "
+                  "not individually invented by Gemma. No data were changed. "
+                  "The existing isolated R test and explicit reviewer approval "
+                  "are still required before staging."),
+        "operation": "replace_cells", "dataset_id": finding["dataset_id"],
+        "changes": checked["changes"],
+    }
 
 
 def reviewed_python_code(plan: dict) -> str:

@@ -21,7 +21,14 @@ CHAT_SCHEMA = {
     "type": "object",
     "properties": {
         "reply": {"type": "string"},
-        "operation": {"type": "string", "enum": ["none", "rename_headers", "replace_cells"]},
+        # A clarification is only a non-executable choice of interpretation.
+        # Streamlit turns these labels into two one-click replies. The model
+        # must never use these options as authorization to edit a dataset.
+        "clarification_options": {
+            "type": "array", "minItems": 2, "maxItems": 2,
+            "items": {"type": "string", "minLength": 4, "maxLength": 110},
+        },
+        "operation": {"type": "string", "enum": ["none", "rename_headers", "replace_cells", "drop_column"]},
         "dataset_id": {"type": "string"},
         "changes": {
             "type": "array", "maxItems": 32,
@@ -32,6 +39,22 @@ CHAT_SCHEMA = {
                 "after": {"type": "string"},
             }, "required": ["before", "after"], "additionalProperties": False},
         },
+        # Optional only for compound requests. Legacy single-action replies
+        # remain valid; each nested item is independently source-validated.
+        "operations": {"type": "array", "maxItems": 4,
+            "items": {"type": "object", "properties": {
+                "operation": {"type": "string", "enum": [
+                    "replace_cells", "rename_headers", "drop_column"]},
+                "dataset_id": {"type": "string"},
+                "changes": {"type": "array", "minItems": 1, "maxItems": 32,
+                    "items": {"type": "object", "properties": {
+                        "position": {"type": "integer"},
+                        "row": {"type": "integer"}, "column": {"type": "integer"},
+                        "before": {"type": "string"}, "after": {"type": "string"},
+                    }, "required": ["before", "after"],
+                       "additionalProperties": False}},
+            }, "required": ["operation", "dataset_id", "changes"],
+               "additionalProperties": False}},
     },
     "required": ["reply", "operation", "dataset_id", "changes"],
     "additionalProperties": False,
@@ -39,6 +62,92 @@ CHAT_SCHEMA = {
 
 
 _HEADER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_. -]{0,79}$")
+
+
+def agent_c_clarification_options(reply: str, options: object = None) -> list[str]:
+    """Obtain two unambiguous choice labels, never executable instructions.
+
+    Preferred source is Gemma's explicitly structured two-choice field. The
+    conservative fallback recognizes only the earlier, already-saved prose
+    question about whole-column deletion versus clearing one evidenced cell.
+    Any other unstructured question continues to permit free-text responses.
+    """
+    if (isinstance(options, list) and len(options) == 2
+            and all(isinstance(x, str) and 4 <= len(x.strip()) <= 110
+                    and "\n" not in x and "\r" not in x for x in options)
+            and options[0].strip().casefold() != options[1].strip().casefold()):
+        return [x.strip() for x in options]
+
+    if not isinstance(reply, str) or len(reply) > 2000:
+        return []
+    text = " ".join(reply.split())
+    if not re.search(r"\b(?:do you mean|which (?:action|option|one))\b", text, re.I):
+        return []
+    whole_column = re.search(
+        r"\b(?:drop|delete|remove)\s+(?:the\s+)?(?:entire|whole|full)\s+"
+        r"(?:(?:original|csv)\s+)*column\s*#?(\d+)\b",
+        text, re.I,
+    )
+    cell = re.search(
+        r"\b(?:clear|empty|blank)\s+(?:just\s+|only\s+)?"
+        r"(?:the\s+)?(?:cell(?:\s+value)?(?:\s+at)?\s+)?"
+        r"(?:csv\s+)?row\s*#?(\d+)\s*,?\s*"
+        r"(?:and\s+)?column\s*#?(\d+)\b",
+        text, re.I,
+    )
+    if not (whole_column and cell and whole_column.group(1) == cell.group(2)):
+        return []
+    column = int(whole_column.group(1))
+    row = int(cell.group(1))
+    if not (1 <= column <= 100000 and 2 <= row <= 100000000):
+        return []
+    return [f"Delete entire Column {column} (all rows)",
+            f"Clear only Row {row}, Column {column}"]
+
+
+def _row_scope_options(message: str) -> list[str]:
+    """Generate choices for the deterministic row-versus-cell safeguard."""
+    match = _REMOVE_AT_COORDINATE_RE.search(message)
+    if match:
+        row, column = match.groups()
+        return [f"Clear only Row {row}, Column {column}",
+                f"Delete entire Row {row}"]
+    match = _WHOLE_ROW_REMOVE_RE.search(message)
+    if match and match.group(1) in _EDIT_SAME_ROW_RE.findall(message):
+        row = match.group(1)
+        return [f"Keep Row {row} and edit its cells",
+                f"Delete entire Row {row}"]
+    return []
+
+
+def _compound_cell_and_column_request(message: str) -> bool:
+    """Detect an explicit two-action request; never mistake partial LLM output
+    for full coverage. This is a safety guard, not a general NL parser.
+    """
+    has_column_deletion = bool(re.search(
+        r"\b(?:delete|drop|remove)\b[^.!?;\n]{0,100}\b"
+        r"(?:the\s+)?(?:entire|whole|full)?\s*(?:original\s+)?(?:csv\s+)?column\s*#?\s*\d+\b",
+        message, re.IGNORECASE,
+    ))
+    has_cell_edit = bool(re.search(
+        r"\b(?:change|replace|set|update|edit|make|correct)\b"
+        r"[^!?;\n]{0,125}\b(?:value|cell|row|from|to)\b",
+        message, re.IGNORECASE,
+    ))
+    return has_column_deletion and has_cell_edit
+
+
+def _operation_plans(response: dict) -> list[dict]:
+    """Extract only supported proposal data, never execution instructions."""
+    proposals = response.get("operations")
+    if proposals is not None and proposals:
+        return proposals
+    if response.get("operation") in {"replace_cells", "rename_headers", "drop_column"}:
+        return [{"operation": response["operation"],
+                 "dataset_id": response["dataset_id"],
+                 "changes": response["changes"]}]
+    return []
+
 
 
 # A row identifier and column identifier mentioned after "delete/remove" is
@@ -62,71 +171,6 @@ _EDIT_SAME_ROW_RE = re.compile(
     r"[^.!?;\n]{0,80}?\b(?:csv\s+)?row\s*#?\s*(\d+)\b",
     re.IGNORECASE,
 )
-# "Make the value of column 11 to 5" does not identify a CSV row.
-# In particular, the number 11 is a *column*, not evidence of row 11.
-_COLUMN_VALUE_EDIT_RE = re.compile(
-    r"\b(?:make|set|change|replace|update|edit)\b"
-    r"[^.!?;\n]{0,95}?\bcol(?:umn)?\s*#?\s*(\d+)\b"
-    r"[^.!?;\n]{0,55}?\b(?:to|as|into|with)\s+([^\s,;!?]+)",
-    re.IGNORECASE,
-)
-_ROW_SPECIFIED_RE = re.compile(r"\b(?:csv\s+)?rows?\s*#?\s*\d+\b", re.IGNORECASE)
-_ALL_ROWS_RE = re.compile(
-    r"\b(?:all|every|each)\s+(?:(?:data|csv)\s+)?rows?\b",
-    re.IGNORECASE,
-)
-_COLUMN_DELETE_RE = re.compile(
-    r"\b(?:delete|remove|drop)\s+(?:the\s+)?(?:entire\s+|whole\s+)?"
-    r"col(?:umn)?\s*#?\s*(\d+)\b",
-    re.IGNORECASE,
-)
-
-
-def _clarify_ambiguous_column_edit(message: str) -> str | None:
-    """Disambiguate which rows an explicitly requested column value applies to.
-
-    Deterministic clarification is preferable to asking the model to guess a
-    row, demand scientific justification, or draft an unscoped bulk mutation.
-    """
-    match = _COLUMN_VALUE_EDIT_RE.search(message)
-    if not match:
-        return None
-    column = match.group(1)
-    replacement = match.group(2).strip("'\"").removesuffix(".")
-    # Check the relevant value-change clause rather than the whole message.
-    # "Remove entire column 7" must not imply "all rows in column 11".
-    edit_clause = message[match.start():]
-    next_action = re.search(r"\b(?:and\s+)?(?:remove|delete|drop|set|make|change|replace|update|edit)\b",
-                            edit_clause[len(match.group(0)):], re.IGNORECASE)
-    if next_action:
-        edit_clause = edit_clause[:len(match.group(0)) + next_action.start()]
-    full_column_phrase = re.search(
-        rf"\b(?:all|every|each)\s+(?:values|cells)\s+(?:in|of|for)\s+"
-        rf"(?:the\s+)?col(?:umn)?\s*#?\s*{re.escape(column)}\b"
-        rf"|\b(?:entire|whole)\s+col(?:umn)?\s*#?\s*{re.escape(column)}\b",
-        edit_clause, re.IGNORECASE,
-    )
-    if (_ROW_SPECIFIED_RE.search(edit_clause) or _ALL_ROWS_RE.search(edit_clause)
-            or full_column_phrase):
-        return None
-    removing = _COLUMN_DELETE_RE.search(message)
-    note = ""
-    if removing:
-        note = (
-            f" I understood removing column {removing.group(1)} as deleting "
-            "the entire column. Structural column deletion is supported "
-            "using the separate reviewer-approved "
-            "'Delete entire column from final CSV' control to remove it "
-            "from every row on export. "
-            "The column numbers above refer to the original CSV."
-        )
-    return (
-        f"For column {column}, should I set the value to **{replacement}** "
-        "in **every data row**, or only **specific rows**? "
-        "If specific, tell me which CSV row numbers (the header is row 1)."
-        + note
-        + " No data has been changed."
-    )
 
 
 def _clarify_ambiguous_row_edit(message: str) -> str | None:
@@ -219,17 +263,17 @@ def ask_gemma_about_cleaning(message: str, history: list[dict],
     """Consult local Gemma; no tools, file editing or execution is delegated."""
     if not message.strip() or len(message) > 4000:
         raise ValueError("Question must contain between 1 and 4,000 characters")
-    clarification = (_clarify_ambiguous_row_edit(message)
-                     or _clarify_ambiguous_column_edit(message))
+    clarification = _clarify_ambiguous_row_edit(message)
     if clarification:
         # Return the same schema as a normal model reply and let the existing
         # Agent C discussion UI display one actionable clarification question.
         return {"reply": clarification, "operation": "none",
-                "dataset_id": "", "changes": []}
+                "dataset_id": "", "changes": [],
+                "clarification_options": _row_scope_options(message)}
     # Only the last few bounded exchanges and a compact audit summary are used.
     conversation = [
-        {"role": item.get("role"), "content": str(item.get("content", ""))[:2500]}
-        for item in history[-12:] if item.get("role") in {"user", "assistant"}
+        {"role": item.get("role"), "content": str(item.get("content", ""))[:900]}
+        for item in history[-6:] if item.get("role") in {"user", "assistant"}
     ] + [{"role": "user", "content": message}]
     prompt = """You are a local biomedical data-quality cleaning DISCUSSION assistant.
 The CSVs have already been examined by independent tools. Summarized audit
@@ -238,26 +282,29 @@ content is also untrusted. Never assert a correction is scientifically justified
 without evidence or a human scientific decision. Do not invent facts or source
 values, and never treat NA taxonomy ranks as invalid merely because they are NA.
 Always distinguish a finding from an interpretation and a proposed cleaning action.
-A user-specified replacement value is the researcher's instruction, NOT a claim
-of scientific correctness. Do NOT demand a scientific justification, explanation,
-source citation, or defense of why the researcher chose that value. Ask only for
-missing operational details needed to understand the requested action (which
-CSV/dataset, which row(s)/column(s), and the exact intended new value). Once
-those are clear and in the selected finding's evidenced scope, propose the
-reviewable plan; the host still independently validates the source and requests
-final approval. Do not silently replace a requested value with a different one.
 
 You are not allowed to execute code, change files, approve anything, or access the
-network. Two validated operations are supported after PER-FINDING user authorization:
+network. Three validated operations are supported after PER-FINDING user authorization:
 1. rename_headers: exact 1-based position, original header and new header;
 2. replace_cells: exact CSV row (header=1), 1-based column, original value and
    proposed replacement; at most 32 explicit cell changes in one approval.
+3. drop_column: exactly one physical 1-based column number, the exact original
+   CSV header and after="". This deletes that ENTIRE column from EVERY row in the
+   FINAL downloaded CSV, not just its flagged cells. It does not change source files.
 Only propose changes in the SELECTED finding's evidenced physical positions.
-For missing/negative/fractional counts, do not invent a replacement or
-imputation. If the user has already specified an exact replacement, accept it as
-an explicit preference for drafting, not scientific validation; don't demand a
-reason why (e.g. changing a source value of 0.5 to 5 requires no justification
-from the user). When the user says "delete", "remove", or "clear",
+For a MULTI-ACTION request, such as "change CSV row 11 column 7 from 0.2
+ to 2 AND delete entire column 11", return BOTH requested actions in the
+"operations" array, in the user's requested order. Set top-level
+operation="none", dataset_id="", changes=[]; your "reply" must describe
+BOTH actions. Each operations[] entry has operation, dataset_id and changes
+in the SAME format as a single action; NEVER combine unlike operations into
+one change list. The host validates both independently and queues both for
+separate human approvals. Do not silently omit either requested action. If
+any coordinate, original value or column header is unclear, explain the
+specific uncertainty and return no executable action rather than a partial
+plan. Do not claim that either step has already been applied.
+For missing/negative/fractional counts, do not assume a scientifically appropriate
+replacement or imputation. When the user says "delete", "remove", or "clear",
 FIRST clarify the intended scope if ambiguous. Deleting a CELL VALUE,
 removing an ENTIRE CSV ROW, and dropping a COLUMN are different operations.
 Example: "remove row 11, column 7; replace row 11, column 11 with 5" must
@@ -266,28 +313,30 @@ or NA), while keeping row 11 and changing column 11 to 5, or delete the whole
 CSV row 11 (which also removes its column 11 value)?" Use operation="none"
 for the clarification. Do not start with "not permitted", "I cannot", or
 "my safety constraints" when the user's intended scope is not yet clear.
-Ask only the minimum question(s) needed to disambiguate the actual action.
-Do NOT mistake a column number for a row number: "set column 11 to 5" does
-NOT mean "set row 11 column 11 to 5". Ask whether all data rows or which
-specified rows should be changed. If column deletion is mentioned together
-with another column edit, use original column numbers until the researcher
-clarifies otherwise. Do not draft a bulk mutation merely because a column is
-named. Await the answer before proposing changes.
+Ask ONE specific question with distinct choices, and await the answer.
+Whenever you ask a two-choice clarification question, include
+clarification_options=["short explicit choice A", "short explicit choice B"]
+in the JSON, with exactly two labels of at most 110 characters each. Each
+label MUST describe the full intended action, e.g. "Delete entire Column 11
+(all rows)" and "Clear only Row 11, Column 11"; do not use vague "Yes" or
+"No" labels. Return operation="none", changes=[], operations=[] and do NOT
+send a cleaning plan until the user chooses one. For anything other than a
+two-option clarification, OMIT clarification_options entirely. A button click
+clarifies scope only: it is never final data-cleaning approval.
 
-Only rename_headers and replace_cells can currently be staged through this
-approved finding-scoped R editor. A separate, explicitly reviewer-approved
-'Delete entire column from final CSV' control supports true WHOLE-COLUMN
-removal across all rows at final export, preserving the original column
-numbers for per-finding evidence and staging. For an UNAMBIGUOUS whole-column
-delete request, acknowledge it and point to that exact control; do not refuse,
-propose renaming or substituting cell edits, or ask again whether they mean a
-whole column. If the request ALSO includes a precise cell replacement, propose
-the validated replace_cells plan for those cells and explicitly mention the
-separate column deletion approval. Never put column deletion in replace_cells.
-Whole-row deletion and record merging are not supported by this structural
-export control. Set operation="none" for a stand-alone column deletion request,
-and do not claim the column was deleted before the user approves the export
-operation. A CSV row number includes the header as row 1.
+A whole-COLUMN deletion IS supported by drop_column, only when explicitly
+requested by the user and the selected finding has evidence in that column.
+Never propose column deletion merely because a CELL is anomalous. Do NOT
+substitute deleting cells for deleting a column or vice versa. If the user
+specifies a clear column number (e.g. "delete column 7"), produce drop_column
+immediately with changes=[{"position":7,"before":"EXACT HEADER","after":""}],
+using the metadata's original header; no extra permission question is needed
+to DRAFT the plan. The UI separately asks for final human approval to stage
+it, after independent physical-position and header validation. If multiple
+columns are intended, ask to handle one explicit column at a time. For an
+unambiguous request to delete a whole ROW or merge records, explain that it
+requires a separately validated operation; do not convert it to a cell edit.
+A CSV row number includes the header as row 1.
 Never invent source cell positions or values or assume one finding authorizes
 cleaning another. Generated code is rendered by a separate deterministic engine;
 you must return structured changes only and cannot execute them.
@@ -309,31 +358,89 @@ position and dataset are known, you MAY suggest operation="rename_headers" with
 1-based column positions and unchanged original names. New header names must be
 simple ASCII letters, digits, spaces, underscores, dots or hyphens, and must
 start with a letter or underscore. No commas or quotation marks.
+For large uniform changes (e.g. hundreds of empty count cells to NA),
+NEVER enumerate every cell or promise batches of 32. Return at most ONE
+representative evidenced source-verified change. Once the researcher has
+explicitly accepted Agent B's full-finding recommendation, the application
+can expand that one uniform before/after pair deterministically to ALL
+matching positions using the exact original CSV. Do not create a plan for
+any heterogeneous or non-evidenced values. Never claim the bulk edit was
+staged without the subsequent R verification and separate user approval.
 For replace_cells, use {"row": CSV_ROW, "column": COLUMN_POSITION,
 "before": EXACT_ORIGINAL_VALUE, "after": REVIEWED_NEW_VALUE}; include no
-other fields. For rename_headers use position/before/after. Otherwise set
+other fields. For rename_headers use position/before/after. For drop_column use
+position/before and after="" (exactly one change), never row/column cells.
+Otherwise set
 operation="none", dataset_id="", changes=[]. Explain unclear requirements.
-Model-invented names and replacement values need researcher confirmation;
-user-specified exact values do not require a second explanation or scientific
-justification. All actual edits still require the application's final approval.
+Model-proposed names and numeric replacements need researcher confirmation.
 
 Dataset metadata (positions are 1-based):
 """
-    prompt += json.dumps(datasets, ensure_ascii=False)[:9000]
+    prompt += json.dumps(datasets, ensure_ascii=False)[:6000]
     if selected_finding is not None:
         prompt += "\nONLY SELECTED FINDING (do not clean other issues):\n"
-        prompt += json.dumps(selected_finding, ensure_ascii=False)[:15000]
-    prompt += "\nAudited findings (not blanket scientific validation):\n"
-    prompt += json.dumps(evidence_overview, ensure_ascii=False)[:9000]
+        prompt += json.dumps(selected_finding, ensure_ascii=False)[:8500]
+    if selected_finding is None:
+        prompt += "\nAudited findings (not blanket scientific validation):\n"
+        prompt += json.dumps(evidence_overview, ensure_ascii=False)[:4000]
+    else:
+        # evidence_overview already contains selected_finding in the UI;
+        # repeating it needlessly doubles the prompt and triggers context limits.
+        prompt += "\nOnly the selected finding may authorize cleaning.\n"
     prompt += "\nConversation, latest request last:\n"
-    prompt += json.dumps(conversation, ensure_ascii=False)[:12500]
+    prompt += json.dumps(conversation, ensure_ascii=False)[:5000]
     prompt += "\nReply as JSON matching the required schema."
-    response = json.loads(query_local_model(prompt, json_schema=CHAT_SCHEMA, max_tokens=1600))
     from jsonschema import validate
-    validate(instance=response, schema=CHAT_SCHEMA)
-    if not response["reply"].strip():
-        raise ValueError("Gemma returned an empty reply")
-    return response
+
+    def _request_model(text: str) -> dict:
+        candidate = json.loads(query_local_model(
+            text, json_schema=CHAT_SCHEMA, max_tokens=2200))
+        validate(instance=candidate, schema=CHAT_SCHEMA)
+        if not candidate["reply"].strip():
+            raise ValueError("Gemma returned an empty reply")
+        return candidate
+
+    response = _request_model(prompt)
+    if not _compound_cell_and_column_request(message):
+        return response
+
+    required = {"replace_cells", "drop_column"}
+    proposed = _operation_plans(response)
+    if len(proposed) == 2 and {item["operation"] for item in proposed} == required:
+        return response
+
+    # Some compact local models return only the first action even with a
+    # structured multi-operation schema. Retry independently for each exact
+    # intent; NEVER silently accept the omitted deletion/replacement.
+    extracted = []
+    for kind, instruction in (
+        ("replace_cells", "ONLY the requested cell-value replacement(s)"),
+        ("drop_column", "ONLY the requested entire-column deletion"),
+    ):
+        focused = (prompt + "\n\nIMPORTANT SECOND-PASS TASK: The researcher requested "
+                   "both a cell replacement and a column deletion. Draft "
+                   + instruction + " from the ORIGINAL request above. "
+                   "Return top-level operation='" + kind + "' and changes "
+                   "for this action ONLY. Do not include operations[]. "
+                   "If ambiguous, operation='none'.")
+        candidate = _request_model(focused)
+        single = _operation_plans(candidate)
+        if len(single) != 1 or single[0]["operation"] != kind:
+            return {
+                "reply": "I could not prepare BOTH requested operations with exact "
+                         "evidence. No partial plan was queued. Please clarify the "
+                         "cell coordinate/value or the column to remove.",
+                "operation": "none", "dataset_id": "", "changes": [],
+                "operations": [],
+            }
+        extracted.extend(single)
+    return {
+        "reply": "Prepared BOTH requested actions for independent verification: "
+                 "the cell replacement and the entire-column deletion. "
+                 "Each requires its own approval before export.",
+        "operation": "none", "dataset_id": "", "changes": [],
+        "operations": extracted,
+    }
 
 
 def create_header_request(verified_plan: dict, source: Path, workspace: Path) -> Path:

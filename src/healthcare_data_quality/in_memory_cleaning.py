@@ -176,75 +176,45 @@ def apply_verified_in_memory(original: bytes, staged: bytes, insertion: dict, *,
     }
 
 
+def apply_approved_column_deletions(original: bytes, staged: bytes,
+                                    deletions: list[dict]) -> bytes:
+    """Apply explicitly approved physical-column removals only at final export.
 
-
-def authorize_column_drop(original: bytes, *, dataset_id: str, finding_id: str,
-                          position: int, reviewer: str) -> dict:
-    """Approve an explicit structural deletion, pegged to ORIGINAL CSV position.
-
-    This deliberately does not shift the in-session numbered evidence: column
-    removal happens on final export, after all individually verified edits.
+    Cell/rename modifications remain in the coordinate-stable staged CSV until
+    export. This prevents column-shift bugs when later Agent C edits use the
+    original numbered evidence. No source file or in-session intermediate is
+    changed. Each retained value is checked against the latest staged input.
     """
-    rows = _records(original)
-    if (type(position) is not int or position < 1 or position > len(rows[0]) or len(rows[0]) < 2):
-        raise ValueError("Select an existing original column; at least one column must remain")
-    if not isinstance(dataset_id, str) or not dataset_id.startswith("dataset_"):
-        raise ValueError("An attributable uploaded dataset is required")
-    if not isinstance(finding_id, str) or not finding_id:
-        raise ValueError("A selected finding is required")
-    if not isinstance(reviewer, str) or not reviewer.strip() or len(reviewer) > 120:
-        raise PermissionError("Reviewer identifier is required for column deletion")
-    return {
-        "operation": "delete_column_on_export", "dataset_id": dataset_id,
-        "finding_id": finding_id, "position": position,
-        "original_header": rows[0][position - 1],
-        "original_columns": len(rows[0]), "original_rows": len(rows),
-        "source_sha256": sha256_bytes(original), "reviewer": reviewer.strip(),
-    }
-
-
-def apply_approved_column_drops(original: bytes, staged: bytes,
-                                approvals: list[dict], *, dataset_id: str) -> bytes:
-    """Export a CSV without explicitly approved ORIGINAL columns, without drift.
-
-    Staged data retains its original width until final export so that per-finding
-    physical coordinates, R proofs and approval records remain valid. This
-    independently checks all retained cell values after the structural change.
-    """
-    if not approvals:
+    original_rows, staged_rows = _records(original), _records(staged)
+    if (len(original_rows) != len(staged_rows) or
+            any(len(a) != len(b) for a, b in zip(original_rows, staged_rows))):
+        raise PermissionError("Staged CSV dimensions differ from original evidence")
+    if not isinstance(deletions, list):
+        raise ValueError("Deletion approvals must be a list")
+    if not deletions:
         return staged
-    original_rows, current_rows = _records(original), _records(staged)
-    if len(original_rows) != len(current_rows) or any(
-            len(a) != len(b) for a, b in zip(original_rows, current_rows)):
-        raise PermissionError("The staged dataset dimensions changed before export")
-    source_digest = sha256_bytes(original)
-    excluded = set()
-    for approval in approvals:
-        if not isinstance(approval, dict) or approval.get("operation") != "delete_column_on_export":
-            raise PermissionError("Missing or invalid explicit column-deletion approval")
+    dropped: set[int] = set()
+    for approval in deletions:
+        if not isinstance(approval, dict):
+            raise PermissionError("Invalid column deletion approval")
         pos = approval.get("position")
-        if (approval.get("dataset_id") != dataset_id
-                or approval.get("source_sha256") != source_digest
-                or type(pos) is not int or not 1 <= pos <= len(original_rows[0])
-                or pos in excluded or approval.get("original_header") != original_rows[0][pos - 1]
-                or approval.get("original_rows") != len(original_rows)
-                or approval.get("original_columns") != len(original_rows[0])
-                or not str(approval.get("reviewer") or "").strip()
-                or not approval.get("finding_id")):
-            raise PermissionError("Column-deletion approval is stale, duplicated or unverified")
-        excluded.add(pos)
-    if len(excluded) >= len(original_rows[0]):
-        raise ValueError("Cannot delete every column from a CSV")
-    keep = [c for c in range(len(original_rows[0])) if (c + 1) not in excluded]
-    output_rows = [[row[c] for c in keep] for row in current_rows]
+        if (type(pos) is not int or not 1 <= pos <= len(original_rows[0])
+                or pos in dropped or approval.get("source_sha256") != sha256_bytes(original)
+                or approval.get("before") != original_rows[0][pos - 1]
+                or not isinstance(approval.get("reviewer"), str)
+                or not approval["reviewer"].strip()):
+            raise PermissionError("Stale, duplicate or unapproved column deletion")
+        dropped.add(pos)
+    if len(dropped) >= len(original_rows[0]):
+        raise PermissionError("Cannot delete every column from the CSV")
+    keep = [i for i in range(len(original_rows[0])) if i + 1 not in dropped]
+    output_rows = [[row[i] for i in keep] for row in staged_rows]
     buffer = StringIO(newline="")
-    csv.writer(buffer, lineterminator="\n").writerows(output_rows)
+    csv.writer(buffer).writerows(output_rows)
     output = (b"\xef\xbb\xbf" if staged.startswith(b"\xef\xbb\xbf") else b"") + buffer.getvalue().encode("utf-8")
-    verified_rows = _records(output)
-    if (len(verified_rows) != len(current_rows)
-            or any(after_row != [before_row[c] for c in keep]
-                   for before_row, after_row in zip(current_rows, verified_rows))):
-        raise AssertionError("The structural export changed an unrelated row or value")
+    observed = _records(output)
+    if observed != output_rows or len(observed) != len(staged_rows):
+        raise AssertionError("Final column deletion changed an unexpected value or row")
     return output
 
 
@@ -271,6 +241,10 @@ def build_final_download(dataset_names: list[tuple[str, str, bytes]]) -> tuple[s
 def review_completion(findings: list[dict], statuses: dict[str, str]) -> tuple[int, int]:
     """Count all findings AND completed no-issue Gemma checks, not only edits."""
     total = len(findings)
-    done = sum(statuses.get(f["id"]) in {"Applied and verified", "Resolved by earlier approved edit", "Reviewed — no change"}
-               for f in findings)
+    done = sum(statuses.get(f["id"]) in {
+        "Applied and verified", "Resolved by earlier approved edit",
+        "Approved column deletion for final export",
+        "Partially approved — remaining action rejected",
+        "Reviewed — no change",
+    } for f in findings)
     return done, total

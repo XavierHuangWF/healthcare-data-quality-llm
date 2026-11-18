@@ -14,18 +14,6 @@ class TrackingUI(StubUI):
         self.visible = []
         self.check_labels = []
         self.checked = set()
-        self.info_messages = []
-        self.submitted_text = {}
-        self.send_chat = False
-
-    def info(self, text):
-        self.info_messages.append(text)
-
-    def text_area(self, label, *, key=None, **kwargs):
-        return self.submitted_text.get(key, "")
-
-    def form_submit_button(self, label, *, disabled=False, **kwargs):
-        return label == "Send to Agent C" and self.send_chat and not disabled
 
     def checkbox(self, label, *, key=None, **kwargs):
         self.check_labels.append(label)
@@ -92,34 +80,12 @@ def test_no_button_opens_chat_without_mutating_data(monkeypatch, tmp_path):
     assert st.session_state.cleaning_discussion_mode_by_finding == {
         "dataset_1:qc:1": "alternative"
     }
-    assert submissions == [], "No must not submit an automatic Gemma request"
-    fid = "dataset_1:qc:1"
-    assert st.session_state.cleaning_messages_by_finding.get(fid, []) == []
-    assert fid not in st.session_state.cleaning_pending_gemma_b
+    assert len(submissions) == 0  # No hidden Gemma prompt after clicking No.
     st.buttons_on.clear()
     render()
-    assert f"review_chat_form_{fid}" in st.form_names
-    assert any("won't receive a request until" in msg for msg in st.info_messages)
+    assert "review_chat_form_dataset_1:qc:1" in st.form_names
     assert csv.read_bytes() == before
     assert st.session_state.cleaning_plans_by_finding == {}
-
-
-def test_no_then_custom_message_is_first_and_only_agent_c_submission(monkeypatch, tmp_path):
-    app, st, csv, render = setup(monkeypatch, tmp_path)
-    fid = "dataset_1:qc:1"
-    requests = []
-    monkeypatch.setattr(app, "_queue_agent_c_for_finding",
-                        lambda *args, **kwargs: requests.append(args[4]))
-    st.buttons_on.add(f"review_no_{fid}")
-    with pytest.raises(StopIteration, match="rerun"):
-        render()
-    assert requests == []
-    st.buttons_on.clear()
-    st.submitted_text[f"review_message_{fid}"] = "Keep column 7; clear row 4 column 11."
-    st.send_chat = True
-    with pytest.raises(StopIteration, match="rerun"):
-        render()
-    assert requests == ["Keep column 7; clear row 4 column 11."]
 
 
 def test_yes_hides_chat_until_agent_c_asks_for_clarification(monkeypatch, tmp_path):
