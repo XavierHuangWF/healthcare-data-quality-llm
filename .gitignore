@@ -249,3 +249,10 @@ __marimo__/
 data/decision_memory/
 # Generated local R execution artifacts
 /tools/generated_r/
+
+
+# Ignore all asset files
+/assets/**
+
+# Keep the assets folder in Git
+!/assets/.gitkeep

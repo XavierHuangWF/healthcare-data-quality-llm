@@ -16,7 +16,11 @@ from .finding_evidence import dataset_finding_evidence
 from .ingestion import inspect_headers
 
 APPROVAL_PHRASE = "APPROVE THIS FINDING ONLY"
-MAX_CELL_CHANGES = 32
+# Agent C's JSON schema remains limited to 32 examples. The host can expand
+# a uniform, source-evidenced, researcher-accepted correction to a larger
+# validated plan; all positions still must be cited in the selected finding.
+MAX_CELL_CHANGES = 2048
+MAX_MODEL_EXAMPLE_CHANGES = 32
 
 
 def build_cleaning_findings(audit: dict, paths: list[Path], names: list[str], runs: list[dict]) -> list[dict]:
@@ -151,6 +155,46 @@ def validate_scoped_plan(plan: dict, finding: dict, source: Path) -> dict:
     return {"operation": operation, "dataset_id": finding["dataset_id"],
             "finding_id": finding["id"], "source_sha256": file_sha256(source),
             "changes": verified}
+
+
+
+def expand_uniform_evidence_plan(plan: dict, finding: dict, source: Path, *,
+                                 full_finding_accepted: bool) -> tuple[dict, int]:
+    """Expand a homogeneous example plan to its complete, evidenced scope.
+
+    Never infer new cell values or extrapolate to a whole column. Expansion is
+    allowed only after the researcher accepts an action covering *all* the
+    selected finding, all source coordinates are independently in its evidence,
+    and every evidenced original value is identical to the verified examples.
+    Heterogeneous or ambiguous proposals remain strictly partial.
+    """
+    checked = validate_scoped_plan(plan, finding, source)
+    seed = checked.get("changes", [])
+    if (not full_finding_accepted or checked["operation"] != "replace_cells"
+            or not seed or len(seed) > MAX_MODEL_EXAMPLE_CHANGES):
+        return checked, 0
+    allowed, _ = allowed_positions(finding, source)
+    if len(allowed) <= len(seed) or len(allowed) > MAX_CELL_CHANGES:
+        return checked, 0
+    pairs = {(item["before"], item["after"]) for item in seed}
+    if len(pairs) != 1:
+        return checked, 0
+    before, after = next(iter(pairs))
+    # Validate the *complete* CSV independently of the model's partial list.
+    with Path(source).open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.reader(stream, strict=True))
+    if not rows or any(len(row) != len(rows[0]) for row in rows):
+        return checked, 0
+    if any(r > len(rows) or c > len(rows[0]) or rows[r-1][c-1] != before
+           for r, c in allowed):
+        return checked, 0
+    expanded = {"operation": "replace_cells", "dataset_id": checked["dataset_id"],
+                "changes": [{"row": r, "column": c, "before": before, "after": after}
+                            for r, c in sorted(allowed)]}
+    # This passes through the same unchanged source-value, scope, duplicate,
+    # value and SHA-256 checks as a regular plan. No LLM-generated code is run.
+    verified = validate_scoped_plan(expanded, finding, source)
+    return verified, len(verified["changes"]) - len(seed)
 
 
 def reviewed_python_code(plan: dict) -> str:

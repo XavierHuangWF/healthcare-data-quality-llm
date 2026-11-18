@@ -59,32 +59,32 @@ def test_baseline_and_exploration_share_one_data_quality_tab(monkeypatch):
     assert 'render_baseline(dataset_id, baseline, source_path=paths[label_index])' in source
 
 
-def test_unified_run_requires_explicit_start_and_checkbox_opt_in(monkeypatch):
+def test_unified_run_opt_in_starts_nonblocking_exploration(monkeypatch):
     _app(monkeypatch)
     source = (ROOT / "app.py").read_text(encoding="utf-8")
     assert 'run_requested = st.button("Run full investigation", type="primary")' in source
     assert '"Include Gemma\'s automatic exploratory analyses (isolated read-only Python)"' in source
     assert 'if run_requested:' in source
-    assert 'if include_exploration:\n                progress_view.begin_exploration()' in source
-    assert 'on_progress=progress_view.exploration_event' in source
-    assert 'on_verified_round=progress_view.verified_round' in source
-    assert 'run_exploratory_series(' in source
+    assert 'start_live_exploration(full, cache_key, paths, names)' in source
+    assert 'investigation_manager().start(run_id, paths, runner=run_background,' in source
+    assert 'sync_live_exploration(audit, cache_key)' in source
+    assert 'run_exploratory_series(' in source  # legacy/manual helper preserved
     assert 'def combined_audit_export(' in source
     assert 'healthcare_data_quality_combined_investigation.json' in source
 
 
-
-def test_full_run_progress_tracks_real_events_and_does_not_invent_eta(monkeypatch):
+def test_full_run_progress_publishes_real_background_events(monkeypatch):
     _app(monkeypatch)
     source = (ROOT / "app.py").read_text(encoding="utf-8")
-    assert "progress_callback=progress_view.baseline_event" in source
-    assert "on_progress=progress_view.exploration_event" in source
-    assert "on_verified_round=progress_view.verified_round" in source
-    assert "progress_view.finish(exploration_error=bool(" in source
-    assert "progress_view.error()" in source
-    assert "components.html(live_timer_html(int(time() * 1000))" in source
+    worker = (ROOT / "exploration_jobs.py").read_text(encoding="utf-8")
+    registered_worker = (ROOT / "investigation_jobs.py").read_text(encoding="utf-8")
+    assert 'progress_callback=progress,' in registered_worker
+    assert 'baseline_ready_callback=publish_baseline' in registered_worker
+    assert 'st.fragment(run_every="3s")(refresh_explorations)' in source
+    assert 'st.fragment(run_every="3s")(refresh_cleaning)' in source
+    assert 'with model_request_priority("investigation"):' in worker
+    assert "components.html(live_timer_html(self.started_epoch_ms)" in source
     assert "estimated percentage or time remaining" in source
-    assert "on_progress: Callable[[str], None] | None = None" in source
 
 
 def test_combined_export_preserves_baseline_and_contains_verified_runs(monkeypatch):

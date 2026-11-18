@@ -97,5 +97,6 @@ def test_evidence_ui_does_not_repeat_entire_ai_history_or_empty_exploratory_bann
     assert "render_technical_history(audit)" not in view
     assert 'if exploratory_runs:' in view
     assert 'st.markdown("#### Gemma exploratory findings")' not in view
-    assert "registered_investigation_evidence(audit, dataset_paths)" in view
+    assert "registered_investigation_evidence(audit, dataset_paths)" not in view  # duplicated narrative intentionally excluded
+    assert 'baseline_evidence_trace(' in view
     assert "st.code(str(proposal.get(\"code\")" in view

@@ -125,17 +125,25 @@ def test_batch_recommendations_are_non_executable_and_match_ids(monkeypatch):
 
     def fake_query(prompt, **kwargs):
         calls.append((prompt, kwargs))
-        identifiers = [item["finding_id"] for item in json.loads(prompt.split("DATA:\n", 1)[1])]
+        items = json.loads(prompt.split("DATA:\n", 1)[1])
         return json.dumps({"recommendations": [
-            {"finding_id": fid, "suggestion": "Seek researcher's policy", "decision_needed": "Which one?"}
-            for fid in identifiers
-        ] + [{"finding_id": "unknown", "suggestion": "Ignore", "decision_needed": ""}]})
+            {"finding_id": item["finding_id"],
+             "action_type": "no_change" if item["type"] == "Gemma check" else "set_missing",
+             "action": "Keep the dataset unchanged for this completed check." if item["type"] == "Gemma check"
+                       else "Replace the affected invalid cells with NA in a reviewed CSV copy.",
+             "rationale": "No verified data error requires a correction."}
+            for item in items
+        ] + [{"finding_id": "unknown", "action_type": "set_missing",
+              "action": "Replace invalid observations with NA in a separate reviewed copy.",
+              "rationale": "No evidence linked to a known finding."}]})
 
     monkeypatch.setattr("cleaning_review.query_local_model", fake_query)
     catalog = _catalog()
     replies = ask_gemma_for_review_options(catalog)
     assert set(replies) == {item["id"] for item in catalog}
     assert "unknown" not in replies
+    assert replies[catalog[0]["id"]]["suggestion"].startswith("Replace the affected invalid cells")
+    assert "researcher" not in replies[catalog[0]["id"]]["suggestion"].lower()
     assert len(calls) == 1
     assert "no code" not in calls[0][0].lower() or "do not generate code" in calls[0][0].lower()
     assert calls[0][1]["json_schema"]
@@ -186,16 +194,22 @@ def test_accepting_batch_suggestion_passes_its_text_to_model(monkeypatch, tmp_pa
                         lambda *args, **kwargs: _catalog())
     monkeypatch.setattr("healthcare_data_quality.finding_cleaning.allowed_positions",
                         lambda *args: (set(), set()))
+    class SavedAgentB:
+        def snapshot(self, key):
+            return {"entries": {"dataset_1:qc:1": {
+                "status": "ready",
+                "suggestion": "Ask owner whether fractional values are measurements.",
+                "decision_needed": "Are these counts or concentrations?"}}}
+    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: SavedAgentB())
     app.render_cleaning_workspace([file], [SimpleNamespace(name="one.csv")], {}, "audit-C", [])
-    st.session_state.cleaning_recommendations["dataset_1:qc:1"] = {
-        "suggestion": "Ask owner whether fractional values are measurements.",
-        "decision_needed": "Are these counts or concentrations?",
-    }
     st.buttons_on.add("review_yes_dataset_1:qc:1")
     seen = []
+    from threading import Event
+    invoked = Event()
 
     def fake_gemma(message, history, overview, datasets, *, selected_finding=None):
         seen.append(selected_finding)
+        invoked.set()
         return {"reply": "Scientific policy still needed.",
                 "operation": "none", "dataset_id": "", "changes": []}
 
@@ -203,7 +217,10 @@ def test_accepting_batch_suggestion_passes_its_text_to_model(monkeypatch, tmp_pa
     import pytest
     with pytest.raises(StopIteration, match="rerun"):
         app.render_cleaning_workspace([file], [SimpleNamespace(name="one.csv")], {}, "audit-C", [])
+    # Model execution is now asynchronous; the click only queues a request.
+    assert invoked.wait(2), "Agent C job did not begin"
     assert len(seen) == 1
+    assert st.session_state.cleaning_messages_by_finding["dataset_1:qc:1"][0]["role"] == "user"
     assert seen[0]["finding_id"] == "dataset_1:qc:1"
     assert "fractional values" in seen[0]["suggestion_under_discussion"]["suggestion"]
     assert st.session_state.cleaning_plans_by_finding == {}
@@ -227,4 +244,6 @@ def test_existing_open_session_migrates_to_new_card_states(monkeypatch, tmp_path
     assert st.session_state.cleaning_plans_by_finding == {}
     assert st.session_state.cleaning_recommendations == {}
     assert st.session_state.cleaning_history[0]["finding_id"] == "old"
-    assert len(st.expanders) == 3
+    assert len(st.expanders) == 4  # includes final, optional in-memory audit history
+    assert st.session_state.cleaning_working_paths == {}
+    assert st.session_state.cleaning_staged_bytes_by_dataset["dataset_1"] == file.read_bytes()

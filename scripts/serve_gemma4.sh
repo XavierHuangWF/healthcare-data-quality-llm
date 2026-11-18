@@ -12,16 +12,34 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_DISABLE_TELEMETRY=1
 
+# The investigated workflow needs >= 12,288 tokens of model context.  Do not
+# shrink the context to accommodate a second concurrent inference request:
+# reduce HDQ_MAX_NUM_SEQS instead if GPU/KV-cache memory is insufficient.
+MODEL_LEN="${HDQ_MAX_MODEL_LEN:-12288}"
+if [[ ! "$MODEL_LEN" =~ ^[0-9]+$ ]] || (( 10#$MODEL_LEN < 12288 )); then
+    echo "ERROR: HDQ_MAX_MODEL_LEN must be an integer >= 12288 (received: '$MODEL_LEN')." >&2
+    echo "Keep the tested minimum context; reduce HDQ_MAX_NUM_SEQS to 1 if needed." >&2
+    exit 2
+fi
+
+MAX_SEQS="${HDQ_MAX_NUM_SEQS:-1}"
+if [[ ! "$MAX_SEQS" =~ ^[123]$ ]]; then
+    echo "ERROR: HDQ_MAX_NUM_SEQS must be 1, 2, or 3 (received: '$MAX_SEQS')." >&2
+    exit 2
+fi
+
 echo "Starting Gemma 4 12B..."
 echo "Model: $MODEL_DIR"
 echo "Server: http://127.0.0.1:8000"
+echo "Model context: $MODEL_LEN tokens (minimum: 12288)"
+echo "vLLM max simultaneous sequences: $MAX_SEQS"
 
 exec "$VLLM" serve "$MODEL_DIR" \
     --served-model-name gemma4-12b \
     --host 127.0.0.1 \
     --port 8000 \
-    --max-model-len 12288   \
+    --max-model-len "$MODEL_LEN" \
     --gpu-memory-utilization 0.90 \
-    --max-num-seqs 1 \
+    --max-num-seqs "$MAX_SEQS" \
     --language-model-only \
     --enforce-eager

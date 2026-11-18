@@ -365,6 +365,7 @@ def run_initial_audit(
         additional_datasets: list[Path] | None = None,
         *,
         generate_proposals: bool = False,
+        baseline_ready_callback: Callable[[dict], None] | None = None,
 ) -> dict:
     """Run the audit. Proposal inference is opt-in, never part of read-only mode."""
     dataset_path = Path(dataset_path)
@@ -468,6 +469,19 @@ def run_initial_audit(
 
     if progress_callback is not None:
         progress_callback("Automatic baseline checks completed.")
+
+    # Publish deterministic QC before invoking the potentially long Gemma
+    # registered-tool agent. This partial snapshot contains no fabricated
+    # history or conclusions and is never saved as a completed investigation.
+    if baseline_ready_callback is not None:
+        baseline_ready_callback({
+            "status": "investigating", "ingestion": ingestion,
+            "baseline": baseline, "dataset_baselines": dataset_baselines,
+            "investigation_priorities": investigation_priorities,
+            "investigation_objectives": initial_ledger,
+            "report": {}, "history": [], "proposals": [],
+            "proposal_generation_error": None, "partial": True,
+        })
 
     prior_decisions = get_decision_context(dataset_path)
 

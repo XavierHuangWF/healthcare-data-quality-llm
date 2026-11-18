@@ -116,6 +116,21 @@ def _metric(name: str, observed: object, calculation: str) -> dict:
     return {"Measurement": name, "Observed": observed, "How obtained": calculation}
 
 
+def measurement_rows_for_display(measurements: list[dict]) -> list[dict]:
+    """Return Arrow-safe evidence metrics without changing the recorded data.
+
+    A single check may report numeric counts AND a categorical string such as
+    "unprefixed" in its Observed column. PyArrow requires a consistent column
+    type and otherwise logs an ArrowTypeError on each Streamlit rerender.
+    All observed values are shown as text *only in this display copy*; the
+    underlying audit/trace retains its original numeric values.
+    """
+    return [
+        {**row, "Observed": "—" if row.get("Observed") is None else str(row["Observed"])}
+        for row in measurements
+    ]
+
+
 def _cell_pair_examples(path: Path | None, left: int, right: int, limit: int = 4) -> list[dict]:
     """Read a few source examples, without re-running or supplanting the saved test."""
     if path is None or not Path(path).is_file() or left < 1 or right < 1:
