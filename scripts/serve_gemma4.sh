@@ -13,16 +13,16 @@ export TRANSFORMERS_OFFLINE=1
 export HF_HUB_DISABLE_TELEMETRY=1
 
 # The investigated workflow needs >= 12,288 tokens of model context.  Do not
-# shrink the context to accommodate a second concurrent inference request:
+# shrink the context to accommodate concurrent inference requests:
 # reduce HDQ_MAX_NUM_SEQS instead if GPU/KV-cache memory is insufficient.
 MODEL_LEN="${HDQ_MAX_MODEL_LEN:-12288}"
 if [[ ! "$MODEL_LEN" =~ ^[0-9]+$ ]] || (( 10#$MODEL_LEN < 12288 )); then
     echo "ERROR: HDQ_MAX_MODEL_LEN must be an integer >= 12288 (received: '$MODEL_LEN')." >&2
-    echo "Keep the tested minimum context; reduce HDQ_MAX_NUM_SEQS to 1 if needed." >&2
+    echo "Keep the tested minimum context; use HDQ_MAX_NUM_SEQS=1 or 2 explicitly if GPU memory cannot support 3." >&2
     exit 2
 fi
 
-MAX_SEQS="${HDQ_MAX_NUM_SEQS:-1}"
+MAX_SEQS="${HDQ_MAX_NUM_SEQS:-3}"
 if [[ ! "$MAX_SEQS" =~ ^[123]$ ]]; then
     echo "ERROR: HDQ_MAX_NUM_SEQS must be 1, 2, or 3 (received: '$MAX_SEQS')." >&2
     exit 2

@@ -1171,6 +1171,24 @@ def _rerun_cleaning_fragment() -> None:
         st.rerun()
 
 
+def _render_live_finding_assignment(fid: str) -> None:
+    """Update the small ownership caption without remounting Agent C input."""
+    from interactive_chat_jobs import interactive_chat_manager
+    pending = st.session_state.get("cleaning_pending_gemma_b", {}).get(fid)
+    if not pending:
+        return
+    manager = interactive_chat_manager()
+    role = manager.agent_for(pending["job_id"]) if hasattr(manager, "agent_for") else None
+    assigned = role if role in {"A", "B", "C"} else pending.get("assigned_agent", "C")
+    pending["assigned_agent"] = assigned
+    if assigned in {"A", "B"}:
+        st.caption(f"Idle Agent {assigned} is now assisting with this finding "
+                   "while C handles another request. Human approval is still required.")
+    else:
+        st.caption("Agent C is preparing the scoped cleaning plan or waiting "
+                   "for its turn. No working CSV is being modified.")
+
+
 def _render_live_agent_b_finding(
     fid: str, finding: dict, source: Path | None, uploaded: list,
     dataset_paths: list[Path], job_id: str | None, ds_id: str,
@@ -1662,14 +1680,10 @@ def render_cleaning_workspace(
                         with st.chat_message(item["role"]):
                             st.write(item["content"])
             if b_pending:
-                assigned = st.session_state.cleaning_pending_gemma_b[fid].get("assigned_agent", "C")
-                if assigned in {"A", "B"}:
-                    st.caption(f"Idle Agent {assigned} is assisting with this finding while Agent C handles "
-                               "another request. The same validation and approval rules apply; "
-                               "no data are being modified.")
+                if hasattr(st, "fragment"):
+                    st.fragment(run_every="3s")(_render_live_finding_assignment)(fid)
                 else:
-                    st.caption("Agent C is preparing the scoped cleaning plan (or waiting for "
-                               "its next turn). No working CSV is being modified.")
+                    _render_live_finding_assignment(fid)
             if fid not in ready_ids:
                 st.caption("Agent C unlocks once Agent B's recommendation is ready.")
             if (choice_labels and fid in ready_ids and not plan and not b_pending
@@ -1706,7 +1720,7 @@ def render_cleaning_workspace(
                     (mode == "alternative" or clarification_needed)):
                 with st.form(f"review_chat_form_{fid}", clear_on_submit=True):
                     message = st.text_area(
-                        "Clarify missing scientific details" if clarification_needed
+                        "Clarify requested edit" if clarification_needed
                         else "Discuss another action with Agent C",
                         placeholder="Ask a question or specify exact desired changes…",
                         key=f"review_message_{fid}", height=80,
@@ -2460,44 +2474,42 @@ def _ask_gemma_for_finding(finding: dict, source: Path | None, uploaded: list,
                        f"Agent C did not return a valid response: {exc}. No changes were made."})
 
 
-def _finished_background_agents_for_review() -> tuple[bool, bool]:
-    """Return ONLY helpers whose original background pipelines are terminal.
+def _background_agents_idle_for_run(context_key: str, run_id: str) -> tuple[bool, bool]:
+    """Thread-safe, process-local availability; never reads Streamlit state.
 
-    Unknown or partially published run state is NOT sufficient evidence of
-    idleness; we must not borrow A/B during an active investigation or when
-    Agent B still has recommendations waiting to generate.
+    The same saved recommendation queue drives the Agent B status card and
+    the borrow decision. The probe is safe for queued worker threads to call
+    after Agent B finishes; it never starts new background work.
     """
-    audit = st.session_state.get("audit_result") or {}
-    if not isinstance(audit, dict):
-        return False, False
-    # The review UI may still hold a partial audit after its background jobs
-    # finish. Read authoritative worker status instead of treating that stale
-    # UI snapshot as proof that both agents are busy.
-    run_id = (audit.get("cleaning_recommendation_run_id")
-              or st.session_state.get("registered_investigation_run_id"))
-    context_key = st.session_state.get("audit_cache_key")
-    if not run_id or not context_key:
+    if not context_key or not run_id:
         return False, False
     from exploration_jobs import exploration_manager
     from cleaning_jobs import recommendation_manager, job_fingerprint
     try:
-        investigation = investigation_manager().snapshot(run_id)
-        exploration = exploration_manager().snapshot(run_id)
-        a_idle = bool(
-            investigation and investigation.get("status") in {"completed", "failed"}
-            and (not exploration or exploration.get("status") in {"complete", "incomplete", "failed"})
-        )
-        recommendation_key = job_fingerprint(context_key, [], run_id=run_id)
-        recommendation = recommendation_manager().snapshot(recommendation_key)
-        entries = (recommendation or {}).get("entries") or {}
+        a_idle = (not investigation_manager().has_running_jobs()
+                  and not exploration_manager().has_running_jobs())
+        key = job_fingerprint(context_key, [], run_id=run_id)
+        snapshot = recommendation_manager().snapshot(key) or {}
+        entries = snapshot.get("entries") or {}
         b_idle = bool(entries) and all(
             isinstance(entry, dict) and entry.get("status") in {"ready", "failed"}
             for entry in entries.values()
         )
         return a_idle, b_idle
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-        # If background status is unavailable, leave the work with Agent C.
+    except (OSError, ValueError, KeyError, TypeError, AttributeError,
+            json.JSONDecodeError):
         return False, False
+
+
+def _finished_background_agents_for_review() -> tuple[bool, bool]:
+    """UI-side adapter for the same background-safe availability check."""
+    audit = st.session_state.get("audit_result") or {}
+    if not isinstance(audit, dict):
+        return False, False
+    run_id = (audit.get("cleaning_recommendation_run_id")
+              or st.session_state.get("registered_investigation_run_id"))
+    context_key = st.session_state.get("audit_cache_key")
+    return _background_agents_idle_for_run(context_key, run_id)
 
 
 def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: list,
@@ -2532,25 +2544,33 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             _record_gemma_b_response(fid, finding, source, bulk)
             return
         manager = interactive_chat_manager()
-        # Every explicit user request can borrow an idle A/B lane while C is
-        # occupied, including "Yes — prepare this action". The previous version
-        # restricted borrowing to "No — discuss another action", making all
-        # accepted plans queue behind C even with idle helper agents.
-        # Automatic retries stay on C to avoid surprise helper activations.
+        # Explicit Yes/No conversations enter one C lane. A queued job may
+        # borrow a newly idle A/B later, not only at click time. This is
+        # important when B finishes its recommendations while C is replying.
         mode = st.session_state.cleaning_discussion_mode_by_finding.get(fid)
         user_initiated = (mode in {"accepted", "alternative"} and not automatic)
-        if (user_initiated and hasattr(manager, "active_count")
-                and manager.active_count("C") > 0):
-            a_idle, b_idle = _finished_background_agents_for_review()
-        else:
-            a_idle, b_idle = False, False
-        if (a_idle or b_idle) and hasattr(manager, "submit_routed"):
+        if user_initiated and hasattr(manager, "submit_routed"):
+            audit = st.session_state.get("audit_result") or {}
+            context_key = st.session_state.get("audit_cache_key")
+            run_id = (audit.get("cleaning_recommendation_run_id")
+                      or st.session_state.get("registered_investigation_run_id"))
+            if not context_key or not run_id:
+                # The cleaning workspace can be rendered directly in unit
+                # tests without the top-level investigation session state.
+                context_key = st.session_state.get("cleaning_context_key", "").split(":")[0]
+                run_id = audit.get("cleaning_recommendation_run_id")
+            idle_probe = (lambda context_key=context_key, run_id=run_id:
+                          _background_agents_idle_for_run(context_key, run_id))
+            a_idle, b_idle = idle_probe()
             job_id, agent = manager.submit_routed(
                 ask_gemma_about_cleaning, question, old_thread, [scoped], metadata,
                 selected_finding=scoped,
                 agent_a_idle=a_idle, agent_b_idle=b_idle,
+                idle_probe=idle_probe,
             )
         else:
+            # Automatic retries retain C ownership and are never handed to
+            # another role without a new explicit user request.
             job_id = manager.submit(
                 ask_gemma_about_cleaning, question, old_thread, [scoped], metadata,
                 selected_finding=scoped)
@@ -2578,6 +2598,10 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
     manager = interactive_chat_manager()
     pending_b = st.session_state.cleaning_pending_gemma_b.get(fid)
     if pending_b:
+        if hasattr(manager, "agent_for"):
+            live_agent = manager.agent_for(pending_b["job_id"])
+            if live_agent in {"A", "B", "C"}:
+                pending_b["assigned_agent"] = live_agent
         # The small completion-only poller can collect the result without
         # rerendering this form. Consume that exact stored outcome once.
         outcome = st.session_state.setdefault("cleaning_completed_gemma", {}).pop(
@@ -3349,6 +3373,10 @@ def _poll_agent_c_completion() -> None:
     for fid, info in list(pending.items()):
         if fid in ready or not isinstance(info, dict) or not info.get("job_id"):
             continue
+        if hasattr(manager, "agent_for"):
+            live_agent = manager.agent_for(info["job_id"])
+            if live_agent in {"A", "B", "C"}:
+                info["assigned_agent"] = live_agent
         result = manager.take(info["job_id"])
         if result.get("status") != "running":
             ready[fid] = result

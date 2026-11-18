@@ -22,7 +22,7 @@ _REQUEST_PRIORITY = ContextVar("hdq_llm_request_priority", default="interactive"
 
 
 def _max_active_requests() -> int:
-    value = os.environ.get("HDQ_LLM_MAX_ACTIVE", "1")
+    value = os.environ.get("HDQ_LLM_MAX_ACTIVE", "3")
     try:
         number = int(value)
     except ValueError as exc:
