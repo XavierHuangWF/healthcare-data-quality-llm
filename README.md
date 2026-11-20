@@ -1,5 +1,124 @@
 # Healthcare Data Quality LLM
 
+## Current implementation — November 20, 2026
+
+> **Read this section first.** This is a local research prototype, not a clinically validated cleaning system. Subsequent dated sections document earlier engineering states; where they disagree, treat this November 20 overview and the actual source code as authoritative.
+
+### Three logical agents, one Gemma inference server
+
+| Role | Responsibility | Execution authority |
+| --- | --- | --- |
+| **Agent A — Investigation** | Run deterministic QC and local Gemma exploratory checks; assemble source-grounded findings and evidence. | Read-only investigation; cannot authorize cleaning. |
+| **Agent B — Recommendations** | For each relevant finding or check, compare current evidence with previously approved methods and generated advisory skills; propose candidate cleaning actions. | Suggestions only. A queued or cached historical rule is **not** a freshly validated suggestion. |
+| **Agent C — Interactive cleaning** | Manage reviewer discussion, resolve explicitly requested edits, prepare source-verified Before → After proposals, and route selected batches through the approval gate. | Cannot approve its own edits; a named reviewer must authorize a verified batch. |
+
+All three roles use the **same locally hosted Gemma/vLLM model**; they are not three copies of the model. The application and server each default to a concurrency cap of three (`HDQ_LLM_MAX_ACTIVE`, `HDQ_MAX_NUM_SEQS`). Background concurrency is not a guarantee that an interactive request will never queue.
+
+### Reviewer-facing workflow
+
+1. Upload CSV data. Original uploads are never overwritten. Run or restore a source-compatible investigation. Agent A identifies findings and checks; Agent B prepares recommendations in the background.
+2. For each finding/check, Agent B supplies the current evidence and relevant **previously approved methods** to Gemma for fresh applicability assessment. Saved solutions and generated skills are advisory context, never authorization. The app should count a recommendation as ready only when its current assessment exists.
+3. Where Gemma proposes 1–3 candidate actions, the application verifies every supported target against the **current original CSV** before rendering concise **Location | Before | After** choices. Invalid, ambiguous, or incomplete candidates must not receive an executable choice button. The UI may fall back to a discussion path.
+4. A selected choice advances to Agent C. **No — Discuss Another Idea** opens the Agent C chat and does not send an automatic request. An explicit reviewer instruction (for example, replace an identified cell or delete a named original CSV row) should be grounded directly in source data without demanding external scientific justification.
+5. For any supported, source-verified batch, the reviewer sees one exact Before → After review, enters a reviewer name if needed, and uses **Yes — Approve & Execute** once. This stages *all* approved operations atomically in memory. Conflicting, stale, invalid or unsupported edits remain blocked by deterministic validation; a reviewer preference does not override an integrity failure.
+6. **Download cleaned CSV** exports the currently validated staged changes to a new derived file, even if some findings are still pending. Original source files stay unchanged. Previously completed findings can be reopened for revision subject to conflict-safe rollback.
+
+**Data-quality interpretation:** Empty count cells and literal taxonomy `NA` are distinct. Taxonomy level count must match the expected number, with `NA` allowed in any rank. No model may invent missing taxonomic identities or infer full-dataset totals from an evidence sample.
+
+### Persistent review memory and learned skills
+
+- `src/healthcare_data_quality/interaction_memory.py` records approved methods for retrieval by related finding/check. Cross-finding similarity influences what Gemma considers, **not** what can be executed.
+- `src/healthcare_data_quality/adaptive_skill_memory.py` records abstract outcomes (approved, declined, or reviewed without change). After at least **two approved edits within a finding family**, a best-effort background Gemma job may produce a versioned advisory method in `skills/generated/` as JSON and Markdown. Generated guidance is never executable Python or authority to edit data.
+- `memory/` and `skills/generated/` are **Git-ignored local state**. Keep these local records and any scientific/customer data outside commits. The source modules implementing memory and skills **should** be committed.
+- A learned rule must be reassessed against new source evidence, independently validated, and explicitly approved. Refused or reversed edits must not become auto-authorization.
+
+### Start the local services (WSL Ubuntu)
+
+**Terminal A — Gemma/vLLM server:**
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+source /home/xavier/.venv/bin/activate
+bash scripts/serve_gemma4.sh
+```
+
+**Terminal B — Streamlit client:**
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+source /home/xavier/.venv/bin/activate
+PYTHONPATH=src:scripts streamlit run app.py \
+  --server.address 127.0.0.1 --server.port 8501 \
+  --browser.gatherUsageStats false
+```
+
+Verify the server with `curl -fsS http://127.0.0.1:8000/v1/models`, then open `http://127.0.0.1:8501`. These paths reflect this developer machine and may differ elsewhere. A reachable API is not proof that local inference succeeds.
+
+### Git checkpoint for the current `backend` branch
+
+PyCharm's **Commit** window shows *tracked modifications* and *Unversioned Files* separately. Before committing, review **all** unversioned entries: stage the newly introduced `.py` modules, tests, and deliberate package metadata needed by the running app, but **exclude** CSVs, uploaded patient/research data, model weights, caches, local run outputs, `.env` files, and generated decision logs or skills.
+
+From the WSL project root:
+
+```bash
+git branch --show-current              # Expected: backend
+git status --short                       # Review tracked + untracked
+python -m compileall -q app.py cleaning_jobs.py cleaning_review.py \
+  src/healthcare_data_quality
+# Run your applicable focused tests before committing.
+# In PyCharm, select reviewed source files + README.md for staging.
+git diff --cached --check                # Or: git diff --check before staging
+git diff --cached --stat
+git commit -m "feat: integrate adaptive A/B/C cleaning, memory, and reviewer-controlled actions"
+git status --short
+```
+
+If staging only through PyCharm, use its **Commit** panel to check the files you intend to include and review the diff before pressing **Commit**. `git diff --cached` reports only staged changes; PyCharm may handle staging internally depending on its Git configuration. **Do not use `git add .` without first reviewing unversioned content.** Commit to `backend` first. Merge into `main` only after checking compatibility; do not force-push or switch branches with uncommitted changes.
+
+**Known test boundary:** Focused tests for earlier patches were run in the development workspace; complete live Streamlit + Gemma inference and the full tool sandbox have not been verified together. Do not treat the current prototype as clinically validated.
+
+---
+
+
+## Evidence-grounded A/B/C reviews and stable approvals (2026-11-19)
+
+**Current workflow:** One read-only source of truth supplies verified facts to each logical agent. The model proposes interpretations and structured action candidates; deterministic Python verifies all coordinates, counts, source identity, scope, and final output. The researcher approves **one reviewed proposal per request**. Historical notes farther down this README may describe earlier, investigation-only builds.
+
+### Evidence Registry — shared contract
+
+- `src/healthcare_data_quality/source_inventory.py` scans the **entire original CSV** (header is CSV Row 1) to count truly empty COUNT cells and distinct affected rows. Literal `NA` taxonomy levels are tracked separately and are not treated as empty count cells.
+- `src/healthcare_data_quality/evidence_registry.py` binds each QC finding or attributable Gemma check to `finding_id`, `dataset_id`, original-file SHA-256, verified finding positions, and complete source-wide row/cell counts. The registry is a deterministic read-only projection, not a model response or an edit authorization. Ragged/unreadable datasets remain visible for review; their unsupported counts are not labeled verified.
+- **Agent A** performs investigation and produces candidate evidence. When findings are assembled for review, the registry binds those findings to the original source. **Agent B** receives a bounded, source-verified registry summary with its recommendation prompt; a short evidence sample never becomes a source-wide total. **Agent C** receives the same source-verified facts, along with the selected finding and approved in-memory stage context.
+- Agent C's structured edit plans pass `validate_scoped_plan()` and, for grouped operations, `evaluate_compound()`. These gates verify source identity, exact `before` values, allowed physical positions, reviewer approval, and the final derived CSV. This applies to both QC findings and Gemma checks when a source dataset is selected. Gemma has **no authority** to authorize edits, fabricate additional affected rows, or declare a source-wide count from a sample.
+- The **default edit scope** is the selected finding. A user can explicitly request a wider dataset operation such as *delete all rows containing any empty count cell*; Python independently resolves the complete condition against the original CSV and requires final approval. A request explicitly limited to *this finding* stays within its verified finding positions. Empty cells and `NA` literals are distinct predicates.
+- For a repeated problem on another dataset, historical interaction memory is **a suggested rule, not data evidence**. Current source positions/values must be re-resolved and verified. Saving or loading an earlier investigation is not the same as staging approved changes.
+
+**Example — missing-value count matrix:** If 618 empty count cells occur in CSV Rows `2, 3, 5, 7, 15, 20`, the correct proposal is **Delete 6 rows**, not 618 rows or every row in the CSV. The result should show exact row IDs and the final row count, derived from current data. No example coordinates are portable to another dataset without new source validation.
+
+### Professional approval UI
+
+1. **One concise numbered review** per submitted request (including combined cell edits, column/row deletions, and row merges). Show exact source positions and `before → after`, or a brief summary plus expandable table for bulk edits.
+2. **Approve all** stages an entire validated group atomically; validation failure stages none. **Reject & discuss** clears only the unapproved proposal and leaves the finding open for new Agent C instructions. A suggestion, memory match, or chat message is never final approval.
+3. **Stable expansion and scroll:** The expander label remains constant when the approval status changes; the active finding stays open. Submission and approval use fragment-scoped reruns. The cleaning tab renders directly into its own Streamlit fragment rather than clearing an external tab container during review actions, avoiding a known remount/jump mechanism. Background model status uses its own independent polling fragment, not a timed rerun of the editable form.
+4. Browser-specific scroll preservation is not yet proven by an automated UI/browser test. If your Streamlit version still jumps, record its version and reproduce the exact approval click; do not workaround by periodically reloading the whole page.
+
+### Start and regression tests
+
+Run Gemma and Streamlit in separate WSL terminals, using the commands in the **three-agent concurrency** section below. The UI requires `PYTHONPATH=src:scripts` if the project is not installed as an editable Python package. These guardrails **do not** require running three separate model copies; the existing configured max concurrency remains 3.
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+source /home/xavier/.venv/bin/activate
+PYTHONPATH=src:. python -m pytest -q \
+  tests/test_cleaning_fragment_scroll.py \
+  tests/test_cleaning_jobs.py \
+  tests/test_finding_scoped_cleaning.py
+```
+
+Additional registry-specific regression tests were run in the development workspace; source-only replacement ZIPs intentionally omit tests. The README's later historical implementation sections remain documentation of earlier work, **not** proof that all of those older descriptions still match the current client.
+
+---
+
 ## Current local three-agent concurrency (2026-11-18)
 
 **Default: three concurrent model request lanes, one shared locally loaded Gemma model.** Agent C handles the first active interactive cleaning request. When C is occupied and Agent A or B has finished its own background work, the idle agent can prepare a separate finding's cleaning plan. The finding remains under the existing reviewer validation, R-preview, and final approval workflow. If all three lanes are occupied, new requests wait; they never bypass authorization. The three agents are **logical roles/worker threads**, not three loaded model copies or independent GPUs.
@@ -369,13 +488,16 @@ Do not reuse approval IDs, manually fabricate evidence, or overwrite an existing
 ```bash
 git status --short
 
-# Develop/test kernel in terminal:
-git switch backend
-# ... edit/test ...
-git add src/ scripts/ tests/ README.md  # Review staged files; never stage data/
+# Already on backend: review changes before staging.
+git branch --show-current
+git status --short
+# Stage only reviewed source files and README.md, including required new modules.
+# Avoid blanket staging of unversioned runtime data.
 git diff --cached --check
-git commit -m "feat: describe verified backend change"
-git push origin backend
+git diff --cached --stat
+git commit -m "feat: integrate adaptive A/B/C cleaning, memory, and reviewer-controlled actions"
+# Optional only when ready to publish:
+# git push origin backend
 
 # Update the UI version once backend checks pass:
 git switch main

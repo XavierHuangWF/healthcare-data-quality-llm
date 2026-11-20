@@ -256,3 +256,6 @@ data/decision_memory/
 
 # Keep the assets folder in Git
 !/assets/.gitkeep
+# Local approved decisions and adaptive advisory skills (private research data)
+/memory/
+/skills/generated/

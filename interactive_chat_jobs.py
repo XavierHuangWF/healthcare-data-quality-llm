@@ -38,6 +38,22 @@ class InteractiveChatJobs:
             state = self._jobs.get(job_id)
             return state.get("agent") if state else None
 
+    def phase_for(self, job_id: str) -> str | None:
+        """Read-only UI status: queued, generating, done, failed or unknown.
+
+        A job is *generating* only after it has acquired its role lane AND the
+        model admission gate. Do not label workers waiting on either gate as
+        actively generating.
+        """
+        with self._lock:
+            state = self._jobs.get(job_id)
+            if not state:
+                return None
+            return state.get("phase") or (
+                "queued" if state.get("status") == "running"
+                else state.get("status")
+            )
+
     def submit(self, action: Callable, *args, **kwargs) -> str:
         """Legacy API retained for direct callers/tests."""
         job_id, _ = self._enqueue(action, args, kwargs, allow_helpers=False)
@@ -86,7 +102,8 @@ class InteractiveChatJobs:
                         self._jobs.pop(key)
                     if len(self._jobs) < 128:
                         break
-            self._jobs[job_id] = {"status": "running", "agent": role}
+            self._jobs[job_id] = {"status": "running", "agent": role,
+                                  "phase": "queued"}
 
         def run() -> None:
             effective_role = role
@@ -125,12 +142,19 @@ class InteractiveChatJobs:
                         self._lanes[role].acquire()
                         held_lane = self._lanes[role]
                 with model_request_priority(_ROLE_PRIORITY[effective_role]):
+                    # The model admission gate has been acquired; show active
+                    # generation only now. UI polls this under its own small
+                    # fragment and never remounts the researcher's text input.
+                    with self._lock:
+                        if job_id in self._jobs:
+                            self._jobs[job_id]["phase"] = "generating"
                     result = action(*args, **kwargs)
                 if not isinstance(result, (dict, str)):
                     raise ValueError("Gemma returned an unsupported response")
-                outcome = {"status": "done", "result": result, "agent": effective_role}
+                outcome = {"status": "done", "phase": "done",
+                           "result": result, "agent": effective_role}
             except Exception as exc:
-                outcome = {"status": "failed", "error":
+                outcome = {"status": "failed", "phase": "failed", "error":
                            f"{type(exc).__name__}: {str(exc)[:350]}",
                            "agent": effective_role}
             finally:

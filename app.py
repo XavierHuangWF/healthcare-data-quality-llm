@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
@@ -70,6 +71,7 @@ from healthcare_data_quality.cleaning_workspace import (
     ask_gemma_about_cleaning, validate_header_plan, agent_c_clarification_options,
 )
 from healthcare_data_quality.cleaning_authorization import file_sha256
+from healthcare_data_quality.source_inventory import source_inventory, concise_source_context
 
 # Reuse the CLI's existing recommendation assessment, including its provenance
 # and partial-coverage rules. No CLI main() or remediation entry point is called.
@@ -152,7 +154,9 @@ def analysis_fingerprint() -> str:
     # Keep the PRE-EXISTING baseline-audit cache valid when adding the
     # independent exploratory feature. Its implementation has a separate key.
     relevant = sorted(p for p in source_root.rglob("*.py")
-                      if not p.name.startswith("exploratory_"))
+                      if not p.name.startswith("exploratory_")
+                      and p.name not in {"cleaning_stage_checkpoint.py", "reviewed_rule_replay.py",
+                                         "evidence_registry.py"})
     relevant.extend([
         project_root / "scripts" / "run_workflow.py",
         project_root / "scripts" / "serve_gemma4.sh",
@@ -1132,7 +1136,128 @@ def schedule_agent_b_once(context_key: str, audit: dict, paths: list[Path],
     findings = build_cleaning_findings(audit, paths, names, runs)
     if not findings:
         return None
-    return recommendation_manager().start(context_key, findings, run_id=run_id)
+    # Historical approvals are inputs to NEW Gemma assessments, never ready
+    # recommendations. Reuse only relevant, bounded method summaries, including
+    # related finding/check types, before the worker publishes a suggestion.
+    from cleaning_jobs import recommendation_manager, reviewed_method_context
+    reviewed_methods = {}
+    for finding in findings:
+        ds_id = str(finding.get("dataset_id") or "")
+        try:
+            index = int(ds_id.rsplit("_", 1)[-1]) - 1
+        except (ValueError, IndexError):
+            index = -1
+        # A Gemma check can span multiple uploads and have no dataset_id.
+        # Assess saved methods against each involved source rather than
+        # silently dropping memory for those checks.
+        sources = ([paths[index]] if 0 <= index < len(paths) else
+                   paths if finding.get("source") != "QC" else [])
+        candidates, seen = [], set()
+        for candidate_source in sources:
+            for method in reviewed_method_context(
+                    finding, Path(candidate_source), limit=16):
+                fingerprint = json.dumps(method, sort_keys=True, ensure_ascii=False)
+                if fingerprint not in seen:
+                    candidates.append(method)
+                    seen.add(fingerprint)
+                if len(candidates) >= 16:
+                    break
+            if len(candidates) >= 16:
+                break
+        reviewed_methods[finding["id"]] = candidates
+    return recommendation_manager().start(
+        context_key, findings, run_id=run_id, reviewed_methods=reviewed_methods,
+    )
+
+
+def _review_action_button_css() -> str:
+    """Color only explicit cleaning-review actions, never unrelated app controls."""
+    return """<style>
+    div[class*="st-key-review_yes_"] button:not(:disabled),
+    div[class*="st-key-review_memory_yes_"] button:not(:disabled),
+    div[class*="st-key-review_clarify_yes_"] button:not(:disabled),
+    div[class*="st-key-review_approve_yes_"] button:not(:disabled) {
+        background-color: #15803d !important;
+        border-color: #15803d !important;
+        color: #fff !important;
+    }
+    div[class*="st-key-review_yes_"] button:not(:disabled):hover,
+    div[class*="st-key-review_memory_yes_"] button:not(:disabled):hover,
+    div[class*="st-key-review_clarify_yes_"] button:not(:disabled):hover,
+    div[class*="st-key-review_approve_yes_"] button:not(:disabled):hover {
+        background-color: #166534 !important;
+        border-color: #166534 !important;
+        color: #fff !important;
+    }
+    div[class*="st-key-review_no_"]:not([class*="st-key-review_no_action_"]) button:not(:disabled),
+    div[class*="st-key-review_memory_no_"] button:not(:disabled),
+    div[class*="st-key-review_discuss_no_"] button:not(:disabled) {
+        background-color: #b91c1c !important;
+        border-color: #b91c1c !important;
+        color: #fff !important;
+    }
+    div[class*="st-key-review_no_"]:not([class*="st-key-review_no_action_"]) button:not(:disabled):hover,
+    div[class*="st-key-review_memory_no_"] button:not(:disabled):hover,
+    div[class*="st-key-review_discuss_no_"] button:not(:disabled):hover {
+        background-color: #991b1b !important;
+        border-color: #991b1b !important;
+        color: #fff !important;
+    }
+    /* Completed review headers are green without changing the expander's
+       stable label/key. Changing the label on approval previously caused a
+       Streamlit remount and jumped the reviewer back to the top. */
+    details:has(.hdq-cleaning-completed-marker) {
+        border-color: #15803d !important;
+    }
+    details:has(.hdq-cleaning-completed-marker) > summary {
+        background-color: rgba(22, 163, 74, 0.14) !important;
+        color: #4ade80 !important;
+    }
+    details:has(.hdq-cleaning-completed-marker) > summary p {
+        color: #4ade80 !important;
+        font-weight: 600 !important;
+    }
+    details:has(.hdq-cleaning-completed-marker) > summary [data-testid="stMarkdownContainer"] p::after {
+        content: " · Completed";
+        color: #4ade80;
+        font-weight: 700;
+    }
+    div[data-testid="stMarkdown"]:has(.hdq-cleaning-completed-marker) {
+        display: none;
+    }
+    </style>"""
+
+
+def _open_agent_c_alternative_chat(fid: str, *, discard_plan: bool = False) -> None:
+    """Open the current finding's input box without contacting any model.
+
+    Discard only unapproved proposals. Historical approvals and the original
+    CSV are untouched. Expire old clarification widgets so an old answer
+    cannot be clicked after the researcher chooses No.
+    """
+    if discard_plan:
+        _cancel_agent_c_batch(fid, status="Discussion open")
+        for field in (
+            "cleaning_compound_previews_by_finding", "cleaning_r_previews_by_finding",
+            "cleaning_r_errors_by_finding", "cleaning_r_diagnostics_by_finding",
+            "cleaning_r_selfchecks_by_finding", "cleaning_rebased_previews_by_finding",
+            "cleaning_explicit_row_deletions_by_finding",
+            "cleaning_explicit_column_deletions_by_finding",
+        ):
+            st.session_state.setdefault(field, {}).pop(fid, None)
+    else:
+        _next_agent_c_ui_generation(fid)
+    st.session_state.setdefault("cleaning_custom_value_input_by_finding", {}).pop(fid, None)
+    st.session_state.setdefault("cleaning_custom_operation_input_by_finding", {}).pop(fid, None)
+    st.session_state.cleaning_discussion_mode_by_finding[fid] = "alternative"
+    st.session_state.cleaning_review_statuses[fid] = "Discussion open"
+    finding_for_memory = st.session_state.get("cleaning_finding_type_lookup", {}).get(fid)
+    if finding_for_memory:
+        try:
+            from healthcare_data_quality.adaptive_skill_memory import record_review
+            record_review(finding_for_memory, "declined_proposal", build_skill=False)
+        except (OSError, ValueError, RuntimeError, TypeError):
+            pass
 
 
 def _recommendation_preview(text: str, max_chars: int = 220) -> str:
@@ -1144,7 +1269,80 @@ def _recommendation_preview(text: str, max_chars: int = 220) -> str:
     return (segment or clean[:max_chars]).rstrip(" ,;:") + "…"
 
 
-def _rerun_cleaning_fragment() -> None:
+def _next_agent_c_ui_generation(fid: str) -> int:
+    """Invalidate all prior clarification/approval widget identities.
+
+    The chat transcript remains available for audit, but cannot keep obsolete
+    options active when a newer request or validated proposal takes its place.
+    """
+    versions = st.session_state.setdefault("cleaning_control_generation_by_finding", {})
+    versions[fid] = int(versions.get(fid, 0)) + 1
+    for item in st.session_state.get("cleaning_messages_by_finding", {}).get(fid, []):
+        if item.get("role") == "assistant":
+            item["controls_expired"] = True
+    return versions[fid]
+
+
+def _active_agent_c_control_generation(fid: str) -> int:
+    return int(st.session_state.setdefault(
+        "cleaning_control_generation_by_finding", {}).get(fid, 0))
+
+
+def _render_before_after(plans: list[dict]) -> None:
+    """Show only exact, independently verified intended edits.
+
+    Model prose and aggregate statistics are not substitutes for each source
+    target's actual original value and proposed outcome.
+    """
+    from healthcare_data_quality.reviewed_rule_replay import current_change_rows
+    changes = current_change_rows(plans)
+    if changes:
+        st.dataframe(pd.DataFrame([
+            {"Location": item["Target"], "Before": item["Before"],
+             "After": item["After"]} for item in changes
+        ]), hide_index=True, width="stretch")
+
+
+def _render_source_deletion_details(source: Path, plans: list[dict],
+                                    *, key: str) -> bool:
+    """No second inspection UI: exact before/after and source validators suffice.
+
+    Structural source integrity is rechecked by evaluate_compound (or the
+    single-operation validator), both before rendering approval and on commit.
+    """
+    return True
+
+
+def _agent_c_control_phase(*, mode: str | None, transcript: list,
+                           plan: dict | None, queued_actions: list | None,
+                           pending: bool, custom_value: bool = False,
+                           custom_operation: bool = False) -> tuple[str, list[str]]:
+    """One authoritative interaction state for every finding/Gemma check.
+
+    A validated proposal always supersedes older questions. Reading saved chat
+    history must never withdraw an active plan or resurrect its old controls.
+    All agent roles use this same per-finding state; a prior button is not a
+    live authorization to change data.
+    """
+    if plan is not None or queued_actions:
+        return "approval", []
+    if pending:
+        return "processing", []
+    if mode not in {"accepted", "alternative"}:
+        return "idle", []
+    if custom_value or custom_operation:
+        return "custom_input", []
+    latest = transcript[-1] if transcript else None
+    if isinstance(latest, dict) and latest.get("role") == "assistant":
+        if not latest.get("controls_expired"):
+            choices = agent_c_clarification_options(
+                str(latest.get("content") or ""), latest.get("clarification_options"))
+            if choices:
+                return "clarification", choices
+    return "discussion", []
+
+
+def _rerun_cleaning_fragment(fid: str | None = None) -> None:
     """Refresh the cleaning UI without rerendering the entire Streamlit page.
 
     Cleaning cards live inside ``st.fragment``. A bare ``st.rerun()`` requests
@@ -1153,6 +1351,15 @@ def _rerun_cleaning_fragment() -> None:
     support (or a direct compatibility test calls this outside a fragment),
     fall back to the normal full rerun.
     """
+    if fid:
+        # Stable expander label + remembered focus prevent approval from
+        # folding the finding and remounting the review/scroll position.
+        # Keep the current finding open, not every previously visited finding.
+        # Older completed findings may therefore remain collapsed normally.
+        open_map = st.session_state.setdefault("cleaning_keep_open_by_finding", {})
+        open_map.clear()
+        open_map[fid] = True
+        st.session_state["cleaning_active_finding"] = fid
     try:
         st.rerun(scope="fragment")
     except TypeError:
@@ -1171,22 +1378,66 @@ def _rerun_cleaning_fragment() -> None:
         st.rerun()
 
 
+
+def _rerun_parent_after_agent_b_choice(fid: str) -> None:
+    """Refresh the parent review after clicking a nested Agent B control.
+
+    Agent B is a polling child fragment. A fragment-scoped rerun there only
+    refreshes Agent B; the parent's Agent C input/approval cannot appear.
+    Force an app rerun for a *user click*, preserving the selected finding's
+    open state. Background polling continues to use its normal fragment.
+    """
+    keep_open = st.session_state.setdefault("cleaning_keep_open_by_finding", {})
+    keep_open.clear()
+    keep_open[fid] = True
+    st.session_state["cleaning_active_finding"] = fid
+    try:
+        st.rerun(scope="app")
+    except TypeError:
+        st.rerun()
+    except Exception as exc:
+        if type(exc).__name__ != "StreamlitAPIException":
+            raise
+        st.rerun()
+
+
 def _render_live_finding_assignment(fid: str) -> None:
-    """Update the small ownership caption without remounting Agent C input."""
+    """Indicate an in-flight request with Streamlit's native spinner.
+
+    The indicator is rendered *inside the existing cleaning review fragment*.
+    Do not create a nested polling fragment here: across Streamlit versions,
+    fragment reruns inside an expander/tab can leave stale form blocks mounted.
+    The separate background completion poller delivers the final reply.
+    """
     from interactive_chat_jobs import interactive_chat_manager
+
     pending = st.session_state.get("cleaning_pending_gemma_b", {}).get(fid)
-    if not pending:
+    if not isinstance(pending, dict) or not pending.get("job_id"):
         return
+
     manager = interactive_chat_manager()
-    role = manager.agent_for(pending["job_id"]) if hasattr(manager, "agent_for") else None
+    job_id = pending["job_id"]
+    role = manager.agent_for(job_id) if hasattr(manager, "agent_for") else None
     assigned = role if role in {"A", "B", "C"} else pending.get("assigned_agent", "C")
     pending["assigned_agent"] = assigned
-    if assigned in {"A", "B"}:
-        st.caption(f"Idle Agent {assigned} is now assisting with this finding "
-                   "while C handles another request. Human approval is still required.")
+    phase = manager.phase_for(job_id) if hasattr(manager, "phase_for") else "queued"
+
+    if phase == "queued":
+        label = "Queued — waiting for an inference slot"
+    elif phase == "generating":
+        label = f"Agent {assigned} is processing your request"
+    elif phase == "done":
+        st.caption("Response ready — opening review")
+        return
+    elif phase == "failed":
+        st.caption("Request finished — opening error details")
+        return
     else:
-        st.caption("Agent C is preparing the scoped cleaning plan or waiting "
-                   "for its turn. No working CSV is being modified.")
+        label = f"Agent {assigned} is preparing your request"
+
+    # This running state animates natively, without HTML escaping/code blocks,
+    # fabricated completion percentages, or a second editable form.
+    st.status(label, state="running", expanded=False)
 
 
 def _render_live_agent_b_finding(
@@ -1212,98 +1463,105 @@ def _render_live_agent_b_finding(
 
     if entry.get("status") == "ready":
         previous = st.session_state.cleaning_recommendations.get(fid) or {}
+        first_ready = fid not in st.session_state.setdefault("cleaning_autoready_seen", set())
+        if first_ready:
+            st.session_state.cleaning_autoready_seen.add(fid)
         review_status = st.session_state.cleaning_review_statuses.get(fid)
         # A background job must never replace a human-selected recommendation
         # or resurrect a completed/rejected review.
-        if (previous.get("_source") != "manual" and
+        if (previous.get("_source") not in {"manual", "review_memory"} and
                 review_status in {None, "Awaiting review", "Agent B suggestion ready"}):
             st.session_state.cleaning_recommendations[fid] = {
                 "suggestion": entry["suggestion"],
                 "decision_needed": entry.get("decision_needed", ""),
+                "memory_assessed": entry.get("memory_assessed", False),
+                "choices": entry.get("choices") or [],
                 "_source": "background",
             }
             st.session_state.cleaning_review_statuses[fid] = "Agent B suggestion ready"
 
-    suggestion = st.session_state.cleaning_recommendations.get(fid)
-    if suggestion:
-        st.markdown("**Agent B — proposed cleaning action (not approved)**")
-        advice = str(suggestion["suggestion"])
-        decision = str(suggestion.get("decision_needed") or "")
-        needs_expansion = (len(" ".join(advice.split())) > 220 or
-                           len(" ".join(decision.split())) > 170)
-        show_full = (st.checkbox("Show full recommendation", key=f"review_full_advice_{fid}")
-                     if needs_expansion else False)
-        st.write(advice if show_full else _recommendation_preview(advice))
-        if decision:
-            if show_full:
-                st.write("**Reason / evidence limit:**", decision)
-            else:
-                st.caption("Reason / evidence limit: " + _recommendation_preview(decision, 170))
-    else:
-        background_status = entry.get("status")
-        if background_status == "running":
-            st.caption("Agent B is preparing this recommendation. "
-                       "This section updates automatically when it is ready.")
-        elif background_status == "pending":
-            st.caption("Agent B has queued this recommendation. "
-                       "This section updates automatically when it is ready.")
-        elif background_status == "failed":
-            st.error("Agent B could not finish this recommendation. "
-                     "No automatic retry occurs; inspect its failure details.")
-        else:
-            st.caption("Waiting for this finding's Agent B recommendation. "
-                       "This section updates automatically.")
+    # A parent/card approval or active conversation always owns this finding.
+    # The independently polling Agent B fragment must display NOTHING in that
+    # state, including old advice and preparation buttons.
+    if (st.session_state.cleaning_plans_by_finding.get(fid) is not None
+            or st.session_state.cleaning_batch_queue_by_finding.get(fid)
+            or fid in st.session_state.cleaning_pending_gemma_b
+            or st.session_state.cleaning_discussion_mode_by_finding.get(fid) in {"accepted", "alternative"}
+            or any(h.get("finding_id") == fid for h in st.session_state.cleaning_history)
+            or st.session_state.cleaning_review_statuses.get(fid) == "Reviewed — no change"):
         return
-
-    if any(h.get("dataset_id") == ds_id
-           for h in st.session_state.cleaning_history):
-        st.caption("This suggestion uses the original investigation. The next "
-                   "verified edit will be checked against the current in-memory stage.")
-
-    b_pending = fid in st.session_state.cleaning_pending_gemma_b
-    selected_mode = st.session_state.cleaning_discussion_mode_by_finding.get(fid)
-    previously_applied = any(
-        event.get("finding_id") == fid for event in st.session_state.cleaning_history
-    )
-    review_status = st.session_state.cleaning_review_statuses.get(fid)
-    if (selected_mode not in {"accepted", "alternative"} and
-            not st.session_state.cleaning_plans_by_finding.get(fid) and
-            not previously_applied and review_status != "Reviewed — no change"):
-        yes, no = st.columns(2)
-        if yes.button("Yes — prepare this action", key=f"review_yes_{fid}", disabled=b_pending):
-            st.session_state.cleaning_discussion_mode_by_finding[fid] = "accepted"
-            st.session_state.cleaning_review_statuses[fid] = "Agreed in principle"
-            st.session_state.cleaning_decisions.append({
-                "finding_id": fid,
-                "decision": "approach_agreed_not_execution",
-                "approach": suggestion["suggestion"],
-            })
-            _queue_agent_c_for_finding(
-                finding, source, uploaded, dataset_paths,
-                "I accept Agent B's action for this finding and authorize DRAFTING its "
-                "exact structured change plan only. Return operation=replace_cells or "
-                "rename_headers with source-verified before/after values and positions "
-                "immediately if sufficiently supported; do NOT ask for another "
-                "authorization to prepare a plan. The app will separately generate "
-                "and test R against isolated affected values, and will ask for ONE "
-                "final approval before insertion. Do not invent missing scientific "
-                "parameters, fabricate data, or edit outside this finding.",
-            )
-            # Clicking Yes is an explicit action; refresh the parent layout so
-            # the Agent C discussion can appear. Do not full-rerun on polling.
-            st.rerun()
-        if no.button("No — discuss another action", key=f"review_no_{fid}", disabled=b_pending):
-            st.session_state.cleaning_discussion_mode_by_finding[fid] = "alternative"
-            st.session_state.cleaning_review_statuses[fid] = "Alternative requested"
-            st.session_state.cleaning_plans_by_finding.pop(fid, None)
-            st.session_state.cleaning_r_previews_by_finding.pop(fid, None)
-            st.session_state.cleaning_decisions.append({
-                "finding_id": fid,
-                "decision": "suggestion_declined_no_edit",
-                "approach": suggestion["suggestion"],
-            })
-            # No Gemma request until the user types or selects a clarification.
-            st.rerun()
+    suggestion = st.session_state.cleaning_recommendations.get(fid)
+    # Memory-backed findings use the single reviewed-solution Yes/No UI in
+    # the parent finding, never a second Agent B recommendation widget.
+    if suggestion and suggestion.get("_source") == "review_memory":
+        return
+    if suggestion:
+        from recommendation_options import source_backed_choices
+        options = source_backed_choices(finding, source, suggestion)
+        # Exact Before -> After is the primary interface. Do not turn a
+        # plausible model narrative into an unverified operation button.
+        if options:
+            for option_idx, option in enumerate(options):
+                if len(options) > 1:
+                    st.markdown('**' + option['label'] + '**')
+                st.dataframe(pd.DataFrame(option['rows']), hide_index=True, width="stretch")
+            choices = st.columns(len(options))
+            for index, option in enumerate(options):
+                label = ('Yes — Approve this approach' if len(options) == 1
+                         else 'Yes — ' + option['label'])
+                if choices[index].button(
+                    label, key=f"review_yes_{fid}_{_active_agent_c_control_generation(fid)}_option_{index}"):
+                    # User explicitly selected this exact source-grounded
+                    # proposal. Validate it through the same Agent C path as
+                    # a hand-written request; only a later NAMED Yes executes.
+                    op_summary = []
+                    for op in option['operations']:
+                        if op['operation'] == 'drop_rows':
+                            ids = [c['row'] for c in op['changes']]
+                            op_summary.append('Delete CSV rows '+', '.join(map(str, ids)))
+                            st.session_state.setdefault(
+                                'cleaning_explicit_row_deletions_by_finding', {})[fid] = frozenset(ids)
+                        if op['operation'] == 'drop_column':
+                            ids = [c['position'] for c in op['changes']]
+                            op_summary.append('Delete columns '+', '.join(map(str, ids)))
+                            st.session_state.setdefault(
+                                'cleaning_explicit_column_deletions_by_finding', {})[fid] = frozenset(ids)
+                    request = ('; '.join(op_summary) if op_summary else option['label'])
+                    st.session_state.cleaning_messages_by_finding.setdefault(fid, []).append({
+                        'role': 'user', 'content': request,
+                    })
+                    st.session_state.cleaning_discussion_mode_by_finding[fid] = 'accepted'
+                    st.session_state.cleaning_review_statuses[fid] = 'Preparing verified changes'
+                    _record_gemma_b_response(fid, finding, source, {
+                        'reply': option['label'] + ' — review exact changes below.',
+                        'operation': 'none', 'dataset_id': '', 'changes': [],
+                        'operations': option['operations'], 'clarification_options': [],
+                    })
+                    _rerun_parent_after_agent_b_choice(fid)
+        else:
+            # Model did not provide exact source-backed actions. No fake
+            # before/after or green confirmation of a prose-only suggestion.
+            st.write(_recommendation_preview(str(suggestion['suggestion']), 180))
+            st.caption('Exact changes require source verification. Discuss the approach.')
+        if st.button('No — Discuss Another Idea',
+                     key=f"review_no_{fid}_{_active_agent_c_control_generation(fid)}_choices"):
+            _open_agent_c_alternative_chat(fid)
+            _rerun_parent_after_agent_b_choice(fid)
+    else:
+        background_status = entry.get('status')
+        if background_status == 'running':
+            st.caption('Preparing recommendation')
+        elif background_status == 'pending':
+            st.caption('Recommendation queued')
+        elif background_status == 'failed':
+            st.caption('Recommendation unavailable — use Agent C to discuss')
+    # A child polling fragment cannot expand its parent directly. Rerun the
+    # main cleaning fragment once, when this finding first becomes ready.
+    if (entry.get("status") == "ready" and first_ready
+            and fid not in st.session_state.get("cleaning_parent_ready_ids", set())):
+        # A child fragment rerun cannot change its parent's expander state.
+        # One full rerun, never continuous polling reruns, opens the card.
+        st.rerun()
 
 
 def render_cleaning_workspace(
@@ -1311,6 +1569,7 @@ def render_cleaning_workspace(
     gemma_runs: list[dict] | None = None,
 ) -> None:
     """Agent C reviews Agent B advice, negotiates scoped changes and R approval."""
+    from contextlib import nullcontext
     from cleaning_review import (
         ask_gemma_for_review_options, indexed_review_catalog, review_question,
     )
@@ -1319,7 +1578,8 @@ def render_cleaning_workspace(
     )
     from healthcare_data_quality.in_memory_cleaning import (
         apply_verified_in_memory, assess_verified_in_memory, build_final_download,
-        review_completion, apply_approved_column_deletions, _records, sha256_bytes,
+        review_completion, apply_approved_column_deletions,
+        apply_approved_row_operations, _records, sha256_bytes,
     )
 
     from healthcare_data_quality.scoped_r_execution import (
@@ -1330,10 +1590,7 @@ def render_cleaning_workspace(
         diagnose_r_preview_failure, run_r_environment_self_test,
     )
     st.subheader("Agent C — Interactive cleaning")
-    st.caption("Review findings one by one. Agent C tests each exact R operation; approval adds its "
-               "verified result to session memory only. Download the final cleaned dataset at "
-               "the bottom after every finding and completed Gemma check has been reviewed. "
-               "Original uploads remain unchanged.")
+    st.markdown(_review_action_button_css(), unsafe_allow_html=True)
     run_id = audit.get("cleaning_recommendation_run_id")
     session_context = f"{context_key}:{run_id}" if run_id else context_key
     if st.session_state.get("cleaning_context_key") != session_context:
@@ -1344,6 +1601,7 @@ def render_cleaning_workspace(
         st.session_state.cleaning_plans_by_finding = {}
         st.session_state.cleaning_batch_queue_by_finding = {}
         st.session_state.cleaning_batch_total_by_finding = {}
+        st.session_state.cleaning_compound_previews_by_finding = {}
         st.session_state.cleaning_batch_rejected_by_finding = set()
         st.session_state.cleaning_r_previews_by_finding = {}
         st.session_state.cleaning_r_errors_by_finding = {}
@@ -1353,15 +1611,36 @@ def render_cleaning_workspace(
         st.session_state.cleaning_recommendations = {}
         st.session_state.cleaning_review_statuses = {}
         st.session_state.cleaning_discussion_mode_by_finding = {}
+        st.session_state.cleaning_custom_value_input_by_finding = {}
+        st.session_state.cleaning_custom_operation_input_by_finding = {}
         st.session_state.cleaning_decisions = []
+        st.session_state.cleaning_memory_candidates = {}
+        st.session_state.cleaning_memory_skipped = set()
+        st.session_state.cleaning_reviewed_rule_context_by_finding = {}
+        st.session_state.cleaning_cross_source_review_by_finding = {}
         st.session_state.cleaning_result = None
         st.session_state.cleaning_working_paths = {}  # legacy field; no output files created
         st.session_state.cleaning_staged_bytes_by_dataset = {}
         st.session_state.cleaning_approved_columns_by_dataset = {}
+        st.session_state.cleaning_approved_rows_by_dataset = {}
+        st.session_state.cleaning_explicit_row_deletions_by_finding = {}
+        st.session_state.cleaning_explicit_column_deletions_by_finding = {}
         st.session_state.cleaning_history = []
+        # A user-initiated NEW investigation is a new review, even when the
+        # source CSV is byte-identical to a previous run. Keep the saved
+        # checkpoint on disk, but never automatically offer/import it here.
+        st.session_state.cleaning_recovery_dismissed = bool(
+            run_id and st.session_state.get("cleaning_fresh_review_run_id") == run_id
+        )
         st.session_state.cleaning_approved_reviewer = ""
         st.session_state.cleaning_rebased_previews_by_finding = {}
         st.session_state.cleaning_completed_audits_by_finding = {}
+        st.session_state.cleaning_keep_open_by_finding = {}
+        st.session_state.cleaning_active_finding = None
+        st.session_state.cleaning_control_generation_by_finding = {}
+        st.session_state.cleaning_autoready_seen = set()
+        st.session_state.cleaning_parent_ready_ids = set()
+        st.session_state.cleaning_finding_type_lookup = {}
     else:
         # Compatible with an already-open Streamlit session from the earlier
         # single-select cleaning UI. Retain its working dataset and change log,
@@ -1373,6 +1652,7 @@ def render_cleaning_workspace(
             ("cleaning_plans_by_finding", {}),
             ("cleaning_batch_queue_by_finding", {}),
             ("cleaning_batch_total_by_finding", {}),
+            ("cleaning_compound_previews_by_finding", {}),
             ("cleaning_batch_rejected_by_finding", set()),
             ("cleaning_r_previews_by_finding", {}),
             ("cleaning_r_errors_by_finding", {}),
@@ -1382,14 +1662,30 @@ def render_cleaning_workspace(
             ("cleaning_recommendations", {}),
             ("cleaning_review_statuses", {}),
             ("cleaning_discussion_mode_by_finding", {}),
+            ("cleaning_custom_value_input_by_finding", {}),
+            ("cleaning_custom_operation_input_by_finding", {}),
             ("cleaning_decisions", []),
+            ("cleaning_memory_candidates", {}),
+            ("cleaning_memory_skipped", set()),
+            ("cleaning_reviewed_rule_context_by_finding", {}),
+            ("cleaning_cross_source_review_by_finding", {}),
             ("cleaning_working_paths", {}),
             ("cleaning_staged_bytes_by_dataset", {}),
             ("cleaning_approved_columns_by_dataset", {}),
+            ("cleaning_approved_rows_by_dataset", {}),
+            ("cleaning_explicit_row_deletions_by_finding", {}),
+            ("cleaning_explicit_column_deletions_by_finding", {}),
             ("cleaning_history", []),
+            ("cleaning_recovery_dismissed", False),
             ("cleaning_approved_reviewer", ""),
             ("cleaning_rebased_previews_by_finding", {}),
             ("cleaning_completed_audits_by_finding", {}),
+            ("cleaning_keep_open_by_finding", {}),
+            ("cleaning_active_finding", None),
+            ("cleaning_control_generation_by_finding", {}),
+            ("cleaning_autoready_seen", set()),
+            ("cleaning_parent_ready_ids", set()),
+            ("cleaning_finding_type_lookup", {}),
         ):
             if key not in st.session_state:
                 st.session_state[key] = empty
@@ -1416,8 +1712,176 @@ def render_cleaning_workspace(
         gemma_runs if gemma_runs is not None else (st.session_state.get("exploration_runs") or []),
     )
     if not catalog:
-        st.info("No findings or completed Gemma checks require review in this audit. "
-                "The final download becomes available after the investigation finishes.")
+        st.info("No findings or checks to review.")
+
+    # A cached investigation and a remembered decision are not a staged edit.
+    # Save only approved DELTAS and explicit no-change reviews, never the whole
+    # source CSV. Restoration requires one affirmative click and revalidation.
+    from healthcare_data_quality.cleaning_stage_checkpoint import (
+        save_approved_stage, load_approved_stage,
+        verify_and_reconstruct, checkpoint_counts, LegacyCheckpointError,
+        inspect_legacy_stage, archive_legacy_stage,
+    )
+    source_paths = [Path(path) for path in dataset_paths]
+    finding_titles = {finding["id"]: str(finding.get("title") or "")
+                      for finding in catalog}
+    session_completed = (bool(st.session_state.cleaning_history) or
+                         any(value == "Reviewed — no change"
+                             for value in st.session_state.cleaning_review_statuses.values()))
+    if session_completed:
+        try:
+            save_approved_stage(
+                source_paths,
+                st.session_state.cleaning_staged_bytes_by_dataset,
+                st.session_state.cleaning_approved_columns_by_dataset,
+                st.session_state.cleaning_approved_rows_by_dataset,
+                st.session_state.cleaning_history,
+                st.session_state.cleaning_review_statuses,
+                st.session_state.cleaning_approved_reviewer,
+                finding_titles,
+                completed_audits=st.session_state.cleaning_completed_audits_by_finding,
+            )
+        except (OSError, ValueError, PermissionError, AssertionError, csv.Error) as exc:
+            st.warning("Current approvals are staged, but recovery could not be saved. "
+                       "Export before ending this session.")
+            with st.expander("Recovery details"):
+                st.code(f"{type(exc).__name__}: {exc}")
+    elif not st.session_state.get("cleaning_recovery_dismissed"):
+        try:
+            previous_stage = load_approved_stage(source_paths)
+        except LegacyCheckpointError:
+            previous_stage = None
+            # V1 checkpoint lacks value-level approval proof. Never silently
+            # restore it or make old decisions appear as completed.
+            st.info("A previous cleaning session was saved by an older version. "
+                    "Its edits cannot be automatically restored as approved. "
+                    "You can review them, preserve a backup, and start a new review.")
+            st.caption("If Agent B has no recommendations for this investigation, "
+                       "run a new full investigation to generate them.")
+            try:
+                legacy_preview = inspect_legacy_stage(source_paths, finding_titles)
+            except (OSError, ValueError, PermissionError, AssertionError,
+                    csv.Error, json.JSONDecodeError) as exc:
+                legacy_preview = None
+                st.warning("The older checkpoint cannot be safely previewed. "
+                           "No edits have been restored.")
+                with st.expander("Recovery details"):
+                    st.code(f"{type(exc).__name__}: {exc}")
+            if legacy_preview is not None:
+                deltas = legacy_preview['cell_changes']
+                structural = legacy_preview['structural_operations']
+                row_actions = sum(len(v['rows']) for v in structural.values())
+                column_actions = sum(len(v['columns']) for v in structural.values())
+                st.caption(f"Earlier session: {len(deltas)} cell edits · "
+                           f"{row_actions} row actions · {column_actions} column actions · "
+                           f"{len(legacy_preview['saved_statuses'])} saved review statuses. "
+                           "All are read-only until individually approved again.")
+                with st.expander("Review saved changes (read-only)"):
+                    if deltas:
+                        st.dataframe(pd.DataFrame(deltas), use_container_width=True,
+                                     hide_index=True)
+                    else:
+                        st.caption("The saved checkpoint has no changed cell values.")
+                    if row_actions or column_actions:
+                        st.markdown("**Earlier row/column removal requests (unrestored)**")
+                        st.json(structural)
+                    if legacy_preview['unmatched_findings']:
+                        st.warning("Some saved finding IDs do not appear in this investigation. "
+                                   "Re-investigate before reapplying those edits.")
+                    # Streamlit offers a local export. Lightweight test UIs
+                    # may not implement this optional download control.
+                    if callable(getattr(st, "download_button", None)):
+                        st.download_button(
+                            "Download original checkpoint JSON",
+                            data=legacy_preview['backup_json'],
+                            file_name="legacy_cleaning_checkpoint_backup.json",
+                            mime="application/json",
+                            key="cleaning_download_legacy_checkpoint",
+                        )
+            else:
+                st.caption("The previous file will be archived without importing any edits.")
+            if st.button("Archive old checkpoint and start new review",
+                         key="cleaning_archive_legacy_stage"):
+                try:
+                    archived = archive_legacy_stage(
+                        source_paths,
+                        expected_digest=(legacy_preview['checkpoint_digest']
+                                         if legacy_preview else None),
+                    )
+                except (OSError, ValueError, PermissionError, json.JSONDecodeError) as exc:
+                    st.error("Could not archive the previous checkpoint. "
+                             "Nothing was changed; download a backup before retrying.")
+                    with st.expander("Recovery details"):
+                        st.code(f"{type(exc).__name__}: {exc}")
+                else:
+                    st.session_state.cleaning_recovery_dismissed = True
+                    st.session_state.cleaning_legacy_archive_notice = str(archived)
+                    _rerun_cleaning_fragment()
+        except (OSError, ValueError, PermissionError, json.JSONDecodeError) as exc:
+            previous_stage = None
+            st.warning("A saved cleaning checkpoint cannot be verified. "
+                       "Current data remains unchanged.")
+            with st.expander("Recovery details"):
+                st.code(f"{type(exc).__name__}: {exc}")
+        if previous_stage:
+            try:
+                recovered = verify_and_reconstruct(previous_stage, source_paths, finding_titles)
+            except (OSError, ValueError, PermissionError, AssertionError, csv.Error) as exc:
+                st.warning("Previous cleaning edits do not match the current audit. "
+                           "Reuse individual saved solutions instead.")
+                with st.expander("Recovery details"):
+                    st.code(f"{type(exc).__name__}: {exc}")
+            else:
+                action_count, no_change_count = checkpoint_counts(previous_stage)
+                with st.container(border=True):
+                    st.markdown("**Previous approved cleaning session available**")
+                    st.caption(f"{action_count} approved actions · "
+                               f"{no_change_count} no-change reviews · Original CSV verified")
+                    restore_col, fresh_col = st.columns(2)
+                    with restore_col:
+                        restore = st.button("Restore verified stage",
+                                            key="cleaning_restore_previous_stage")
+                    with fresh_col:
+                        fresh = st.button("Start new review",
+                                          key="cleaning_skip_previous_stage")
+                    if restore:
+                        # A second verification catches changes after preview,
+                        # before we import any staged bytes or review state.
+                        try:
+                            confirmed = verify_and_reconstruct(
+                                previous_stage, source_paths, finding_titles)
+                        except (OSError, ValueError, PermissionError, AssertionError,
+                                csv.Error) as exc:
+                            st.error("Could not safely restore this checkpoint; nothing was staged.")
+                            with st.expander("Recovery details"):
+                                st.code(f"{type(exc).__name__}: {exc}")
+                        else:
+                            for key, value in confirmed.items():
+                                st.session_state[key] = value
+                            restored_history = confirmed.get("cleaning_history", [])
+                            restored_statuses = st.session_state.cleaning_review_statuses
+                            for event in restored_history:
+                                if event.get("finding_id") in finding_titles:
+                                    restored_statuses.setdefault(
+                                        event["finding_id"], "Applied and verified")
+                            st.session_state.cleaning_recovery_dismissed = True
+                            st.session_state.cleaning_restore_notice = (
+                                len({event.get("finding_id") for event in restored_history
+                                     if event.get("finding_id") in finding_titles}))
+                            _rerun_cleaning_fragment()
+                    if fresh:
+                        st.session_state.cleaning_recovery_dismissed = True
+                        _rerun_cleaning_fragment()
+
+    archived_legacy = st.session_state.pop("cleaning_legacy_archive_notice", None)
+    if archived_legacy:
+        st.success("Previous recovery file was archived, not deleted. "
+                   "Start a fresh review; earlier edits were not automatically staged.")
+        with st.expander("Archived checkpoint location"):
+            st.code(archived_legacy)
+    restored_count = st.session_state.pop("cleaning_restore_notice", None)
+    if restored_count is not None:
+        st.success(f"Stage restored · {restored_count} findings with approved changes")
 
     # The reviewer identifier is requested inside the FIRST approval form,
     # next to the action it authorizes. Once verified staging succeeds, it is
@@ -1426,12 +1890,12 @@ def render_cleaning_workspace(
     if session_reviewer:
         st.caption(f"Reviewer for this cleaning session: {session_reviewer}")
 
+    # Recall saved methods only as suggestions. Even exact-source matches
+    # receive a fresh local Gemma applicability assessment before any plan is
+    # offered for independent validation and human approval.
     # Agent B saves one suggestion per finding in the background. Agent C
     # handles interactive discussion, plans and authorization review.
-    # The individual Agent B suggestion panels now poll independently.
-    # This manual button is retained only as a compatibility fallback.
-    if st.button("Check for new Agent B results", key="hdq_refresh_cleaning_suggestions"):
-        _rerun_cleaning_fragment()
+    # Individual Agent B suggestion panels poll automatically.
     from cleaning_jobs import recommendation_manager, job_fingerprint
     jobs = recommendation_manager()
     # Agent B runs once per finding during investigation, not by this tab.
@@ -1463,6 +1927,10 @@ def render_cleaning_workspace(
         for result_id, entry in entries.items():
             if entry["status"] != "ready":
                 continue
+            if entry.get("origin") == "review_memory":
+                # The parent finding provides the only interaction for this
+                # memory-backed result; don't display competing Agent B advice.
+                continue
             existing = st.session_state.cleaning_recommendations.get(result_id) or {}
             review_status = st.session_state.cleaning_review_statuses.get(result_id)
             if (existing.get("_source") == "manual" or
@@ -1471,27 +1939,56 @@ def render_cleaning_workspace(
             st.session_state.cleaning_recommendations[result_id] = {
                 "suggestion": entry["suggestion"],
                 "decision_needed": entry.get("decision_needed", ""),
+                "memory_assessed": entry.get("memory_assessed", False),
+                "choices": entry.get("choices") or [],
                 "_source": "background",
             }
             st.session_state.cleaning_review_statuses[result_id] = "Agent B suggestion ready"
     else:
-        st.caption("No saved Agent B recommendations belong to this investigation. "
-                   "Agent C opens when Agent B produces its first suggestion. "
-                   "Recommendations are only generated automatically during a new full investigation.")
+        if run_id and catalog:
+            st.warning("No Agent B recommendation job was recorded for this investigation. "
+                       "This can happen when the earlier investigation callback failed. "
+                       "You can start the missing recommendations without rerunning Agent A.")
+            if st.button("Start missing Agent B recommendations",
+                         key=f"cleaning_start_missing_agent_b_{session_context}"):
+                try:
+                    started = schedule_agent_b_once(
+                        context_key, audit, source_paths,
+                        [item.name for item in uploaded], gemma_runs or [],
+                    )
+                except (OSError, ValueError, TypeError) as exc:
+                    st.error(f"Could not start Agent B recommendations: {exc}")
+                else:
+                    if started:
+                        _rerun_cleaning_fragment()
+                    else:
+                        st.error("No recommendation job was started. Check the current finding catalog.")
+        else:
+            st.caption("No Agent B recommendations were saved with this older investigation. "
+                       "Run a full investigation to generate them, or discuss a finding "
+                       "directly with Agent C below.")
 
+    # Agent B's new queue assesses relevant saved methods with Gemma before
+    # marking any suggestion ready. Never promote a historical approval to an
+    # actionable suggestion or count it as completed inference here.
     # Intermediate results remain in session memory; no CSV is offered or
     # written while findings are still being reviewed.
     history_all = st.session_state.cleaning_history
 
     ready_ids = {item_id for item_id, entry in ((state or {}).get("entries") or {}).items()
                  if entry.get("status") == "ready"}
-    st.caption("Agent B suggestions appear automatically inside each finding as they finish. "
-               "The status cards above show live overall progress; Agent C's input stays stable.")
 
+    # Snapshot what the parent expander already knew when it was mounted.
+    # Child polling reruns the parent only for genuinely new readiness.
+    st.session_state.cleaning_parent_ready_ids = set(ready_ids)
     numbered = indexed_review_catalog(catalog)
     last_group = None
     for label, finding in numbered:
         fid = finding["id"]
+        st.session_state.setdefault("cleaning_finding_type_lookup", {})[fid] = {
+            "title": finding.get("title", ""),
+            "check_key": finding.get("check_key", ""),
+        }
         ds_id = finding.get("dataset_id", "")
         index = int(ds_id.rsplit("_", 1)[-1]) - 1 if ds_id.startswith("dataset_") else -1
         # The original upload stays the immutable evidence anchor. Final
@@ -1512,119 +2009,333 @@ def render_cleaning_workspace(
             else:
                 status = f"Staged in memory ({len(applied)} approved edit{'s' if len(applied) != 1 else ''})"
         # Unfinished discussions stay open so submitted text remains visible.
-        # After a verified in-memory stage, remount the expander under a
-        # completed label and collapse it. The immutable approval history,
-        # conversation and R code remain available on demand below.
+        # Keep the expander label stable even after verified approval. The
+        # completed status appears inside the card; do not collapse it.
         remaining_batch = st.session_state.cleaning_batch_queue_by_finding.get(fid, [])
         current_plan = st.session_state.cleaning_plans_by_finding.get(fid)
-        reviewed_no_change = (status == "Reviewed — no change" and not applied)
-        completed = (bool(applied) or reviewed_no_change) and not current_plan and not remaining_batch
+        raw_status = st.session_state.cleaning_review_statuses.get(fid)
+        # Earlier named approval may already have fixed this finding's exact
+        # format defect (e.g. standardizing taxonomy also fixes its '|'
+        # delimiter). Do not ask to overwrite the better staged value with
+        # an old, less-complete proposal or demand another approval.
+        if (source and not applied and finding.get("check_key") in {
+                "inspect_taxonomy_structure", "inspect_taxonomy_naming"}
+                and any(event.get("dataset_id") == ds_id for event in history_all)):
+            from healthcare_data_quality.direct_actions import already_resolved_format_issue
+            staged_now = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id)
+            if staged_now and already_resolved_format_issue(finding, source, staged_now):
+                for field in (
+                    "cleaning_plans_by_finding", "cleaning_batch_queue_by_finding",
+                    "cleaning_batch_total_by_finding", "cleaning_r_previews_by_finding",
+                    "cleaning_compound_previews_by_finding",
+                ):
+                    st.session_state.setdefault(field, {}).pop(fid, None)
+                st.session_state.cleaning_review_statuses[fid] = "Reviewed — no change"
+                st.session_state.cleaning_discussion_mode_by_finding.pop(fid, None)
+                current_plan, remaining_batch = None, []
+                raw_status = "Reviewed — no change"
+        reviewed_no_change = (raw_status == "Reviewed — no change" and not applied)
+        # Terminal approval state, not a leftover chat-mode flag, decides when
+        # an approval has finished. Earlier versions left mode="alternative"
+        # after single-operation approval, resurfacing the Send form despite
+        # the user's completed Yes decision (especially findings 2 and 3).
+        completed_statuses = {
+            "Applied and verified", "Resolved by earlier approved edit",
+            "Approved column deletion for final export",
+            "Approved row changes for final export", "Reviewed — no change",
+        }
+        completed = (bool(applied) or reviewed_no_change) and not current_plan and not remaining_batch and (
+            raw_status in completed_statuses)
+        # A review decision itself is an active interaction, even before the
+        # researcher sends any text. In particular, clicking "No — discuss
+        # another action" sets mode="alternative" with an EMPTY transcript.
+        # If we only check for messages/jobs/plans, the subsequent Streamlit
+        # rerun remounts this expander collapsed and hides the chat form.
+        discussion_mode = st.session_state.cleaning_discussion_mode_by_finding.get(fid)
         active_conversation = (not completed and bool(
-            st.session_state.cleaning_messages_by_finding.get(fid)
+            discussion_mode in {"alternative", "accepted"}
+            or st.session_state.cleaning_messages_by_finding.get(fid)
             or fid in st.session_state.cleaning_pending_gemma_b
             or current_plan or remaining_batch
         ))
-        completed_suffix = " · Staged ✓" if completed else ""
-        with st.expander(f"{label} · {finding['title']}{completed_suffix}",
-                         expanded=active_conversation):
-            st.caption(f"{status} · {finding['source']} · {finding.get('name', '')}")
+        # Never change the expander's identity when approval changes status.
+        # The expander title must remain stable through approvals; the green
+        # Completed suffix is rendered by a marker-based CSS rule.
+        keep_open = st.session_state.setdefault("cleaning_keep_open_by_finding", {}).get(fid, False)
+        with st.expander(f"{label} · {finding['title']}",
+                         expanded=bool(active_conversation or keep_open or (fid in ready_ids and not completed))):
+            if completed and fid not in st.session_state.cleaning_batch_rejected_by_finding:
+                # Do not mark a partially rejected batch as fully completed.
+                # No extra caption: tint the whole heading green and append
+                # " · Completed" to its visible title using the style above.
+                st.markdown('<span class="hdq-cleaning-completed-marker" aria-hidden="true">&#8203;</span>',
+                            unsafe_allow_html=True)
+            if finding.get("check_key") == "gemma_check" and source is None and len(dataset_paths) == 1:
+                source = Path(dataset_paths[0])
+                ds_id = "dataset_1"
+                finding = {**finding, "dataset_id": ds_id, "name": uploaded[0].name}
+            if finding.get("check_key") == "gemma_check" and source is None and dataset_paths:
+                # A completed Gemma test can inspect several uploaded CSVs.
+                # It has no reliable dataset citation when it finds no issue.
+                # Let the researcher select the real source, never guess one.
+                dataset_choice = st.selectbox(
+                    "Source dataset to inspect",
+                    options=list(range(len(dataset_paths))), index=None,
+                    format_func=lambda i: f"Dataset {i+1}: {uploaded[i].name}",
+                    key=f"review_gemma_source_{fid}",
+                    placeholder="Choose a dataset to inspect its full CSV evidence",
+                )
+                if dataset_choice is not None:
+                    index = int(dataset_choice)
+                    ds_id = f"dataset_{index+1}"
+                    source = Path(dataset_paths[index])
+                    finding = {**finding, "dataset_id": ds_id,
+                               "name": uploaded[index].name}
             if completed:
-                if reviewed_no_change:
-                    st.markdown("**Completed — reviewed, no change required.**")
-                    st.caption("Review recorded in session memory. No cell, header, or column "
-                               "was changed or queued for deletion; the original data is preserved.")
-                    if st.button("Reopen this review", key=f"review_reopen_{fid}"):
-                        st.session_state.cleaning_review_statuses.pop(fid, None)
-                        st.session_state.cleaning_discussion_mode_by_finding.pop(fid, None)
-                        st.session_state.cleaning_decisions.append({
-                            "finding_id": fid, "decision": "no_change_review_reopened",
-                        })
-                        _rerun_cleaning_fragment()
-                    # No edit was staged; only the review decision is complete.
-                    # Keep the same collapsed, read-only completion treatment as
-                    # approved edit findings, without claiming a data mutation.
-                    continue
-                staged_count = sum(int(event.get("changes", 0) or 0) for event in applied)
-                reused_count = sum(int(event.get("already_resolved", 0) or 0)
-                                   for event in applied)
-                if fid in st.session_state.cleaning_batch_rejected_by_finding:
-                    st.warning("Only part of the multi-action request was approved. "
-                               "The rejected step was NOT applied; see the audit below.")
-                else:
-                    st.markdown("**Completed — approved and verified in session memory.**")
-                st.caption(f"{staged_count} reviewed change(s)"
-                           + (f" · {reused_count} correction(s) reused" if reused_count else "")
-                           + " · No intermediate CSV created")
-                if any(event.get("operation") == "drop_column" for event in applied):
-                    st.caption("Whole-column deletion is approved for final download; "
-                               "other in-memory edits retain original column coordinates.")
                 if st.checkbox("Show completed finding audit",
                                key=f"review_completed_audit_{fid}"):
-                    for event in applied:
-                        st.write("**Approved edit:**", {
-                            "operation": event.get("operation"),
-                            "changes": event.get("changes", 0),
-                            "already_resolved": event.get("already_resolved", 0),
-                            "reviewer": event.get("reviewer"),
-                            "staged_sha256": event.get("staged_sha256"),
-                            "r_code_sha256": event.get("r_code_sha256"),
-                            "modified_positions": event.get("modified_positions", []),
-                        })
-                    completed_audit = st.session_state.cleaning_completed_audits_by_finding.get(fid)
-                    if completed_audit:
-                        changes = completed_audit.get("changes", [])
-                        if changes:
-                            st.dataframe(pd.DataFrame(changes), hide_index=True, width="stretch")
-                        if completed_audit.get("r_function"):
-                            st.markdown("**Verified R cleaning code**")
-                            st.code(completed_audit["r_function"], language="r")
-                        if completed_audit.get("insertion_r_function"):
-                            st.markdown("**R insertion specification (not executed)**")
-                            st.code(completed_audit["insertion_r_function"], language="r")
-                    for message in st.session_state.cleaning_messages_by_finding.get(fid, []):
-                        if not message.get("automatic"):
-                            with st.chat_message(message["role"]):
-                                st.write(message["content"])
-                # Do not sync Agent C, offer suggestions, retry generation,
-                # or show any editing/approval widgets after a staged action.
+                    completed_audit = st.session_state.cleaning_completed_audits_by_finding.get(fid) or {}
+                    changes = completed_audit.get("changes") or []
+                    from healthcare_data_quality.reviewed_rule_replay import current_change_rows
+                    operation_types = {event.get("operation") for event in applied}
+                    reviewed_plans = []
+                    for change in changes:
+                        if not isinstance(change, dict):
+                            continue
+                        if "row" in change and "column" in change:
+                            op = "replace_cells"
+                        elif "source_row" in change:
+                            op = "merge_rows"
+                        elif "row" in change:
+                            op = "drop_rows"
+                        elif "position" in change:
+                            op = ("rename_headers" if "rename_headers" in operation_types
+                                  and "drop_column" not in operation_types else "drop_column")
+                        else:
+                            continue
+                        reviewed_plans.append({"operation": op, "changes": [change]})
+                    # Older approvals and export-only row/column operations may
+                    # lack a completed_audit. Recover exact BEFORE values from
+                    # the immutable CSV, never infer a value from Gemma prose.
+                    if not reviewed_plans and source:
+                        from healthcare_data_quality.in_memory_cleaning import _records
+                        original_records = _records(source.read_bytes())
+                        for event in applied:
+                            op = event.get("operation")
+                            if op in {"replace_cells", "rename_headers"}:
+                                for cell in event.get("approved_cell_changes") or []:
+                                    reviewed_plans.append({"operation": "replace_cells", "changes": [
+                                        {"row": cell["row"], "column": cell["column"],
+                                         "before": cell["before"], "after": cell["after"]}]})
+                            elif op == "drop_column":
+                                for pos in event.get("modified_positions") or []:
+                                    col = pos.get("column")
+                                    if type(col) is int and 1 <= col <= len(original_records[0]):
+                                        reviewed_plans.append({"operation": op, "changes": [
+                                            {"position": col, "before": original_records[0][col-1],
+                                             "after": ""}]})
+                            elif op in {"drop_rows", "merge_rows"}:
+                                for item in event.get("modified_positions") or []:
+                                    row = item.get("row")
+                                    if type(row) is int and 2 <= row <= len(original_records):
+                                        change = {"row": row, "before": original_records[row-1][0],
+                                                  "after": ""}
+                                        if op == "merge_rows":
+                                            other = item.get("source_row")
+                                            if type(other) is not int:
+                                                continue
+                                            change["source_row"] = other
+                                            change["after"] = "sum_numeric"
+                                        reviewed_plans.append({"operation": op, "changes": [change]})
+                    try:
+                        rows_for_display = current_change_rows(reviewed_plans)
+                    except (ValueError, KeyError, TypeError):
+                        rows_for_display = []
+                    if rows_for_display:
+                        st.dataframe(pd.DataFrame([
+                            {"Location": row["Target"], "Before": row["Before"],
+                             "After": row["After"]} for row in rows_for_display
+                        ]), hide_index=True, width="stretch")
+                    elif reviewed_no_change:
+                        st.caption("Reviewed without changes")
+                    else:
+                        st.caption("Approved changes recorded")
+                    if st.button("Revise completed action", key=f"review_reopen_{fid}"):
+                        if source is None:
+                            st.error("Select the original CSV before revising this review.")
+                        else:
+                            try:
+                                from healthcare_data_quality.interaction_memory import revoke_reviewed_solution
+                                if applied:
+                                    from healthcare_data_quality.approved_revision import reverse_approved_finding
+                                    snapshot = reverse_approved_finding(
+                                        source,
+                                        st.session_state.cleaning_staged_bytes_by_dataset.get(
+                                            ds_id, source.read_bytes()),
+                                        finding_id=fid, dataset_id=ds_id,
+                                        history=st.session_state.cleaning_history,
+                                        columns=st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, []),
+                                        rows=st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, []),
+                                    )
+                                # If this was the last approval, also retire
+                                # the old recovery checkpoint; a future session
+                                # must not offer to restore an undone action.
+                                remaining_history = (snapshot["history"] if applied
+                                                     else st.session_state.cleaning_history)
+                                remaining_reviews = any(
+                                    other_id != fid and review_status == "Reviewed — no change"
+                                    for other_id, review_status in
+                                    st.session_state.cleaning_review_statuses.items())
+                                if not remaining_history and not remaining_reviews:
+                                    from healthcare_data_quality.cleaning_stage_checkpoint import invalidate_approved_stage
+                                    invalidate_approved_stage(source_paths)
+                                revoke_reviewed_solution(finding, source)
+                                if applied:
+                                    st.session_state.cleaning_staged_bytes_by_dataset[ds_id] = snapshot["staged"]
+                                    st.session_state.cleaning_approved_columns_by_dataset[ds_id] = snapshot["columns"]
+                                    st.session_state.cleaning_approved_rows_by_dataset[ds_id] = snapshot["rows"]
+                                    st.session_state.cleaning_history = snapshot["history"]
+                                st.session_state.cleaning_review_statuses[fid] = "Discussion open"
+                                st.session_state.cleaning_recovery_dismissed = True
+                                st.session_state.cleaning_discussion_mode_by_finding[fid] = "alternative"
+                                st.session_state.cleaning_memory_skipped.add(fid)
+                                st.session_state.cleaning_recommendations.pop(fid, None)
+                                st.session_state.cleaning_completed_audits_by_finding.pop(fid, None)
+                                st.session_state.cleaning_batch_rejected_by_finding.discard(fid)
+                                st.session_state.cleaning_plans_by_finding.pop(fid, None)
+                                st.session_state.cleaning_batch_queue_by_finding.pop(fid, None)
+                                st.session_state.cleaning_pending_gemma_b.pop(fid, None)
+                                _next_agent_c_ui_generation(fid)
+                                st.session_state.cleaning_decisions.append({
+                                    "finding_id": fid, "decision": "approved_review_reopened_for_revision",
+                                    "previous_actions_reversed": len(applied),
+                                })
+                                _rerun_cleaning_fragment(fid)
+                            except (OSError, ValueError, PermissionError, AssertionError,
+                                    KeyError, csv.Error) as exc:
+                                st.error(f"Cannot safely revise this approval: {exc}")
+                # Active approval is terminal until researcher explicitly reopens
+                # it; never show old chat input or send controls below this card.
                 continue
             evidence = finding.get("evidence") or []
-            if st.checkbox("Show why this was flagged and original evidence",
-                           key=f"review_evidence_{fid}"):
-                if finding.get("method"):
-                    st.write("**Detection:**", finding["method"])
-                st.write("**Decision needed:**", review_question(finding))
-                if evidence:
-                    st.dataframe(pd.DataFrame(evidence), hide_index=True, width="stretch")
+            if evidence and st.checkbox("Show original evidence",
+                                        value=True, key=f"review_evidence_{fid}"):
+                st.dataframe(pd.DataFrame(evidence), hide_index=True, width="stretch")
+            # Even a zero-issue Gemma negative-control check can provide an
+            # optional actionable deletion choice. The original column headers
+            # and user-selected positions are the only draft source; one named
+            # approval follows exact Before -> After review. No prepare step.
+            if source and fid in ready_ids and finding.get("check_key") == "gemma_check":
+                try:
+                    whole_source = source_inventory(source)
+                except (OSError, ValueError, UnicodeError, csv.Error) as inv_exc:
+                    st.error(f"Source unavailable: {inv_exc}")
+                else:
+                    blank_columns = whole_source["blank_control_columns"]
+                    if blank_columns:
+                        columns = whole_source["columns"]
+                        options = [c["position"] for c in blank_columns]
+                        lookup = {c["position"]: c for c in columns}
+                        selected = st.multiselect(
+                            "Remove control columns (optional)", options=options,
+                            default=options[:3],
+                            format_func=lambda pos: f"Column {pos} · {lookup[pos]['header'] or '(unnamed)'}",
+                            key=f"review_check_columns_{fid}",
+                        )
+                        current = st.session_state.cleaning_plans_by_finding.get(fid)
+                        current_group = ([current, *st.session_state.cleaning_batch_queue_by_finding.get(fid, [])]
+                                         if current else [])
+                        current_positions = sorted(
+                            c["position"] for plan_item in current_group
+                            if plan_item.get("operation") == "drop_column"
+                            for c in plan_item.get("changes", []))
+                        if sorted(selected) != current_positions:
+                            # A selection is never approval. It supplies the
+                            # coordinates against which the final named Yes is
+                            # separately validated before atomic export.
+                            if selected and len(selected) < len(columns):
+                                st.session_state.cleaning_explicit_column_deletions_by_finding[fid] = frozenset(selected)
+                                proposals = [{"operation": "drop_column", "dataset_id": ds_id,
+                                              "changes": [{"position": p, "before": lookup[p]["header"],
+                                                           "after": ""}]}
+                                             for p in sorted(selected)]
+                                _record_gemma_b_response(fid, finding, source, {
+                                    "reply": "Selected control columns are ready for review.",
+                                    "operation": "none", "dataset_id": "", "changes": [],
+                                    "operations": proposals, "clarification_options": [],
+                                })
+                            else:
+                                st.session_state.cleaning_plans_by_finding.pop(fid, None)
+                                st.session_state.cleaning_batch_queue_by_finding.pop(fid, None)
+                                st.session_state.cleaning_explicit_column_deletions_by_finding.pop(fid, None)
             cells, headers = allowed_positions(finding, source) if source else (set(), set())
-            if source:
-                version = sum(h["dataset_id"] == ds_id for h in history_all)
-                st.caption(f"In-memory cleaning stage v{version} · {len(cells)} evidenced cells"
-                           + (f" · {len(headers)} evidenced headers" if headers else ""))
-                if version:
-                    st.caption("Earlier approved edits are stored in memory. Matching corrections "
-                               "are reused; different replacements require explicit review.")
-            else:
-                st.info("This completed check has no associated editable dataset. "
-                        "You can review or discuss it, but it cannot authorize a data change.")
-            if not cells and not headers and source:
-                st.caption("No editable cell/header positions are evidenced for this result. "
-                           "A correction requires a separate validated investigation.")
+            if source is None:
+                st.info("Select a dataset before proposing edits.")
+            elif not cells and not headers:
+                if finding.get("check_key") == "gemma_check":
+                    pass
+                elif finding.get("check_key") == "find_duplicate_taxa":
+                    pass  # No redundant explanation; proposed edits show exact values.
+                else:
+                    st.caption("No verified editable targets.")
+
+            # Agent B has already asked Gemma to assess relevant saved methods
+            # against the current evidence. Do not enqueue a second implicit
+            # Agent C assessment or hide the Yes button behind an auto-chat.
 
             # Job results are consumed by the UI, never by the worker. A
             # submitted user message is already visible while inference runs.
             _sync_gemma_conversations(finding, source)
-            # Auto-refresh ONLY this finding's Agent B suggestion, not Agent C's
-            # chat, form, scroll position, or other findings. Nested fragments
-            # have independent timer reruns in supported Streamlit releases.
-            if hasattr(st, "fragment"):
-                st.fragment(run_every="3s")(_render_live_agent_b_finding)(
-                    fid, finding, source, uploaded, dataset_paths, job_id, ds_id,
-                )
+            # Obvious, reversible formatting inconsistencies do not need a
+            # separate "fix" / "ok" / "draft" conversation. Construct exact
+            # original BEFORE and AFTER values in Python, validate scope and R,
+            # then present the ordinary single named Yes/No review directly.
+            if (source and fid in ready_ids and finding.get("check_key") in {
+                    "inspect_taxonomy_structure", "inspect_taxonomy_naming",
+                    "compare_repeated_headers"}
+                    and not completed and not st.session_state.cleaning_plans_by_finding.get(fid)
+                    and not st.session_state.cleaning_messages_by_finding.get(fid)
+                    and fid not in st.session_state.cleaning_pending_gemma_b
+                    and not st.session_state.cleaning_discussion_mode_by_finding.get(fid)):
+                from healthcare_data_quality.direct_actions import (
+                    draft_format_correction, draft_identical_column_removal)
+                direct = (draft_identical_column_removal(finding, source)
+                          if finding.get("check_key") == "compare_repeated_headers"
+                          else draft_format_correction(finding, source))
+                if direct is not None:
+                    st.session_state.cleaning_memory_skipped.add(fid)
+                    _record_gemma_b_response(fid, finding, source, direct)
+            # The independently refreshed Agent B area may propose an action
+            # ONLY while this finding is idle. Once Agent C is discussing,
+            # preparing, or approving a newer request, clear the entire older
+            # B fragment and its Yes/No widgets. This prevents a late timer
+            # rerun from resurrecting obsolete buttons beside an approval.
+            b_controls_allowed = (
+                st.session_state.cleaning_plans_by_finding.get(fid) is None
+                and not st.session_state.cleaning_batch_queue_by_finding.get(fid)
+                and fid not in st.session_state.cleaning_pending_gemma_b
+                and st.session_state.cleaning_discussion_mode_by_finding.get(fid)
+                    not in {"accepted", "alternative"}
+                and not any(event.get("finding_id") == fid
+                            for event in st.session_state.cleaning_history)
+                and st.session_state.cleaning_review_statuses.get(fid)
+                    != "Reviewed — no change"
+            )
+            agent_b_slot = st.empty() if hasattr(st, "empty") else None
+            if not b_controls_allowed:
+                if agent_b_slot is not None:
+                    agent_b_slot.empty()
             else:
-                _render_live_agent_b_finding(
-                    fid, finding, source, uploaded, dataset_paths, job_id, ds_id,
-                )
+                with (agent_b_slot.container() if agent_b_slot is not None
+                      else nullcontext()):
+                    if hasattr(st, "fragment"):
+                        st.fragment(run_every="3s")(_render_live_agent_b_finding)(
+                            fid, finding, source, uploaded, dataset_paths, job_id, ds_id,
+                        )
+                    else:
+                        _render_live_agent_b_finding(
+                            fid, finding, source, uploaded, dataset_paths, job_id, ds_id,
+                        )
             b_pending = fid in st.session_state.cleaning_pending_gemma_b
 
             # Once Yes or No is clicked the decision controls disappear.
@@ -1633,21 +2344,32 @@ def render_cleaning_workspace(
             transcript = st.session_state.cleaning_messages_by_finding.get(fid, [])
             mode = st.session_state.cleaning_discussion_mode_by_finding.get(fid)
             plan = st.session_state.cleaning_plans_by_finding.get(fid)
+            cross_review = st.session_state.setdefault(
+                "cleaning_cross_source_review_by_finding", {}).get(fid) or {}
             clarification_needed = (mode == "accepted" and not b_pending and not plan
                                     and bool(transcript) and transcript[-1]["role"] == "assistant")
-            # Prefer structured Gemma choices; recognize the earlier saved
-            # column-vs-cell prose question without another model call.
+            # Prefer structured Gemma choices; also render clearly stated
+            # alternatives from older free-form replies without another call.
             last_agent_c_reply = (
                 transcript[-1] if transcript and transcript[-1].get("role") == "assistant"
                 else None
             )
-            choice_labels = (agent_c_clarification_options(
-                last_agent_c_reply.get("content", ""),
-                last_agent_c_reply.get("clarification_options"),
-            ) if last_agent_c_reply and not plan else [])
+            # The pending proposal is the current interaction state. Never
+            # delete it merely because an OLD assistant message contained
+            # clarification options; that message may predate a deterministic
+            # user-requested deletion or a verified remembered rule.
+            custom_value_input = st.session_state.cleaning_custom_value_input_by_finding.get(fid, False)
+            custom_operation_input = st.session_state.cleaning_custom_operation_input_by_finding.get(fid, False)
+            control_phase, choice_labels = _agent_c_control_phase(
+                mode=mode, transcript=transcript, plan=plan,
+                queued_actions=st.session_state.cleaning_batch_queue_by_finding.get(fid),
+                pending=b_pending, custom_value=custom_value_input,
+                custom_operation=custom_operation_input,
+            )
             last_assistant_message = (str(transcript[-1].get("content", ""))
                                       if clarification_needed else "")
-            if (clarification_needed and not choice_labels
+            if (clarification_needed and control_phase == "discussion"
+                    and not choice_labels
                     and fid not in st.session_state.cleaning_plan_retry_once):
                 # Retry once on an accepted action if Gemma answered in prose
                 # rather than supplying the structured plan. Do not repeatedly
@@ -1662,9 +2384,9 @@ def render_cleaning_workspace(
                     "execution or insertion.",
                     automatic=True,
                 )
-                _rerun_cleaning_fragment()
-            if plan and transcript:
-                if st.checkbox("Show Agent C planning discussion", key=f"review_chat_history_{fid}"):
+                _rerun_cleaning_fragment(fid)
+            if False and plan and transcript:
+                if False:
                     for item in transcript:
                         if item.get("automatic"):
                             st.caption("Agent C retried the accepted plan automatically.")
@@ -1674,538 +2396,827 @@ def render_cleaning_workspace(
                                     st.caption(f"Agent {item['assigned_agent']} assisted while C was busy")
                                 st.write(item["content"])
             elif (mode == "alternative" or clarification_needed) and transcript:
-                st.markdown("**Agent C discussion**")
+                st.markdown("**Discussion**")
                 for item in transcript:
                     if not item.get("automatic"):
                         with st.chat_message(item["role"]):
                             st.write(item["content"])
             if b_pending:
-                if hasattr(st, "fragment"):
-                    st.fragment(run_every="3s")(_render_live_finding_assignment)(fid)
-                else:
-                    _render_live_finding_assignment(fid)
-            if fid not in ready_ids:
-                st.caption("Agent C unlocks once Agent B's recommendation is ready.")
-            if (choice_labels and fid in ready_ids and not plan and not b_pending
-                    and mode in {"alternative", "accepted"}):
-                st.markdown("**Choose your answer:**")
-                st.caption("One click replies to Agent C. It does NOT approve a data edit; "
-                           "the reviewed cleaning action still needs its own approval.")
-                choice_columns = st.columns(2)
-                for option_index, (choice_column, choice_label) in enumerate(
-                        zip(choice_columns, choice_labels), start=1):
-                    if choice_column.button(choice_label,
-                            key=f"review_clarify_{fid}_{option_index}",
-                            disabled=b_pending):
-                        # The selected label is visible and explicit; do not
-                        # send any hidden automatic selection. History retains
-                        # the original request so other requested actions are
-                        # not inadvertently discarded by this clarification.
-                        answer = (
-                            f"I choose option {option_index}: {choice_label}. "
-                            "This is my clarification of the scope in your "
-                            "last question, not an approval to modify data. "
-                            "Keep my other previously requested actions from "
-                            "this finding when preparing the validated plan(s). "
-                            "Do not execute or stage anything before the "
-                            "separate explicit review approvals."
-                        )
-                        _queue_agent_c_for_finding(
-                            finding, source, uploaded, dataset_paths, answer)
-                        _rerun_cleaning_fragment()
-            elif mode == "alternative" and not plan and not b_pending:
-                st.info("Tell Agent C what you want instead. Nothing is sent to Gemma until you click Send to Agent C.")
-            if (fid in ready_ids and not plan and
-                    st.session_state.cleaning_review_statuses.get(fid) != "Reviewed — no change" and
-                    (mode == "alternative" or clarification_needed)):
-                with st.form(f"review_chat_form_{fid}", clear_on_submit=True):
-                    message = st.text_area(
-                        "Clarify requested edit" if clarification_needed
-                        else "Discuss another action with Agent C",
-                        placeholder="Ask a question or specify exact desired changes…",
-                        key=f"review_message_{fid}", height=80,
-                    )
-                    send = st.form_submit_button("Send to Agent C", disabled=b_pending)
-                if send and message.strip():
-                    _queue_agent_c_for_finding(finding, source, uploaded, dataset_paths,
-                                               message.strip())
-                    _rerun_cleaning_fragment()
-                elif send:
-                    st.warning("Enter a question or cleaning decision first.")
+                _render_live_finding_assignment(fid)
+            if fid not in ready_ids and mode != "alternative" and not plan:
+                # The previous implementation required Agent B's ready flag to
+                # unlock any Agent C form. A failed/missing B queue therefore
+                # blocked all interaction, even though Agent C can independently
+                # analyze the current source and request an explicit approval.
+                if (source and not applied and not completed and not current_plan
+                        and not remaining_batch and not b_pending
+                        and st.session_state.cleaning_review_statuses.get(fid)
+                            != "Reviewed — no change"):
+                    if st.button("Discuss with Agent C now",
+                                 key=f"review_start_direct_agent_c_{fid}"):
+                        st.session_state.cleaning_discussion_mode_by_finding[fid] = "alternative"
+                        st.session_state.cleaning_review_statuses[fid] = "Alternative requested"
+                        _next_agent_c_ui_generation(fid)
+                        _rerun_cleaning_fragment(fid)
+            # Use one replaceable control slot on Streamlit. Test/dummy
+            # renderers without st.empty still use the same state guards.
+            active_choice_slot = st.empty() if hasattr(st, "empty") else None
+            if control_phase == "approval":
+                if active_choice_slot is not None:
+                    active_choice_slot.empty()
+            else:
+                with (active_choice_slot.container() if active_choice_slot is not None
+                      else nullcontext()):
+                    if (control_phase == "clarification" and choice_labels
+                            and (fid in ready_ids or mode == "alternative")):
+                        st.markdown("**Choose an approach:**")
+                        st.caption("Your selection prepares a verified proposal; changes require approval.")
+                        # Two buttons per row remain readable with long column/row
+                        # descriptions, including a third "other operation" choice.
+                        choice_rows = [st.columns(2) for _ in range((len(choice_labels) + 1) // 2)]
+                        for option_index, choice_label in enumerate(choice_labels, start=1):
+                            choice_column = choice_rows[(option_index - 1) // 2][(option_index - 1) % 2]
+                            positive_label = ("Yes — " + choice_label if option_index == 1
+                                              else choice_label)
+                            if choice_column.button(positive_label,
+                                    key=f"review_clarify_yes_{fid}_{_active_agent_c_control_generation(fid)}_{option_index}",
+                                    disabled=b_pending):
+                                # Ignore clicks from a stale rendered question when a
+                                # proposal has since become active. Never queue old work.
+                                if (st.session_state.cleaning_plans_by_finding.get(fid) is not None
+                                        or st.session_state.cleaning_batch_queue_by_finding.get(fid)
+                                        or fid in st.session_state.cleaning_pending_gemma_b):
+                                    _rerun_cleaning_fragment(fid)
+                                    return
+                                # A different user-supplied value requires the actual
+                                # numbers, not a redundant Gemma clarification turn.
+                                option_text = choice_label.strip().casefold()
+                                # Gemma's two structured labels can be worded in many
+                                # ways; the equivalent user choice must behave the same.
+                                choosing_custom_values = (
+                                    "value" in option_text
+                                    and any(word in option_text for word in (
+                                        "specific", "different", "custom", "my own", "your own"))
+                                    and "absolute" not in option_text
+                                )
+                                if choosing_custom_values:
+                                    st.session_state.cleaning_custom_value_input_by_finding[fid] = True
+                                    st.session_state.cleaning_custom_operation_input_by_finding.pop(fid, None)
+                                    _rerun_cleaning_fragment(fid)
+                                # An open-ended third choice does not need another
+                                # Gemma inference merely to ask the user to type it.
+                                if ("specify another operation" in option_text
+                                        or (any(w in option_text for w in (
+                                            "another", "different", "other", "alternative", "something else"))
+                                            and any(w in option_text for w in (
+                                                "operation", "action", "request", "option", "something",
+                                                "correction", "edit")))):
+                                    st.session_state.cleaning_custom_operation_input_by_finding[fid] = True
+                                    st.session_state.cleaning_custom_value_input_by_finding.pop(fid, None)
+                                    _rerun_cleaning_fragment(fid)
+                                st.session_state.cleaning_custom_value_input_by_finding.pop(fid, None)
+                                st.session_state.cleaning_custom_operation_input_by_finding.pop(fid, None)
+                                # An explicit absolute-value choice is a user instruction
+                                # with precise semantics, not a final edit approval.
+                                # The backend can build it from verified source evidence.
+                                if ("absolute value" in option_text and
+                                        "absolute value" in last_agent_c_reply.get("content", "").casefold()):
+                                    answer = (
+                                        "Use absolute values for every evidenced negative cell "
+                                        "in this finding. Keep the original CSV coordinates "
+                                        "and values. Draft a plan for source verification, "
+                                        "R testing and separate final approval. Do not edit "
+                                        "any data yet."
+                                    )
+                                else:
+                                    # Each other structured choice still replies directly,
+                                    # without approving or executing a data modification.
+                                    answer = (
+                                        f"I choose option {option_index}: {choice_label}. "
+                                        "This clarifies the scope of your last question, "
+                                        "not permission to change data. Retain my other "
+                                        "requested actions and prepare validated plan(s) "
+                                        "for separate review and approval."
+                                    )
+                                _queue_agent_c_for_finding(
+                                    finding, source, uploaded, dataset_paths, answer)
+                                _rerun_cleaning_fragment(fid)
+                        if st.button("No — Discuss Another Idea",
+                                     key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_clarify"):
+                            _open_agent_c_alternative_chat(fid)
+                            _rerun_cleaning_fragment(fid)
+                    elif control_phase == "custom_input":
+                        st.info(("Enter the exact replacement value for each affected cell below. "
+                                 if custom_value_input else "Describe the alternative operation below. ")
+                                + "Press Enter to send.")
+                        if st.button("No — Discuss Another Idea",
+                                     key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_custom"):
+                            _open_agent_c_alternative_chat(fid)
+                            _rerun_cleaning_fragment(fid)
+                    elif control_phase == "discussion" and mode == "alternative":
+                        # A new Agent C proposal in prose must have a direct
+                        # selection path. It is NOT approval of unverified edits.
+                        last_reply = (transcript[-1] if transcript else None)
+                        if (isinstance(last_reply, dict)
+                                and last_reply.get("role") == "assistant"
+                                and str(last_reply.get("content") or "").strip()
+                                and not last_reply.get("automatic")
+                                and not last_reply.get("controls_expired")
+                                and any(word in str(last_reply.get("content") or "").casefold()
+                                        for word in ("recommend", "propos", "replace", "delet",
+                                                     "remov", "merge", "standardiz", "correct",
+                                                     "rename", "clean", "apply", "convert", "pad "))):
+                            yes_choice, no_choice = st.columns(2)
+                            with yes_choice:
+                                if st.button(
+                                    "Yes — Prepare Changes",
+                                    key=f"review_yes_{fid}_{_active_agent_c_control_generation(fid)}_agent_c",
+                                ):
+                                    st.session_state.cleaning_discussion_mode_by_finding[fid] = "accepted"
+                                    st.session_state.cleaning_review_statuses[fid] = "Preparing verified changes"
+                                    _queue_agent_c_for_finding(
+                                        finding, source, uploaded, dataset_paths,
+                                        "Prepare a structured, executable change plan for your "
+                                        "latest recommendation using this finding's verified "
+                                        "source positions and exact before/after values. "
+                                        "Do not merely promise to draft a plan; return "
+                                        "the operations now. Do not execute any change; "
+                                        "a single named human approval follows validation.",
+                                    )
+                                    _rerun_cleaning_fragment(fid)
+                            with no_choice:
+                                if st.button(
+                                    "No — Discuss Another Idea",
+                                    key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_agent_c",
+                                ):
+                                    # Expire this recommendation without sending
+                                    # a hidden message to Gemma; chat stays open.
+                                    last_reply["controls_expired"] = True
+                                    _open_agent_c_alternative_chat(fid)
+                                    _rerun_cleaning_fragment(fid)
+                    # One conversation form per finding, and none while a request is
+                    # in flight. Show the form again when the reply has been collected.
+                    # st.chat_input sends with Enter and inserts a newline with
+                    # Shift+Enter. It is mounted only for an active discussion;
+                    # a pending or approved plan must never display a stale
+                    # secondary Send button beneath its final approval.
+                    if (control_phase in {"idle", "clarification", "custom_input", "discussion"}
+                            and not b_pending and plan is None and not remaining_batch
+                            and mode == "alternative"
+                            and st.session_state.cleaning_review_statuses.get(fid) != "Reviewed — no change"):
+                        placeholder = ("Enter exact replacement values…" if custom_value_input
+                                       else "Describe the new action or ask Agent C…")
+                        chat_key = f"review_message_{fid}_{_active_agent_c_control_generation(fid)}"
+                        message = (st.chat_input(placeholder, key=chat_key,
+                                                 max_chars=4000, disabled=b_pending)
+                                   if hasattr(st, "chat_input") else None)
+                        if message and str(message).strip():
+                            if control_phase == "idle":
+                                # Direct user feedback is a valid discussion even
+                                # without clicking No first; do not auto-approve.
+                                st.session_state.cleaning_discussion_mode_by_finding[fid] = "alternative"
+                                st.session_state.cleaning_review_statuses[fid] = "Discussion open"
+                            _queue_agent_c_for_finding(finding, source, uploaded, dataset_paths,
+                                                       str(message).strip())
+                            st.session_state.cleaning_custom_value_input_by_finding.pop(fid, None)
+                            st.session_state.cleaning_custom_operation_input_by_finding.pop(fid, None)
+                            _rerun_cleaning_fragment(fid)
 
             plan = st.session_state.cleaning_plans_by_finding.get(fid)
-            if plan:
-                queued = len(st.session_state.cleaning_batch_queue_by_finding.get(fid, []))
-                total_ops = st.session_state.cleaning_batch_total_by_finding.get(fid, 1)
-                if total_ops > 1:
-                    step = total_ops - queued
-                    st.info(f"Multi-action request: reviewing operation {step} of "
-                            f"{total_ops}. {queued} more action(s) remain queued. "
-                            "Every action needs independent approval.")
-            if plan and source and plan.get("operation") == "drop_column":
-                # Gemma only proposes a structural edit; this UI gives the
-                # researcher one independent, human-controlled approval.
-                try:
-                    checked = validate_scoped_plan(plan, finding, source)
-                    if checked != plan:
-                        raise PermissionError("Column deletion plan changed since verification")
-                    item = plan["changes"][0]
-                    current_bytes = st.session_state.cleaning_staged_bytes_by_dataset.get(
-                        ds_id, source.read_bytes())
-                    current_rows = _records(current_bytes)
-                    column_position = item["position"]
-                    approvals = st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
-                    if any(entry["position"] == column_position for entry in approvals):
-                        raise PermissionError("This column has already been approved for deletion")
-                    if len(approvals) + 1 >= len(current_rows[0]):
-                        raise PermissionError("At least one column must remain")
-                    can_delete = current_rows[0][column_position - 1] is not None
-                except (ValueError, PermissionError, OSError, IndexError, csv.Error) as exc:
-                    st.error(f"Column deletion proposal cannot be approved: {exc}")
-                    can_delete = False
-                else:
-                    st.warning(
-                        f"Agent C proposes removing the ENTIRE original CSV column "
-                        f"{column_position} ({item['before']!r}) from all "
-                        f"{len(current_rows) - 1} data rows in the FINAL download. "
-                        "This is not limited to the cells flagged by QC. "
-                        "The original upload and earlier approved cell edits stay unchanged."
-                    )
-                    st.caption("The physical column position and original header have been "
-                               "verified against this finding. Deletion happens only at export, "
-                               "so later cell edits retain stable original column numbers.")
-                with st.form(f"review_drop_column_{fid}"):
-                    reviewer_for_approval = st.session_state.get("cleaning_approved_reviewer") or ""
-                    if reviewer_for_approval:
-                        st.caption("Reviewer: " + reviewer_for_approval)
-                    else:
-                        reviewer_for_approval = st.text_input(
-                            "Reviewer identifier", key=f"review_drop_reviewer_{fid}", max_chars=120)
-                    approved = st.form_submit_button("Approve deletion of entire column",
-                                                     disabled=not can_delete)
-                if approved:
-                    reviewer = str(reviewer_for_approval or "").strip()
-                    if not reviewer:
-                        st.error("Enter a reviewer identifier before approval.")
-                    elif not can_delete:
-                        st.error("Column deletion validation failed; nothing was staged.")
-                    else:
+            approval_slot = st.empty() if hasattr(st, "empty") else None
+            if plan is None:
+                if approval_slot is not None:
+                    approval_slot.empty()
+            else:
+                with (approval_slot.container() if approval_slot is not None
+                      else nullcontext()):
+                    compound_active = bool(plan and st.session_state.cleaning_batch_queue_by_finding.get(fid))
+                    if compound_active and source:
+                        _render_compound_approval(fid, finding, source, ds_id, catalog)
+                    if plan and source and not compound_active and plan.get("operation") == "drop_column":
+                        # Gemma only proposes a structural edit; this UI gives the
+                        # researcher one independent, human-controlled approval.
                         try:
-                            # Re-evaluate the entire original/staged relationship
-                            # before committing a pending export-only removal.
-                            fresh = st.session_state.cleaning_staged_bytes_by_dataset.get(
+                            checked = validate_scoped_plan(
+                                plan, finding, source,
+                                user_requested_columns=st.session_state.cleaning_explicit_column_deletions_by_finding.get(fid))
+                            if checked != plan:
+                                raise PermissionError("Column deletion plan changed since verification")
+                            item = plan["changes"][0]
+                            current_bytes = st.session_state.cleaning_staged_bytes_by_dataset.get(
                                 ds_id, source.read_bytes())
-                            checked_again = validate_scoped_plan(plan, finding, source)
-                            if checked_again != plan:
-                                raise PermissionError("The original dataset or plan changed")
-                            original_rows, staged_rows = _records(source.read_bytes()), _records(fresh)
-                            if len(original_rows) != len(staged_rows) or any(
-                                    len(a) != len(b) for a, b in zip(original_rows, staged_rows)):
-                                raise PermissionError("Previously staged data dimensions changed")
-                            approved_entry = {
-                                "position": column_position, "before": item["before"],
-                                "reviewer": reviewer,
-                                "source_sha256": checked_again["source_sha256"],
+                            current_rows = _records(current_bytes)
+                            column_position = item["position"]
+                            approvals = st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
+                            if any(entry["position"] == column_position for entry in approvals):
+                                raise PermissionError("This column has already been approved for deletion")
+                            if len(approvals) + 1 >= len(current_rows[0]):
+                                raise PermissionError("At least one column must remain")
+                            can_delete = current_rows[0][column_position - 1] is not None
+                        except (ValueError, PermissionError, OSError, IndexError, csv.Error) as exc:
+                            st.error(f"Column deletion proposal cannot be approved: {exc}")
+                            can_delete = False
+                        else:
+                            _render_before_after([checked])
+                            if not _render_source_deletion_details(
+                                    source, [checked], key=f"column_{fid}"):
+                                can_delete = False
+                        with st.form(f"review_drop_column_{fid}_{_active_agent_c_control_generation(fid)}"):
+                            reviewer_for_approval = st.session_state.get("cleaning_approved_reviewer") or ""
+                            if reviewer_for_approval:
+                                st.caption("Reviewer: " + reviewer_for_approval)
+                            else:
+                                reviewer_for_approval = st.text_input(
+                                    "Reviewer identifier", key=f"review_drop_reviewer_{fid}", max_chars=120)
+                            yes_col, no_col = st.columns(2)
+                            with yes_col:
+                                approved = st.form_submit_button(
+                                    "Yes — Approve & Execute", disabled=not can_delete,
+                                    key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_column")
+                            with no_col:
+                                decline_column = st.form_submit_button(
+                                    "No — Discuss Another Idea",
+                                    key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_column")
+                        if decline_column:
+                            _open_agent_c_alternative_chat(fid, discard_plan=True)
+                            _rerun_cleaning_fragment(fid)
+                        if approved:
+                            reviewer = str(reviewer_for_approval or "").strip()
+                            if not reviewer:
+                                st.error("Enter a reviewer identifier before approval.")
+                            elif not can_delete:
+                                st.error("Column deletion validation failed; nothing was staged.")
+                            else:
+                                try:
+                                    # Re-evaluate the entire original/staged relationship
+                                    # before committing a pending export-only removal.
+                                    fresh = st.session_state.cleaning_staged_bytes_by_dataset.get(
+                                        ds_id, source.read_bytes())
+                                    checked_again = validate_scoped_plan(
+                                        plan, finding, source,
+                                        user_requested_columns=st.session_state.cleaning_explicit_column_deletions_by_finding.get(fid))
+                                    if checked_again != plan:
+                                        raise PermissionError("The original dataset or plan changed")
+                                    original_rows, staged_rows = _records(source.read_bytes()), _records(fresh)
+                                    if len(original_rows) != len(staged_rows) or any(
+                                            len(a) != len(b) for a, b in zip(original_rows, staged_rows)):
+                                        raise PermissionError("Previously staged data dimensions changed")
+                                    approved_entry = {
+                                        "position": column_position, "before": item["before"],
+                                        "reviewer": reviewer,
+                                        "source_sha256": checked_again["source_sha256"],
+                                        "finding_id": fid,
+                                    }
+                                    updated = [*st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, []),
+                                               approved_entry]
+                                    # Dry run of final export validates all existing approvals.
+                                    apply_approved_column_deletions(source.read_bytes(), fresh, updated)
+                                    st.session_state.cleaning_approved_columns_by_dataset[ds_id] = updated
+                                    st.session_state.cleaning_approved_reviewer = reviewer
+                                    st.session_state.cleaning_history.append({
+                                        "dataset_id": ds_id, "finding_id": fid,
+                                        "finding": finding["title"], "operation": "drop_column",
+                                        "changes": 1, "already_resolved": 0,
+                                        "reviewer": reviewer, "storage": "session_memory_export_only",
+                                        "modified_positions": [{"column": column_position}],
+                                        "source_sha256": checked_again["source_sha256"],
+                                        "staged_sha256": sha256_bytes(fresh),
+                                    })
+                                    st.session_state.cleaning_review_statuses[fid] = "Approved column deletion for final export"
+                                    st.session_state.cleaning_decisions.append({
+                                        "finding_id": fid, "decision": "whole_column_deletion_approved_export_only",
+                                        "column": column_position,
+                                        "original_header": item["before"],
+                                        "source_sha256": checked_again["source_sha256"],
+                                    })
+                                    st.session_state.cleaning_plans_by_finding.pop(fid, None)
+                                    _advance_agent_c_batch(fid)
+                                    _remember_approved_agent_c_solution(fid, finding, source)
+                                    _rerun_cleaning_fragment(fid)
+                                except (ValueError, PermissionError, OSError, AssertionError, csv.Error) as exc:
+                                    st.error(f"Column deletion approval failed; no action staged: {exc}")
+                    if plan and source and not compound_active and plan.get("operation") in {"drop_rows", "merge_rows"}:
+                        row_op = plan["operation"]
+                        is_merge = row_op == "merge_rows"
+                        can_approve_rows = False
+                        try:
+                            checked = validate_scoped_plan(
+                                plan, finding, source,
+                                user_requested_rows=st.session_state.cleaning_explicit_row_deletions_by_finding.get(fid))
+                            if checked != plan:
+                                raise PermissionError("Row plan changed since source verification")
+                            originals = source.read_bytes()
+                            staged_bytes = st.session_state.cleaning_staged_bytes_by_dataset.get(
+                                ds_id, originals)
+                            existing = st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, [])
+                            reviewer_for_approval = st.session_state.get("cleaning_approved_reviewer") or ""
+                            preview_entry = {
+                                "operation": row_op, "changes": checked["changes"],
+                                "reviewer": reviewer_for_approval or "preview_only",
+                                "source_sha256": checked["source_sha256"],
                                 "finding_id": fid,
                             }
-                            updated = [*st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, []),
-                                       approved_entry]
-                            # Dry run of final export validates all existing approvals.
-                            apply_approved_column_deletions(source.read_bytes(), fresh, updated)
-                            st.session_state.cleaning_approved_columns_by_dataset[ds_id] = updated
-                            st.session_state.cleaning_approved_reviewer = reviewer
-                            st.session_state.cleaning_history.append({
-                                "dataset_id": ds_id, "finding_id": fid,
-                                "finding": finding["title"], "operation": "drop_column",
-                                "changes": 1, "already_resolved": 0,
-                                "reviewer": reviewer, "storage": "session_memory_export_only",
-                                "modified_positions": [{"column": column_position}],
-                                "source_sha256": checked_again["source_sha256"],
-                                "staged_sha256": sha256_bytes(fresh),
-                            })
-                            st.session_state.cleaning_review_statuses[fid] = "Approved column deletion for final export"
-                            st.session_state.cleaning_decisions.append({
-                                "finding_id": fid, "decision": "whole_column_deletion_approved_export_only",
-                                "column": column_position,
-                                "original_header": item["before"],
-                                "source_sha256": checked_again["source_sha256"],
-                            })
-                            st.session_state.cleaning_plans_by_finding.pop(fid, None)
-                            _advance_agent_c_batch(fid)
-                            _rerun_cleaning_fragment()
-                        except (ValueError, PermissionError, OSError, AssertionError, csv.Error) as exc:
-                            st.error(f"Column deletion approval failed; no action staged: {exc}")
-                if st.button("Cancel this deletion proposal and discuss another action",
-                             key=f"review_cancel_drop_{fid}"):
-                    _cancel_agent_c_batch(fid, status="Column deletion rejected")
-                    st.session_state.cleaning_discussion_mode_by_finding[fid] = "alternative"
-                    _rerun_cleaning_fragment()
-            if plan and source and plan.get("operation") != "drop_column":
-                prepared = st.session_state.cleaning_r_previews_by_finding.get(fid)
-                # Earlier UI versions cached code-only previews without an R
-                # result. Re-run the isolated test once instead of treating
-                # that old cache as an approved insertion source.
-                if prepared and ("r_result" not in prepared or "insertion_plan" not in prepared):
-                    st.session_state.cleaning_r_previews_by_finding.pop(fid, None)
-                    prepared = None
-                previous_error = st.session_state.cleaning_r_errors_by_finding.get(fid)
-                if not prepared and not previous_error:
-                    try:
-                        # Authorized only to PREVIEW: execute deterministic R on
-                        # the exact affected values in the isolated sandbox.
-                        # The working CSV is not touched by this step.
-                        prepared = prepare_and_execute_scoped_r_preview(plan, finding, source)
-                        st.session_state.cleaning_r_previews_by_finding[fid] = prepared
-                        st.session_state.cleaning_review_statuses[fid] = "R output verified — insertion awaiting approval"
-                        st.session_state.cleaning_decisions.append({
-                            "finding_id": fid, "decision": "scoped_r_preview_tested_no_dataset_change",
-                            "source_sha256": prepared["source_sha256"],
-                            "r_preview_sha256": prepared["preview_sha256"],
-                            "r_result_sha256": prepared["r_result"]["verified_output_sha256"],
-                        })
-                    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, csv.Error) as exc:
-                        diagnosis = diagnose_r_preview_failure(exc, plan, finding)
-                        previous_error = ("Isolated R preview failed: " + diagnosis["summary"]
-                                          + " [" + diagnosis["code"] + "]")
-                        st.session_state.cleaning_r_errors_by_finding[fid] = previous_error
-                        st.session_state.cleaning_r_diagnostics_by_finding[fid] = diagnosis
-                if previous_error:
-                    st.error(previous_error + ". No working data were changed.")
-                    diagnosis = st.session_state.cleaning_r_diagnostics_by_finding.get(fid)
-                    if diagnosis:
-                        # A failed operation must explain why it failed without
-                        # exposing the source CSV or raw model/R code.
-                        with st.expander("R failure details and next steps", expanded=True):
-                            st.write("**Failed stage:**", diagnosis["stage"])
-                            st.write("**Error code:**", diagnosis["code"])
-                            st.write("**Likely cause:**", diagnosis["summary"])
-                            st.write("**What to do:**", diagnosis["action"])
-                            if diagnosis.get("exit_code") is not None:
-                                st.write("**R exit status:**", diagnosis["exit_code"])
-                            if diagnosis.get("stderr_excerpt"):
-                                st.write("**Sanitized R / sandbox error output:**")
-                                st.code(diagnosis["stderr_excerpt"], language="text")
-                            else:
-                                st.caption("No usable R stderr was returned. The error category "
-                                           "and launcher checks above may still identify the cause.")
-                            preflight = diagnosis.get("preflight", {})
-                            st.caption("WSL launcher checks: "
-                                       f"bwrap {'found' if preflight.get('bwrap_found') else 'not found'} · "
-                                       f"Rscript {'found' if preflight.get('rscript_found') else 'not found'}")
-                            if diagnosis.get("partial_scope"):
-                                st.warning(
-                                    f"This plan covers {diagnosis['planned_changes']} of "
-                                    f"{diagnosis['affected_cells']} evidenced cells. "
-                                    "That is a partial cleaning plan, separate from the R failure. "
-                                    "Do not consider the full finding resolved by this batch."
-                                )
-                            if st.button("Run isolated R self-test", key=f"review_r_selftest_{fid}"):
-                                st.session_state.cleaning_r_selfchecks_by_finding[fid] = (
-                                    run_r_environment_self_test()
-                                )
-                                _rerun_cleaning_fragment()
-                            selfcheck = st.session_state.cleaning_r_selfchecks_by_finding.get(fid)
-                            if selfcheck:
-                                if selfcheck["passed"]:
-                                    st.success(selfcheck["summary"])
-                                else:
-                                    st.error("R sandbox self-test failed: " + selfcheck["summary"])
-                                    if selfcheck.get("stderr_excerpt"):
-                                        st.code(selfcheck["stderr_excerpt"], language="text")
-                                st.caption(selfcheck["action"])
-                    if st.button("Retry isolated R preview", key=f"review_retry_r_{fid}"):
-                        st.session_state.cleaning_r_errors_by_finding.pop(fid, None)
-                        st.session_state.cleaning_r_diagnostics_by_finding.pop(fid, None)
-                        st.session_state.cleaning_r_selfchecks_by_finding.pop(fid, None)
-                        _rerun_cleaning_fragment()
-                elif prepared:
-                    st.markdown("**R result verified — review before insertion**")
-                    st.caption("R has run on ONLY the finding's affected values. Your approval "
-                               "will insert its verified result into session memory, NOT create "
-                               "a CSV file. Biological suitability still requires your review.")
-                    affected = prepared["insertion_plan"]["changes"]
-                    evidenced_cells, evidenced_headers = allowed_positions(finding, source)
-                    required_positions = (evidenced_headers if
-                                          prepared["insertion_plan"]["operation"] == "rename_headers"
-                                          else evidenced_cells)
-                    # Do not treat the first 32 of a large finding as complete.
-                    # Smaller findings may legitimately require only selected
-                    # coordinates when the researcher's approved plan says so.
-                    incomplete_scope = (len(required_positions) > 32
-                                        and len(affected) < len(required_positions))
-                    if incomplete_scope:
-                        st.warning(
-                            f"This plan covers only {len(affected)} of "
-                            f"{len(required_positions)} independently evidenced positions. "
-                            "A partial batch cannot complete this finding; "
-                            "request a full validated plan."
-                        )
-                    st.dataframe(pd.DataFrame(affected), hide_index=True, width="stretch")
-                    if st.checkbox("Review R cleaning and insertion code", key=f"review_r_code_{fid}"):
-                        st.markdown("**1. R cleaning (already executed in isolation)**")
-                        st.code(prepared["r_function"], language="r")
-                        st.markdown("**2. R insertion (vectorized, reproducible specification)**")
-                        st.code(prepared["insertion_r_function"], language="r")
-                        st.caption("The insertion function accepts the verified 5-column "
-                                   "change table as data, grouping edits by column instead of "
-                                   "generating a command for every cell. The application "
-                                   "independently verifies and stages approved changes in "
-                                   "memory; this displayed R insertion code is not executed.")
-                        if st.checkbox("Show verified insertion inputs (CSV table)",
-                                       key=f"review_r_manifest_{fid}"):
-                            st.code(prepared["insertion_changes_csv"], language="csv")
-                    # Reconcile each proposed R value against the most recent
-                    # approved in-memory version *before* presenting approval.
-                    # Idempotent overlaps do not require another edit. Genuine
-                    # differences are displayed and verified by a second R
-                    # sandbox run against the current staged cell values.
-                    review = None
-                    insertion = None
-                    approved_rebase = None
-                    can_approve = not incomplete_scope
-                    original_bytes = source.read_bytes()
-                    staged = st.session_state.cleaning_staged_bytes_by_dataset.get(
-                        ds_id, original_bytes)
-                    try:
-                        insertion = verify_prepared_r_insertion(prepared, plan, finding, source)
-                        review = assess_verified_in_memory(original_bytes, staged, insertion)
-                        if review["already_resolved"]:
-                            st.info(f"{len(review['already_resolved'])} cell(s)/header(s) "
-                                    "already have the proposed value from an earlier approval; "
-                                    "no second modification will be made to those positions.")
-                        if review["conflicts"]:
-                            st.warning("Another approved finding previously changed these positions. "
-                                       "Review the current values and proposed replacements before overriding them.")
-                            prior_by_cell = {}
-                            for past_event in history_all:
-                                if past_event.get("dataset_id") == ds_id:
-                                    for coord in past_event.get("modified_positions", []):
-                                        if isinstance(coord, dict):
-                                            prior_by_cell[(coord.get("csv_row"), coord.get("column"))] = (
-                                                past_event.get("finding_id") or "Earlier review")
-                            st.dataframe(pd.DataFrame([
-                                {**conflict, "earlier_finding": prior_by_cell.get(
-                                    (conflict["csv_row"], conflict["column"]), "Prior approved edit")}
-                                for conflict in review["conflicts"]
-                            ]), hide_index=True, width="stretch")
-                            cached = st.session_state.cleaning_rebased_previews_by_finding.get(fid)
-                            if not cached or (cached.get("staged_sha256") != review["staged_sha256"]
-                                              or cached.get("conflicts") != review["conflicts"]):
-                                cached = verify_r_against_current_staged_values(
-                                    original_bytes, staged, insertion)
-                                st.session_state.cleaning_rebased_previews_by_finding[fid] = cached
-                            # Bind the checkbox to the exact current stage
-                            # AND proposed values. A changed stage or revised
-                            # plan requires a new explicit approval.
-                            review_identity = hashlib.sha256((
-                                review["staged_sha256"] + json.dumps(
-                                    insertion, sort_keys=True, ensure_ascii=False)
-                            ).encode("utf-8")).hexdigest()[:24]
-                            if st.checkbox("I authorize replacing these previously approved "
-                                           "values with the verified new values",
-                                           key=f"review_override_conflicts_{fid}_{review_identity}"):
-                                approved_rebase = cached
-                                if st.session_state.get(f"review_r_code_{fid}"):
-                                    st.markdown("**R recheck against latest staged values**")
-                                    st.code(cached["r_function"], language="r")
-                            else:
-                                can_approve = False
-                        elif not review["ready_to_apply"]:
-                            st.success("This proposed cleaning is already satisfied by "
-                                       "earlier staged edits. Approve to record the finding "
-                                       "as resolved without changing any additional cell.")
-                    except (OSError, ValueError, PermissionError, RuntimeError,
-                            csv.Error, KeyError) as exc:
-                        can_approve = False
-                        st.error(f"In-memory insertion failed; no changes were staged: {exc}")
-                    with st.form(f"review_execute_r_{fid}"):
-                        # Only the first approval asks for an identifier. It
-                        # appears beside the approval button so researchers
-                        # never have to scroll back to the top of a long page.
-                        reviewer_for_approval = (
-                            st.session_state.get("cleaning_approved_reviewer") or ""
-                        )
-                        if reviewer_for_approval:
-                            st.caption("Reviewer: " + reviewer_for_approval)
-                        elif hasattr(st, "text_input"):
-                            reviewer_for_approval = st.text_input(
-                                "Reviewer identifier (required once for this investigation)",
-                                key=f"cleaning_reviewer_once_{session_context}",
-                                max_chars=120,
-                            )
-                        execute = st.form_submit_button("Approve & Stage in memory",
-                                                        disabled=not can_approve)
-                    if execute:
-                        reviewer = str(reviewer_for_approval or "").strip()
-                        if not reviewer:
-                            st.error("Enter your reviewer identifier in the field directly "
-                                     "above the approval button. This is required only once.")
-                        elif not can_approve or review is None or insertion is None:
-                            st.error("Recheck the current data and any conflicts before approval.")
+                            # Validate all prior operations and the new one together,
+                            # WITHOUT changing the stored approval list.
+                            preview = apply_approved_row_operations(
+                                originals, staged_bytes, [*existing, preview_entry])
+                            before_count = len(_records(staged_bytes)) - 1
+                            after_count = len(_records(preview)) - 1
+                            if after_count >= before_count:
+                                raise PermissionError("Row operation did not remove a source row")
+                            can_approve_rows = True
+                        except (ValueError, PermissionError, OSError, AssertionError,
+                                IndexError, KeyError, csv.Error) as exc:
+                            st.error(f"Row operation cannot be approved: {exc}")
                         else:
-                            try:
-                                # Revalidate the staged version at the instant
-                                # approval is processed. The R proof is bound
-                                # to the same current staged SHA-256.
-                                fresh_staged = st.session_state.cleaning_staged_bytes_by_dataset.get(
-                                    ds_id, original_bytes)
-                                if review["staged_sha256"] != hashlib.sha256(
-                                        fresh_staged).hexdigest():
-                                    raise PermissionError("Another finding changed the staged "
-                                                          "data since review; inspect it again")
-                                new_bytes, result = apply_verified_in_memory(
-                                    original_bytes, fresh_staged, insertion, reviewer=reviewer,
-                                    approved_rebase=approved_rebase,
-                                )
-                                r_info = {k: v for k, v in prepared["r_result"].items()
-                                          if k != "verified_output_csv"}
-                                result["r_preview_execution"] = r_info
-                                result["r_insertion_code_sha256"] = hashlib.sha256(
-                                    prepared["insertion_r_function"].encode("utf-8")).hexdigest()
-                                # Commit session bytes and audit records only
-                                # after all verification has succeeded.
-                                st.session_state.cleaning_staged_bytes_by_dataset[ds_id] = new_bytes
-                                st.session_state.cleaning_approved_reviewer = reviewer
-                                # Retain the exact reviewed R artifacts only in
-                                # session memory for audit display after completion.
-                                st.session_state.cleaning_completed_audits_by_finding[fid] = {
-                                    "r_function": prepared["r_function"],
-                                    "insertion_r_function": prepared["insertion_r_function"],
-                                    "changes": list(prepared["insertion_plan"]["changes"]),
-                                }
-                                st.session_state.cleaning_pending_gemma_b.pop(fid, None)
-                                st.session_state.cleaning_history.append({
-                                    "dataset_id": ds_id, "finding_id": fid,
-                                    "finding": finding["title"], "operation": insertion["operation"],
-                                    "changes": result["changes_applied"],
-                                    "already_resolved": result["already_resolved"],
-                                    "conflicts_overridden": result["conflicts_overridden"],
-                                    "reviewer": reviewer, "storage": "session_memory",
-                                    "modified_positions": [
-                                        {"csv_row": item["csv_row"], "column": item["column"]}
-                                        for item in review["ready_to_apply"] + (
-                                            review["conflicts"] if approved_rebase else [])
-                                    ],
-                                    "source_sha256": insertion["source_sha256"],
-                                    "staged_sha256": result["staged_sha256"],
-                                    "r_code_sha256": r_info["r_code_sha256"],
-                                })
-                                if result["changes_applied"]:
-                                    st.session_state.cleaning_review_statuses[fid] = "Applied and verified"
-                                else:
+                            if is_merge:
+                                _render_before_after([checked])
+                                item = checked["changes"][0]
+                                # Show the actual numeric impact of merging before approval.
+                                from healthcare_data_quality.in_memory_cleaning import _sum_count_cells
+                                staged_rows = _records(staged_bytes)
+                                target, source_row = item["row"], item["source_row"]
+                                changes_preview = []
+                                for col in range(1, len(staged_rows[0])):
+                                    left = staged_rows[target-1][col]
+                                    right = staged_rows[source_row-1][col]
+                                    combined = _sum_count_cells(left, right)
+                                    if combined != left:
+                                        changes_preview.append({
+                                            "Column": col + 1,
+                                            "Target before": left,
+                                            "Absorbed value": right,
+                                            "Merged value": combined,
+                                        })
+                                if changes_preview:
+                                    with st.expander(f"Preview merged counts ({len(changes_preview)} changed columns)"):
+                                        st.dataframe(pd.DataFrame(changes_preview), hide_index=True,
+                                                     width="stretch")
+                            else:
+                                row_ids = [item["row"] for item in checked["changes"]]
+                                displayed = ", ".join(map(str, row_ids[:16]))
+                                if len(row_ids) > 16:
+                                    displayed += f", … (+{len(row_ids) - 16} more)"
+                                _render_before_after([checked])
+                                if len(row_ids) > 16:
+                                    with st.expander("All selected row numbers"):
+                                        st.dataframe(pd.DataFrame({"CSV row": row_ids}),
+                                                     hide_index=True, width="stretch")
+                            if not _render_source_deletion_details(
+                                    source, [checked], key=f"rows_{fid}"):
+                                can_approve_rows = False
+                        with st.form(f"review_row_operation_{fid}_{_active_agent_c_control_generation(fid)}"):
+                            row_reviewer = st.session_state.get("cleaning_approved_reviewer") or ""
+                            if row_reviewer:
+                                st.caption("Reviewer: " + row_reviewer)
+                            else:
+                                row_reviewer = st.text_input(
+                                    "Reviewer identifier", key=f"review_row_reviewer_{fid}", max_chars=120)
+                            yes_col, no_col = st.columns(2)
+                            with yes_col:
+                                row_approved = st.form_submit_button(
+                                    "Yes — Approve & Execute", disabled=not can_approve_rows,
+                                    key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_rows")
+                            with no_col:
+                                decline_rows = st.form_submit_button(
+                                    "No — Discuss Another Idea",
+                                    key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_rows")
+                        if decline_rows:
+                            _open_agent_c_alternative_chat(fid, discard_plan=True)
+                            _rerun_cleaning_fragment(fid)
+                        if row_approved:
+                            if not str(row_reviewer or "").strip():
+                                st.error("Enter a reviewer identifier before approval.")
+                            elif not can_approve_rows:
+                                st.error("Row plan is not verified")
+                            else:
+                                try:
+                                    current_plan = validate_scoped_plan(
+                                        plan, finding, source,
+                                        user_requested_rows=st.session_state.cleaning_explicit_row_deletions_by_finding.get(fid))
+                                    if current_plan != plan:
+                                        raise PermissionError("Source or row plan changed")
+                                    originals = source.read_bytes()
+                                    latest = st.session_state.cleaning_staged_bytes_by_dataset.get(
+                                        ds_id, originals)
+                                    approved_entry = {
+                                        "operation": row_op,
+                                        "changes": current_plan["changes"],
+                                        "finding_id": fid,
+                                        "reviewer": str(row_reviewer).strip(),
+                                        "source_sha256": current_plan["source_sha256"],
+                                    }
+                                    pending = [
+                                        *st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, []),
+                                        approved_entry,
+                                    ]
+                                    apply_approved_row_operations(originals, latest, pending)
+                                    st.session_state.cleaning_approved_rows_by_dataset[ds_id] = pending
+                                    st.session_state.cleaning_approved_reviewer = str(row_reviewer).strip()
+                                    st.session_state.cleaning_history.append({
+                                        "dataset_id": ds_id, "finding_id": fid,
+                                        "finding": finding["title"], "operation": row_op,
+                                        "changes": len(current_plan["changes"]),
+                                        "already_resolved": 0,
+                                        "reviewer": str(row_reviewer).strip(),
+                                        "storage": "session_memory_export_only",
+                                        "modified_positions": [
+                                            {k: value for k, value in item.items()
+                                             if k in {"row", "source_row"}}
+                                            for item in current_plan["changes"]],
+                                        "source_sha256": current_plan["source_sha256"],
+                                        "staged_sha256": sha256_bytes(latest),
+                                    })
                                     st.session_state.cleaning_review_statuses[fid] = (
-                                        "Resolved by earlier approved edit")
+                                        "Approved row changes for final export")
+                                    st.session_state.cleaning_decisions.append({
+                                        "finding_id": fid,
+                                        "decision": "structural_row_operation_approved_export_only",
+                                        "operation": row_op,
+                                        "source_sha256": current_plan["source_sha256"],
+                                    })
+                                    st.session_state.cleaning_plans_by_finding.pop(fid, None)
+                                    _advance_agent_c_batch(fid)
+                                    _remember_approved_agent_c_solution(fid, finding, source)
+                                    _rerun_cleaning_fragment(fid)
+                                except (ValueError, PermissionError, OSError, AssertionError,
+                                        IndexError, KeyError, csv.Error) as exc:
+                                    st.error(f"Row approval failed; no operation was staged: {exc}")
+                    if plan and source and not compound_active and plan.get("operation") not in {"drop_column", "drop_rows", "merge_rows"}:
+                        prepared = st.session_state.cleaning_r_previews_by_finding.get(fid)
+                        # Earlier UI versions cached code-only previews without an R
+                        # result. Re-run the isolated test once instead of treating
+                        # that old cache as an approved insertion source.
+                        if prepared and ("r_result" not in prepared or "insertion_plan" not in prepared):
+                            st.session_state.cleaning_r_previews_by_finding.pop(fid, None)
+                            prepared = None
+                        previous_error = st.session_state.cleaning_r_errors_by_finding.get(fid)
+                        if not prepared and not previous_error:
+                            try:
+                                # Authorized only to PREVIEW: execute deterministic R on
+                                # the exact affected values in the isolated sandbox.
+                                # The working CSV is not touched by this step.
+                                prepared = prepare_and_execute_scoped_r_preview(plan, finding, source)
+                                st.session_state.cleaning_r_previews_by_finding[fid] = prepared
+                                st.session_state.cleaning_review_statuses[fid] = "R output verified — insertion awaiting approval"
                                 st.session_state.cleaning_decisions.append({
-                                    "finding_id": fid,
-                                    "decision": ("verified_r_result_staged_in_memory"
-                                                 if result["changes_applied"] else
-                                                 "already_resolved_by_prior_verified_edit"),
-                                    "r_result_sha256": r_info["verified_output_sha256"],
-                                    "staged_sha256": result["staged_sha256"],
+                                    "finding_id": fid, "decision": "scoped_r_preview_tested_no_dataset_change",
+                                    "source_sha256": prepared["source_sha256"],
+                                    "r_preview_sha256": prepared["preview_sha256"],
+                                    "r_result_sha256": prepared["r_result"]["verified_output_sha256"],
                                 })
-                                for other in catalog:
-                                    if other.get("dataset_id") == ds_id:
-                                        other_id = other["id"]
-                                        st.session_state.cleaning_plans_by_finding.pop(other_id, None)
-                                        st.session_state.cleaning_r_previews_by_finding.pop(other_id, None)
-                                        st.session_state.cleaning_r_errors_by_finding.pop(other_id, None)
-                                        st.session_state.cleaning_r_diagnostics_by_finding.pop(other_id, None)
-                                        st.session_state.cleaning_r_selfchecks_by_finding.pop(other_id, None)
-                                        st.session_state.cleaning_rebased_previews_by_finding.pop(other_id, None)
-                                        if other_id != fid:
-                                            # A different finding may have generated stale plans.
-                                            st.session_state.cleaning_batch_queue_by_finding.pop(other_id, None)
-                                _advance_agent_c_batch(fid)
-                                _rerun_cleaning_fragment()
-                            except (OSError, ValueError, PermissionError, AssertionError,
-                                    RuntimeError, csv.Error, KeyError) as exc:
+                            except (OSError, ValueError, KeyError, PermissionError, RuntimeError, csv.Error) as exc:
+                                diagnosis = diagnose_r_preview_failure(exc, plan, finding)
+                                previous_error = ("Isolated R preview failed: " + diagnosis["summary"]
+                                                  + " [" + diagnosis["code"] + "]")
+                                st.session_state.cleaning_r_errors_by_finding[fid] = previous_error
+                                st.session_state.cleaning_r_diagnostics_by_finding[fid] = diagnosis
+                        if previous_error:
+                            st.error(previous_error + ". No working data were changed.")
+                            diagnosis = st.session_state.cleaning_r_diagnostics_by_finding.get(fid)
+                            if diagnosis:
+                                # A failed operation must explain why it failed without
+                                # exposing the source CSV or raw model/R code.
+                                with st.expander("R failure details and next steps", expanded=True):
+                                    st.write("**Failed stage:**", diagnosis["stage"])
+                                    st.write("**Error code:**", diagnosis["code"])
+                                    st.write("**Likely cause:**", diagnosis["summary"])
+                                    st.write("**What to do:**", diagnosis["action"])
+                                    if diagnosis.get("exit_code") is not None:
+                                        st.write("**R exit status:**", diagnosis["exit_code"])
+                                    if diagnosis.get("stderr_excerpt"):
+                                        st.write("**Sanitized R / sandbox error output:**")
+                                        st.code(diagnosis["stderr_excerpt"], language="text")
+                                    else:
+                                        st.caption("No usable R stderr was returned. The error category "
+                                                   "and launcher checks above may still identify the cause.")
+                                    preflight = diagnosis.get("preflight", {})
+                                    st.caption("WSL launcher checks: "
+                                               f"bwrap {'found' if preflight.get('bwrap_found') else 'not found'} · "
+                                               f"Rscript {'found' if preflight.get('rscript_found') else 'not found'}")
+                                    if diagnosis.get("partial_scope"):
+                                        st.warning(
+                                            f"This plan covers {diagnosis['planned_changes']} of "
+                                            f"{diagnosis['affected_cells']} evidenced cells. "
+                                            "That is a partial cleaning plan, separate from the R failure. "
+                                            "Do not consider the full finding resolved by this batch."
+                                        )
+                                    if st.button("Run isolated R self-test", key=f"review_r_selftest_{fid}"):
+                                        st.session_state.cleaning_r_selfchecks_by_finding[fid] = (
+                                            run_r_environment_self_test()
+                                        )
+                                        _rerun_cleaning_fragment(fid)
+                                    selfcheck = st.session_state.cleaning_r_selfchecks_by_finding.get(fid)
+                                    if selfcheck:
+                                        if selfcheck["passed"]:
+                                            st.success(selfcheck["summary"])
+                                        else:
+                                            st.error("R sandbox self-test failed: " + selfcheck["summary"])
+                                            if selfcheck.get("stderr_excerpt"):
+                                                st.code(selfcheck["stderr_excerpt"], language="text")
+                                        st.caption(selfcheck["action"])
+                            if st.button("Retry isolated R preview", key=f"review_retry_r_{fid}"):
+                                st.session_state.cleaning_r_errors_by_finding.pop(fid, None)
+                                st.session_state.cleaning_r_diagnostics_by_finding.pop(fid, None)
+                                st.session_state.cleaning_r_selfchecks_by_finding.pop(fid, None)
+                                _rerun_cleaning_fragment(fid)
+                        elif prepared:
+                            # The researcher sees actual proposed values; R proof
+                            # remains available on demand, not a second summary.
+                            _render_before_after([prepared["insertion_plan"]])
+                            affected = prepared["insertion_plan"]["changes"]
+                            evidenced_cells, evidenced_headers = allowed_positions(finding, source)
+                            required_positions = (evidenced_headers if
+                                                  prepared["insertion_plan"]["operation"] == "rename_headers"
+                                                  else evidenced_cells)
+                            # Do not treat the first 32 of a large finding as complete.
+                            # Smaller findings may legitimately require only selected
+                            # coordinates when the researcher's approved plan says so.
+                            incomplete_scope = (len(required_positions) > 32
+                                                and len(affected) < len(required_positions))
+                            if incomplete_scope:
+                                st.warning(
+                                    f"This plan covers only {len(affected)} of "
+                                    f"{len(required_positions)} independently evidenced positions. "
+                                    "A partial batch cannot complete this finding; "
+                                    "request a full validated plan."
+                                )
+                            if False:  # technical R proof is verified by the backend, not shown in review
+                                st.markdown("**1. R cleaning (already executed in isolation)**")
+                                st.code(prepared["r_function"], language="r")
+                                st.markdown("**2. R insertion (vectorized, reproducible specification)**")
+                                st.code(prepared["insertion_r_function"], language="r")
+                                if st.checkbox("Show verified insertion inputs (CSV table)",
+                                               key=f"review_r_manifest_{fid}"):
+                                    st.code(prepared["insertion_changes_csv"], language="csv")
+                            # Reconcile each proposed R value against the most recent
+                            # approved in-memory version *before* presenting approval.
+                            # Idempotent overlaps do not require another edit. Genuine
+                            # differences are displayed and verified by a second R
+                            # sandbox run against the current staged cell values.
+                            review = None
+                            insertion = None
+                            approved_rebase = None
+                            can_approve = not incomplete_scope
+                            original_bytes = source.read_bytes()
+                            staged = st.session_state.cleaning_staged_bytes_by_dataset.get(
+                                ds_id, original_bytes)
+                            try:
+                                insertion = verify_prepared_r_insertion(prepared, plan, finding, source)
+                                review = assess_verified_in_memory(original_bytes, staged, insertion)
+                                if review["already_resolved"]:
+                                    st.info(f"{len(review['already_resolved'])} cell(s)/header(s) "
+                                            "already have the proposed value from an earlier approval; "
+                                            "no second modification will be made to those positions.")
+                                if review["conflicts"]:
+                                    # Already reconciled for benign taxonomy formatting below;
+                                    # all other overlapping edits need explicit override.
+                                    prior_by_cell = {}
+                                    for past_event in history_all:
+                                        if past_event.get("dataset_id") == ds_id:
+                                            for coord in past_event.get("modified_positions", []):
+                                                if isinstance(coord, dict):
+                                                    prior_by_cell[(coord.get("csv_row"), coord.get("column"))] = (
+                                                        past_event.get("finding_id") or "Earlier review")
+                                    # The single Before → After preview above is the
+                                    # complete action summary. Do not display a second
+                                    # aggregate/conflict table here.
+                                    cached = st.session_state.cleaning_rebased_previews_by_finding.get(fid)
+                                    if not cached or (cached.get("staged_sha256") != review["staged_sha256"]
+                                                      or cached.get("conflicts") != review["conflicts"]):
+                                        cached = verify_r_against_current_staged_values(
+                                            original_bytes, staged, insertion)
+                                        st.session_state.cleaning_rebased_previews_by_finding[fid] = cached
+                                    # Bind the checkbox to the exact current stage
+                                    # AND proposed values. A changed stage or revised
+                                    # plan requires a new explicit approval.
+                                    review_identity = hashlib.sha256((
+                                        review["staged_sha256"] + json.dumps(
+                                            insertion, sort_keys=True, ensure_ascii=False)
+                                    ).encode("utf-8")).hexdigest()[:24]
+                                    # When a previous finding changed ONLY
+                                    # taxonomy presentation (delimiter/prefixes),
+                                    # a second approval checkbox is redundant.
+                                    # Both edits still have isolated R proof,
+                                    # and the final named Yes validates stage SHA.
+                                    from healthcare_data_quality.direct_actions import same_taxonomy_identity
+                                    prior_format_changes = {
+                                        (pos.get("csv_row"), pos.get("column"))
+                                        for event in history_all
+                                        if event.get("dataset_id") == ds_id
+                                        and event.get("finding_id") != fid
+                                        and event.get("finding_id", "").startswith(f"{ds_id}:qc:")
+                                        and event.get("operation") == "replace_cells"
+                                        for pos in event.get("modified_positions", [])
+                                        if isinstance(pos, dict)
+                                    }
+                                    only_presentation = (
+                                        finding.get("check_key") in {
+                                            "inspect_taxonomy_structure", "inspect_taxonomy_naming"}
+                                        and all((v["csv_row"], v["column"]) in prior_format_changes
+                                                and v["column"] == 1
+                                                and same_taxonomy_identity(
+                                                    v["original"], v["current"], v["proposed"])
+                                                for v in review["conflicts"])
+                                    )
+                                    if only_presentation:
+                                        approved_rebase = cached
+                                    elif st.checkbox(
+                                            "Override previously approved values",
+                                            key=f"review_override_conflicts_{fid}_{review_identity}"):
+                                        approved_rebase = cached
+                                    else:
+                                        can_approve = False
+                                elif not review["ready_to_apply"]:
+                                    st.success("This proposed cleaning is already satisfied by "
+                                               "earlier staged edits. Approve to record the finding "
+                                               "as resolved without changing any additional cell.")
+                            except (OSError, ValueError, PermissionError, RuntimeError,
+                                    csv.Error, KeyError) as exc:
+                                can_approve = False
                                 st.error(f"In-memory insertion failed; no changes were staged: {exc}")
-                if st.button("Reject this proposed insertion", key=f"review_reject_plan_{fid}"):
-                    st.session_state.cleaning_discussion_mode_by_finding.pop(fid, None)
-                    _cancel_agent_c_batch(fid, status="R insertion rejected")
-                    st.session_state.cleaning_r_previews_by_finding.pop(fid, None)
-                    st.session_state.cleaning_r_errors_by_finding.pop(fid, None)
-                    st.session_state.cleaning_r_diagnostics_by_finding.pop(fid, None)
-                    st.session_state.cleaning_r_selfchecks_by_finding.pop(fid, None)
-                    st.session_state.cleaning_decisions.append({
-                        "finding_id": fid, "decision": "r_result_rejected_no_edit",
-                        "changes": len(plan["changes"]),
-                    })
-                    _rerun_cleaning_fragment()
+                            with st.form(f"review_execute_r_{fid}_{_active_agent_c_control_generation(fid)}"):
+                                # Only the first approval asks for an identifier. It
+                                # appears beside the approval button so researchers
+                                # never have to scroll back to the top of a long page.
+                                reviewer_for_approval = (
+                                    st.session_state.get("cleaning_approved_reviewer") or ""
+                                )
+                                if reviewer_for_approval:
+                                    st.caption("Reviewer: " + reviewer_for_approval)
+                                elif hasattr(st, "text_input"):
+                                    reviewer_for_approval = st.text_input(
+                                        "Reviewer identifier (required once for this investigation)",
+                                        # More than one finding may have a pending
+                                        # cell-edit approval form in the same render.
+                                        # The investigation key alone is shared by
+                                        # every finding and raises DuplicateElementKey.
+                                        key=f"cleaning_reviewer_once_{session_context}_{fid}",
+                                        max_chars=120,
+                                    )
+                                yes_col, no_col = st.columns(2)
+                                with yes_col:
+                                    execute = st.form_submit_button(
+                                        "Yes — Approve & Execute", disabled=not can_approve,
+                                        key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_cells")
+                                with no_col:
+                                    decline_cells = st.form_submit_button(
+                                        "No — Discuss Another Idea",
+                                        key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_cells")
+                            if decline_cells:
+                                _open_agent_c_alternative_chat(fid, discard_plan=True)
+                                _rerun_cleaning_fragment(fid)
+                            if execute:
+                                reviewer = str(reviewer_for_approval or "").strip()
+                                if not reviewer:
+                                    st.error("Enter your reviewer identifier in the field directly "
+                                             "above the approval button. This is required only once.")
+                                elif not can_approve or review is None or insertion is None:
+                                    st.error("Recheck the current data and any conflicts before approval.")
+                                else:
+                                    try:
+                                        # Revalidate the staged version at the instant
+                                        # approval is processed. The R proof is bound
+                                        # to the same current staged SHA-256.
+                                        fresh_staged = st.session_state.cleaning_staged_bytes_by_dataset.get(
+                                            ds_id, original_bytes)
+                                        if review["staged_sha256"] != hashlib.sha256(
+                                                fresh_staged).hexdigest():
+                                            raise PermissionError("Another finding changed the staged "
+                                                                  "data since review; inspect it again")
+                                        new_bytes, result = apply_verified_in_memory(
+                                            original_bytes, fresh_staged, insertion, reviewer=reviewer,
+                                            approved_rebase=approved_rebase,
+                                        )
+                                        r_info = {k: v for k, v in prepared["r_result"].items()
+                                                  if k != "verified_output_csv"}
+                                        result["r_preview_execution"] = r_info
+                                        result["r_insertion_code_sha256"] = hashlib.sha256(
+                                            prepared["insertion_r_function"].encode("utf-8")).hexdigest()
+                                        # Commit session bytes and audit records only
+                                        # after all verification has succeeded.
+                                        st.session_state.cleaning_staged_bytes_by_dataset[ds_id] = new_bytes
+                                        st.session_state.cleaning_approved_reviewer = reviewer
+                                        # Retain the exact reviewed R artifacts only in
+                                        # session memory for audit display after completion.
+                                        st.session_state.cleaning_completed_audits_by_finding[fid] = {
+                                            "r_function": prepared["r_function"],
+                                            "insertion_r_function": prepared["insertion_r_function"],
+                                            "changes": list(prepared["insertion_plan"]["changes"]),
+                                        }
+                                        st.session_state.cleaning_pending_gemma_b.pop(fid, None)
+                                        st.session_state.cleaning_history.append({
+                                            "dataset_id": ds_id, "finding_id": fid,
+                                            "finding": finding["title"], "operation": insertion["operation"],
+                                            "changes": result["changes_applied"],
+                                            "already_resolved": result["already_resolved"],
+                                            "conflicts_overridden": result["conflicts_overridden"],
+                                            "reviewer": reviewer, "storage": "session_memory",
+                                            "modified_positions": [
+                                                {"csv_row": item["csv_row"], "column": item["column"]}
+                                                for item in review["ready_to_apply"] + (
+                                                    review["conflicts"] if approved_rebase else [])
+                                            ],
+                                            "approved_cell_changes": [
+                                                {"row": item["csv_row"], "column": item["column"],
+                                                 "before": item["current"], "after": item["proposed"]}
+                                                for item in review["ready_to_apply"] + (
+                                                    review["conflicts"] if approved_rebase else [])
+                                            ],
+                                            "source_sha256": insertion["source_sha256"],
+                                            "staged_sha256": result["staged_sha256"],
+                                            "r_code_sha256": r_info["r_code_sha256"],
+                                        })
+                                        if result["changes_applied"]:
+                                            st.session_state.cleaning_review_statuses[fid] = "Applied and verified"
+                                        else:
+                                            st.session_state.cleaning_review_statuses[fid] = (
+                                                "Resolved by earlier approved edit")
+                                        st.session_state.cleaning_decisions.append({
+                                            "finding_id": fid,
+                                            "decision": ("verified_r_result_staged_in_memory"
+                                                         if result["changes_applied"] else
+                                                         "already_resolved_by_prior_verified_edit"),
+                                            "r_result_sha256": r_info["verified_output_sha256"],
+                                            "staged_sha256": result["staged_sha256"],
+                                        })
+                                        for other in catalog:
+                                            if other.get("dataset_id") == ds_id:
+                                                other_id = other["id"]
+                                                # An edit in one finding invalidates
+                                                # cached R/current-state previews,
+                                                # NOT another finding's approved-
+                                                # evidence proposal or pending group.
+                                                # Those remain visible and are
+                                                # rechecked against fresh staged
+                                                # values at their final approval.
+                                                if other_id != fid:
+                                                    for key in (
+                                                        "cleaning_r_previews_by_finding",
+                                                        "cleaning_r_errors_by_finding",
+                                                        "cleaning_r_diagnostics_by_finding",
+                                                        "cleaning_r_selfchecks_by_finding",
+                                                        "cleaning_rebased_previews_by_finding",
+                                                        "cleaning_compound_previews_by_finding",
+                                                    ):
+                                                        st.session_state.setdefault(key, {}).pop(other_id, None)
+                                        _advance_agent_c_batch(fid)
+                                        _remember_approved_agent_c_solution(fid, finding, source)
+                                        _rerun_cleaning_fragment(fid)
+                                    except (OSError, ValueError, PermissionError, AssertionError,
+                                            RuntimeError, csv.Error, KeyError) as exc:
+                                        st.error(f"In-memory insertion failed; no changes were staged: {exc}")
 
             if (not plan and not applied and not b_pending and not remaining_batch and
                     st.session_state.cleaning_review_statuses.get(fid) != "Reviewed — no change" and
-                    st.button("Mark reviewed — no change required now",
+                    st.button("Mark reviewed (no change)",
                               key=f"review_no_action_{fid}")):
                 st.session_state.cleaning_review_statuses[fid] = "Reviewed — no change"
                 st.session_state.cleaning_decisions.append({
                     "finding_id": fid, "decision": "no_change_authorized_or_executed",
                 })
-                _rerun_cleaning_fragment()
+                if source:
+                    from healthcare_data_quality.interaction_memory import save_reviewed_solution
+                    try:
+                        save_reviewed_solution(
+                            finding, source, decision="reviewed_no_change",
+                            user_request="Mark reviewed — no change required now",
+                        )
+                    except (OSError, ValueError, UnicodeError) as exc:
+                        st.warning(f"Review completed, but memory could not be saved: {exc}")
+                _rerun_cleaning_fragment(fid)
 
 
-    # This is deliberately the ONLY cleaned-data download control in this
-    # workspace. Finalize all QC/Gemma findings AND zero-issue checks first.
-    st.markdown("---")
-    st.markdown("### Final cleaned dataset")
-    reviewed, total = review_completion(catalog, st.session_state.cleaning_review_statuses)
-    st.caption(f"{reviewed} of {total} findings/checks reviewed · "
-               f"{len(history_all)} verified edit(s) staged in session memory")
-    investigation_running = bool(audit.get("partial"))
-    if run_id:
-        current_run = investigation_manager().snapshot(run_id)
-        investigation_running = investigation_running or bool(
-            current_run and current_run.get("status") == "running")
-        from exploration_jobs import exploration_manager
-        exploration_state = exploration_manager().snapshot(run_id)
-        investigation_running = investigation_running or bool(
-            exploration_state and exploration_state.get("status") == "running")
-    recommendation_entries = ((state or {}).get("entries") or {})
-    recommendations_running = any(
-        item.get("status") in {"running", "pending"}
-        for item in recommendation_entries.values() if isinstance(item, dict))
-    if reviewed != total or investigation_running or recommendations_running:
-        pending_reasons = []
-        if reviewed != total:
-            pending_reasons.append(f"review the remaining {total - reviewed} finding(s)/check(s)")
-        if investigation_running:
-            pending_reasons.append("finish the investigation")
-        if recommendations_running:
-            pending_reasons.append("finish Agent B's recommendations")
-        st.info("Final download unlocks when you " + ", ".join(pending_reasons) + ".")
+    # Offer one concise download at every stage. Export contains only changes
+    # that have passed explicit approval and final source verification; pending
+    # suggestions/discussions are never applied. The original upload remains
+    # untouched. The same exact row/column conflict safeguards still run.
+    try:
+        datasets_for_download = []
+        for i, file in enumerate(uploaded):
+            ds_id = f"dataset_{i+1}"
+            staged_bytes = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id)
+            original = dataset_paths[i].read_bytes()
+            data = staged_bytes if staged_bytes is not None else original
+            row_approvals = st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, [])
+            data = apply_approved_row_operations(original, data, row_approvals)
+            approvals = st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
+            data = apply_approved_column_deletions(
+                original, data, approvals,
+                approved_row_operations=row_approvals,
+                staged_before_rows=staged_bytes if staged_bytes is not None else original)
+            datasets_for_download.append((ds_id, file.name, data))
+        file_name, mime, data = build_final_download(datasets_for_download)
+    except (ValueError, PermissionError, AssertionError, OSError, csv.Error) as exc:
+        st.error(f"Download unavailable: {exc}")
     else:
-        try:
-            datasets_for_download = []
-            for i, file in enumerate(uploaded):
-                ds_id = f"dataset_{i+1}"
-                staged_bytes = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id)
-                original = dataset_paths[i].read_bytes()
-                data = staged_bytes if staged_bytes is not None else original
-                approvals = st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
-                data = apply_approved_column_deletions(original, data, approvals)
-                datasets_for_download.append((ds_id, file.name, data))
-            file_name, mime, data = build_final_download(datasets_for_download)
-        except (ValueError, PermissionError, AssertionError, OSError, csv.Error) as exc:
-            st.error(f"Final in-memory dataset could not be verified: {exc}")
-        else:
-            if hasattr(st, "download_button"):
-                st.download_button(
-                    "Download final cleaned dataset" if len(uploaded) == 1
-                    else "Download final cleaned datasets (ZIP)",
-                    data=data, file_name=file_name, mime=mime,
-                    key=f"cleaning_download_final_{session_context}",
-                )
-            st.caption("Download now: staged changes exist only in this browser session. "
-                       "A refresh or server restart may discard them. No working CSV was saved.")
-    if history_all:
-        with st.expander("Approved in-memory changes and reviewer decisions", expanded=False):
-            if hasattr(st, "dataframe"):
-                st.dataframe(pd.DataFrame(history_all), hide_index=True, width="stretch")
-                if st.session_state.cleaning_decisions:
-                    st.dataframe(pd.DataFrame(st.session_state.cleaning_decisions),
-                                 hide_index=True, width="stretch")
-            else:
-                st.write(history_all)
+        if hasattr(st, "download_button"):
+            st.download_button(
+                "Download cleaned CSV" if len(uploaded) == 1
+                else "Download cleaned datasets (ZIP)",
+                data=data, file_name=file_name, mime=mime,
+                key=f"cleaning_download_final_{session_context}",
+            )
 
 
 def _prepare_finding_discussion(
@@ -2225,19 +3236,38 @@ def _prepare_finding_discussion(
         raise ValueError("Enter between 1 and 4,000 characters")
     thread.append({"role": "user", "content": question,
                    **({"automatic": True} if automatic else {})})
+    st.session_state.cleaning_review_statuses[fid] = "Discussion open"
     st.session_state.cleaning_plans_by_finding.pop(fid, None)
+    st.session_state.setdefault("cleaning_compound_previews_by_finding", {}).pop(fid, None)
+    st.session_state.setdefault("cleaning_explicit_row_deletions_by_finding", {}).pop(fid, None)
+    st.session_state.setdefault("cleaning_explicit_column_deletions_by_finding", {}).pop(fid, None)
+    st.session_state.setdefault("cleaning_memory_candidates", {}).pop(fid, None)
     st.session_state.setdefault("cleaning_batch_queue_by_finding", {}).pop(fid, None)
     st.session_state.setdefault("cleaning_batch_total_by_finding", {}).pop(fid, None)
     st.session_state.cleaning_r_previews_by_finding.pop(fid, None)
     st.session_state.cleaning_r_errors_by_finding.pop(fid, None)
     st.session_state.cleaning_r_diagnostics_by_finding.pop(fid, None)
     st.session_state.cleaning_r_selfchecks_by_finding.pop(fid, None)
+    from healthcare_data_quality.evidence_registry import (
+        build_finding_registry, verify_finding_registry, prompt_evidence,
+    )
+    registry = (verify_finding_registry(finding, source, enforce_source_hash=True) if source else None)
+    if source and registry is None:
+        try:
+            registry = build_finding_registry(finding, source)
+        except (OSError, ValueError, UnicodeError, csv.Error) as exc:
+            registry = None
+            # It remains possible to discuss a malformed file, but no source
+            # totals can be presented as verified until the CSV is parseable.
+            finding = {**finding, "evidence_registry_error": str(exc)}
     scoped = {"finding_id": fid, "dataset_id": ds_id,
               "title": finding["title"], "source": finding["source"],
               "method": finding.get("method"), "evidence": evidence[:32],
               "allowed_cell_positions": sorted(valid_cells)[:64],
               "allowed_header_positions": sorted(valid_headers),
               "all_affected_positions_count": len(valid_cells),
+              "verified_evidence_registry": prompt_evidence(registry) if registry else None,
+              "evidence_registry_unavailable": finding.get("evidence_registry_error"),
               "latest_working_version": bool(st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id))}
     recommendation = st.session_state.cleaning_recommendations.get(fid)
     if recommendation:
@@ -2273,6 +3303,10 @@ def _prepare_finding_discussion(
         scoped["latest_staged_sha256"] = sha256_bytes(staged_bytes)
         scoped["latest_working_version"] = staged_bytes != original_bytes
         headers = original_records[0]
+        # Source-wide counts prevent the model from extrapolating from one
+        # example (e.g. assuming taxonomy NA only appears in CSV Row 2).
+        trusted_inventory = source_inventory(source)
+        scoped["full_source_inventory"] = concise_source_context(trusted_inventory)
         metadata = [{"dataset_id": ds_id, "name": uploaded[index].name,
                      "columns": [{"position": i + 1, "header": h,
                                   "current_header": current_records[0][i]}
@@ -2326,6 +3360,157 @@ def _normalize_agent_c_current_before_values(response: dict, finding: dict,
     return {**response, "changes": normalized}
 
 
+def _render_compound_approval(fid: str, finding: dict, source: Path,
+                              ds_id: str, catalog: list[dict]) -> None:
+    """One atomic review/approval for all actions in one Agent C request."""
+    from healthcare_data_quality.compound_approval import (
+        describe_operation, evaluate_compound, proposal_digest,
+    )
+    from healthcare_data_quality.in_memory_cleaning import sha256_bytes
+
+    plans = [st.session_state.cleaning_plans_by_finding[fid],
+             *st.session_state.cleaning_batch_queue_by_finding.get(fid, [])]
+    original = source.read_bytes()
+    staged = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id, original)
+    current_cols = st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
+    current_rows = st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, [])
+    digest = proposal_digest(plans, original, staged, current_cols, current_rows)
+    cache_map = st.session_state.setdefault("cleaning_compound_previews_by_finding", {})
+    preview = cache_map.get(fid)
+    preview_error = (preview.get("_error") if preview and preview.get("digest") == digest
+                     else None)
+    if not preview or preview.get("digest") != digest:
+        try:
+            preview = evaluate_compound(
+                plans, finding, source, staged, current_cols, current_rows,
+                requested_rows=st.session_state.cleaning_explicit_row_deletions_by_finding.get(fid),
+                requested_columns=st.session_state.cleaning_explicit_column_deletions_by_finding.get(fid),
+            )
+            cache_map[fid] = preview
+        except (OSError, ValueError, PermissionError, RuntimeError, AssertionError,
+                IndexError, KeyError, csv.Error) as exc:
+            preview_error = str(exc)
+            cache_map[fid] = {"digest": digest, "_error": preview_error}
+            preview = None
+    if preview_error:
+        preview = None
+
+    with st.container(border=True):
+        _render_before_after(plans)
+        if preview_error:
+            st.error(f"Review blocked: {preview_error}")
+            if st.button("Retry verification", key=f"review_compound_retry_{fid}_{_active_agent_c_control_generation(fid)}"):
+                cache_map.pop(fid, None)
+                _rerun_cleaning_fragment(fid)
+        elif preview:
+            if not _render_source_deletion_details(
+                    source, plans, key=f"group_{fid}"):
+                preview = None
+        with st.form(f"review_compound_{fid}_{_active_agent_c_control_generation(fid)}"):
+            reviewer = st.session_state.get("cleaning_approved_reviewer") or ""
+            if reviewer:
+                st.caption(f"Reviewer: {reviewer}")
+            else:
+                reviewer = st.text_input("Reviewer", max_chars=120,
+                                         key=f"review_compound_reviewer_{fid}")
+            approve_col, reject_col = st.columns(2)
+            with approve_col:
+                approve = st.form_submit_button(
+                    "Yes — Approve & Execute", disabled=preview is None,
+                    key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_compound")
+            with reject_col:
+                reject = st.form_submit_button(
+                    "No — Discuss Another Idea",
+                    key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_compound")
+
+        if reject:
+            # Reject only the pending group. Do not submit a Gemma request.
+            _open_agent_c_alternative_chat(fid, discard_plan=True)
+            st.session_state.cleaning_decisions.append({
+                "finding_id": fid, "decision": "compound_plan_rejected_no_change",
+                "operations": len(plans),
+            })
+            _rerun_cleaning_fragment(fid)
+
+        if approve:
+            reviewer = str(reviewer or "").strip()
+            if not reviewer:
+                st.error("Enter a reviewer identifier.")
+            elif preview is None:
+                st.error("The proposal needs a valid preview.")
+            else:
+                try:
+                    # Revalidate EVERY operation at the moment of approval.
+                    # Reuse only the independently verified R outputs, not
+                    # cached decisions or the model's unverified claims.
+                    approved = evaluate_compound(
+                        plans, finding, source,
+                        st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id, original),
+                        st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, []),
+                        st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, []),
+                        reviewer=reviewer,
+                        requested_rows=st.session_state.cleaning_explicit_row_deletions_by_finding.get(fid),
+                        requested_columns=st.session_state.cleaning_explicit_column_deletions_by_finding.get(fid),
+                        r_previews=preview["r_previews"],
+                    )
+                    if (approved["digest"] != digest
+                            or approved["export_sha256"] != preview["export_sha256"]):
+                        raise PermissionError("Dataset changed; review the proposal again")
+                    history_entries = []
+                    for event in approved["events"]:
+                        history_entries.append({
+                            **event,
+                            "dataset_id": ds_id, "finding_id": fid,
+                            "finding": finding["title"],
+                            "reviewer": reviewer,
+                            "source_sha256": approved["original_sha256"],
+                            "staged_sha256": sha256_bytes(approved["staged_after"]),
+                            "storage": ("session_memory_export_only" if event["operation"] in
+                                        {"drop_column", "merge_rows", "drop_rows"}
+                                        else "session_memory"),
+                            "approval_group": digest[:16],
+                        })
+                    # No state is touched until the complete proposal and
+                    # export have passed verification. This is one commit.
+                    st.session_state.cleaning_staged_bytes_by_dataset[ds_id] = approved["staged_after"]
+                    st.session_state.cleaning_approved_columns_by_dataset[ds_id] = approved["columns_after"]
+                    st.session_state.cleaning_approved_rows_by_dataset[ds_id] = approved["rows_after"]
+                    st.session_state.cleaning_history.extend(history_entries)
+                    st.session_state.cleaning_approved_reviewer = reviewer
+                    st.session_state.cleaning_review_statuses[fid] = "Applied and verified"
+                    st.session_state.cleaning_decisions.append({
+                        "finding_id": fid, "decision": "compound_plan_approved_atomically",
+                        "operations": len(plans), "approval_group": digest[:16],
+                        "source_sha256": approved["original_sha256"],
+                        "export_sha256": approved["export_sha256"],
+                    })
+                    # Retain the audited R proof and history without requiring
+                    # a second confirmation for the structural operations.
+                    proofs = approved["r_previews"].values()
+                    st.session_state.cleaning_completed_audits_by_finding[fid] = {
+                        "r_function": "\n\n".join(p["r_function"] for p in proofs),
+                        "insertion_r_function": "\n\n".join(
+                            p["insertion_r_function"] for p in approved["r_previews"].values()),
+                        "changes": [c for p in plans for c in p["changes"]],
+                    }
+                    for key in (
+                        "cleaning_plans_by_finding", "cleaning_batch_queue_by_finding",
+                        "cleaning_batch_total_by_finding", "cleaning_compound_previews_by_finding",
+                        "cleaning_r_previews_by_finding", "cleaning_r_errors_by_finding",
+                        "cleaning_explicit_row_deletions_by_finding",
+                        "cleaning_explicit_column_deletions_by_finding",
+                    ):
+                        st.session_state.setdefault(key, {}).pop(fid, None)
+                    st.session_state.cleaning_discussion_mode_by_finding.pop(fid, None)
+                    # Save memory only after approval. Its failure must not
+                    # roll back a valid, already-committed transaction.
+                    _remember_approved_agent_c_solution(fid, finding, source)
+                    _rerun_cleaning_fragment(fid)
+                except (OSError, ValueError, PermissionError, RuntimeError,
+                        AssertionError, IndexError, KeyError, csv.Error) as exc:
+                    st.error(f"Nothing was staged: {exc}")
+
+
 def _advance_agent_c_batch(fid: str) -> None:
     """Only after explicit approval, expose the next independently checked action."""
     queue = st.session_state.setdefault("cleaning_batch_queue_by_finding", {}).get(fid, [])
@@ -2338,11 +3523,20 @@ def _advance_agent_c_batch(fid: str) -> None:
                       "cleaning_rebased_previews_by_finding"):
             st.session_state.setdefault(field, {}).pop(fid, None)
     else:
+        st.session_state.setdefault("cleaning_plans_by_finding", {}).pop(fid, None)
         st.session_state.setdefault("cleaning_batch_queue_by_finding", {}).pop(fid, None)
         st.session_state.setdefault("cleaning_batch_total_by_finding", {}).pop(fid, None)
+        # Final approval closes discussion for this finding. A new chat must
+        # be explicitly reopened via the completed audit's Revise control.
+        st.session_state.setdefault("cleaning_discussion_mode_by_finding", {}).pop(fid, None)
 
 
 def _cancel_agent_c_batch(fid: str, *, status: str) -> None:
+    _next_agent_c_ui_generation(fid)
+    # A rejected proposal must never later be remembered as approved.
+    st.session_state.setdefault("cleaning_memory_candidates", {}).pop(fid, None)
+    st.session_state.setdefault("cleaning_explicit_column_deletions_by_finding", {}).pop(fid, None)
+    st.session_state.setdefault("cleaning_reviewed_rule_context_by_finding", {}).pop(fid, None)
     """Reject current AND unapproved queued actions without undoing approvals."""
     st.session_state.cleaning_plans_by_finding.pop(fid, None)
     st.session_state.setdefault("cleaning_batch_queue_by_finding", {}).pop(fid, None)
@@ -2358,6 +3552,37 @@ def _cancel_agent_c_batch(fid: str, *, status: str) -> None:
     })
 
 
+def _remember_approved_agent_c_solution(fid: str, finding: dict,
+                                         source: Path | None) -> None:
+    """Write persistent history only after every plan received human approval.
+
+    Memory failures must not roll back an already verified and staged edit.
+    """
+    candidate = st.session_state.setdefault("cleaning_memory_candidates", {}).get(fid)
+    if not candidate or source is None:
+        return
+    if (st.session_state.cleaning_plans_by_finding.get(fid)
+            or st.session_state.cleaning_batch_queue_by_finding.get(fid)):
+        return
+    approvals = [item for item in st.session_state.cleaning_history
+                 if item.get("finding_id") == fid]
+    if len(approvals) - candidate["approvals_before"] < len(candidate["operations"]):
+        return
+    try:
+        from healthcare_data_quality.interaction_memory import save_reviewed_solution
+        if file_sha256(source) != candidate["source_sha256"]:
+            raise ValueError("The source changed since the review proposal")
+        from healthcare_data_quality.reviewed_rule_replay import annotate_source_headers
+        save_reviewed_solution(
+            finding, source, operations=annotate_source_headers(candidate["operations"], source),
+            decision="approved_edit", user_request=candidate["user_request"],
+            agent_response=candidate["agent_response"],
+        )
+        st.session_state.cleaning_memory_candidates.pop(fid, None)
+    except (OSError, ValueError, TypeError, UnicodeError) as exc:
+        st.warning(f"Edit approved, but its reusable review memory could not be saved: {exc}")
+
+
 def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
                              response: dict) -> None:
     """Validate EVERY requested operation before queueing any for human review.
@@ -2365,18 +3590,52 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
     Multiple operations are independent plans. Approval of the first never
     silently discards the second, and no action executes at proposal time.
     """
-    from healthcare_data_quality.finding_cleaning import expand_uniform_evidence_plan
-    if any(event.get("finding_id") == fid
-           for event in st.session_state.get("cleaning_history", [])):
-        # A late completion must never reopen an already-approved finding.
+    from healthcare_data_quality.finding_cleaning import (
+        expand_uniform_evidence_plan, explicitly_requested_row_deletions,
+        requested_blank_row_scope,
+    )
+    # A delayed completion cannot reactivate a terminal finding. An explicit
+    # new request first moves the finding back into discussion state.
+    if st.session_state.get("cleaning_review_statuses", {}).get(fid) in {
+        "Applied and verified", "Resolved by earlier approved edit",
+        "Approved column deletion for final export",
+        "Approved row changes for final export",
+        "Partially approved — remaining action rejected", "Reviewed — no change",
+    }:
         return
+    st.session_state.setdefault("cleaning_compound_previews_by_finding", {}).pop(fid, None)
     thread = st.session_state.cleaning_messages_by_finding.setdefault(fid, [])
-    reply = str(response["reply"])
+    from healthcare_data_quality.cleaning_workspace import concise_agent_c_reply
+    reply = concise_agent_c_reply(str(response["reply"]))
+    if source:
+        from healthcare_data_quality.evidence_registry import (
+            build_finding_registry, evidence_bound_response,
+        )
+        try:
+            verified_evidence = build_finding_registry(finding, source)
+        except (OSError, ValueError, UnicodeError, csv.Error):
+            verified_evidence = None
+        reply = evidence_bound_response(reply, verified_evidence)
     proposals = response.get("operations") or []
     if not proposals and response.get("operation") != "none":
         proposals = [{"operation": response["operation"],
                       "dataset_id": response["dataset_id"],
                       "changes": response["changes"]}]
+    # Clarification must precede proposing edits. Some model responses
+    # mistakenly contain BOTH a two-choice question and provisional plans.
+    # Never queue those plans while the researcher has not chosen a scope.
+    choices = agent_c_clarification_options(
+        reply, response.get("clarification_options"))
+    _next_agent_c_ui_generation(fid)
+    if choices:
+        st.session_state.cleaning_plans_by_finding.pop(fid, None)
+        st.session_state.setdefault("cleaning_batch_queue_by_finding", {}).pop(fid, None)
+        st.session_state.setdefault("cleaning_batch_total_by_finding", {}).pop(fid, None)
+        st.session_state.setdefault("cleaning_memory_candidates", {}).pop(fid, None)
+        st.session_state.cleaning_review_statuses[fid] = "Clarification required"
+        thread.append({"role": "assistant", "content": reply,
+                       "clarification_options": choices})
+        return
     if not proposals:
         st.session_state.cleaning_review_statuses[fid] = "Discussion updated"
         choices = agent_c_clarification_options(
@@ -2390,10 +3649,9 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
     try:
         if not source:
             raise ValueError("No attributable dataset is available")
-        if len(proposals) > 4:
-            raise ValueError("At most four operations may be reviewed together")
+        if len(proposals) > 16:
+            raise ValueError("At most 16 operations can be verified in one batch")
         verified_plans = []
-        seen_types = set()
         recommendation = st.session_state.get("cleaning_recommendations", {}).get(fid) or {}
         full_scope_action = str(recommendation.get("suggestion") or "")
         accepted_full_scope = (
@@ -2401,61 +3659,101 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
             and any(word in full_scope_action.casefold().split()
                     for word in ("all", "every", "entire"))
         )
+        recent_user_messages = [str(item.get("content") or "") for item in thread
+                                if item.get("role") == "user" and not item.get("automatic")]
+        latest_explicit_user = recent_user_messages[-1] if recent_user_messages else ""
+        explicit_row_ids = explicitly_requested_row_deletions(latest_explicit_user)
+        # A brief answer to Gemma's specific-value question (e.g. "679")
+        # must not erase the user's prior, explicitly confirmed row deletion.
+        # Only carry scope through a numeric continuation; never resurrect
+        # older row coordinates for an unrelated new request.
+        if (not explicit_row_ids and len(recent_user_messages) >= 2
+                and re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)",
+                                 latest_explicit_user.strip())):
+            for earlier in reversed(recent_user_messages[-5:-1]):
+                explicit_row_ids = explicitly_requested_row_deletions(earlier)
+                if explicit_row_ids:
+                    break
+        if latest_explicit_user == "Review source-verified remembered cleaning rule":
+            explicit_row_ids = st.session_state.setdefault(
+                "cleaning_explicit_row_deletions_by_finding", {}).get(fid, frozenset())
+        if source:
+            blank_row_scope = requested_blank_row_scope(latest_explicit_user, source, finding=finding)
+            if blank_row_scope is not None:
+                explicit_row_ids = blank_row_scope
+        explicit_column_ids = st.session_state.setdefault(
+            "cleaning_explicit_column_deletions_by_finding", {}).get(fid)
         expanded_total = 0
         for raw in proposals:
             if not isinstance(raw, dict):
                 raise ValueError("An operation is not a structured plan")
-            op = raw.get("operation")
-            if op in seen_types:
-                raise ValueError("Repeated operation types need separate requests")
-            seen_types.add(op)
             model_plan = _normalize_agent_c_current_before_values(raw, finding, source)
             checked, expanded_count = expand_uniform_evidence_plan(
                 model_plan, finding, source,
-                full_finding_accepted=accepted_full_scope and len(proposals) == 1)
+                full_finding_accepted=accepted_full_scope and len(proposals) == 1,
+                user_requested_rows=explicit_row_ids,
+                user_requested_columns=explicit_column_ids)
             verified_plans.append(checked)
             expanded_total += expanded_count
-        # Reject conflicting per-column requests rather than running an edit
-        # which disappears when its column is later omitted at export.
-        drop_positions = {item["position"] for p in verified_plans
-                          if p["operation"] == "drop_column"
-                          for item in p["changes"]}
-        for p in verified_plans:
-            if p["operation"] == "replace_cells" and any(
-                    item["column"] in drop_positions for item in p["changes"]):
-                raise ValueError("One plan replaces a value in a column also "
-                                 "scheduled for deletion; clarify which action to keep")
-            if p["operation"] == "rename_headers" and any(
-                    item["position"] in drop_positions for item in p["changes"]):
-                raise ValueError("One plan renames a column also scheduled for deletion")
+        # Repeating an operation TYPE is safe. Repeating a SOURCE TARGET is
+        # not: reject overlaps before the researcher can approve the group.
+        from healthcare_data_quality.compound_approval import validate_compound_targets
+        validate_compound_targets(verified_plans)
+        # Only the current real user message can authorize out-of-finding row
+        # deletion. This state is not populated from Gemma JSON or old chats.
+        row_scope = st.session_state.setdefault("cleaning_explicit_row_deletions_by_finding", {})
+        if explicit_row_ids and any(p["operation"] == "drop_rows" for p in verified_plans):
+            row_scope[fid] = explicit_row_ids
+        else:
+            row_scope.pop(fid, None)
+        # Expire all historical clarification controls when a NEW validated
+        # proposal becomes the active user interaction. Preserve chat text.
+        for past_message in thread:
+            if past_message.get("role") == "assistant":
+                past_message["controls_expired"] = True
+        for state_key in ("cleaning_custom_value_input_by_finding",
+                          "cleaning_custom_operation_input_by_finding"):
+            st.session_state.setdefault(state_key, {}).pop(fid, None)
         st.session_state.cleaning_plans_by_finding[fid] = verified_plans[0]
         remaining = verified_plans[1:]
         st.session_state.setdefault("cleaning_batch_queue_by_finding", {})[fid] = remaining
         st.session_state.setdefault("cleaning_batch_total_by_finding", {})[fid] = len(verified_plans)
         st.session_state.cleaning_review_statuses[fid] = "Exact plan awaiting approval"
-        if expanded_total:
-            first = verified_plans[0]
-            reply += (f"\n\nThe independently verified evidence expands the uniform "
-                      f"correction to all {len(first['changes'])} affected cells "
-                      f"({expanded_total} additional coordinates).")
-        if len(verified_plans) > 1:
-            summary = "; ".join(
-                f"{idx}. {p['operation']} ({len(p['changes'])} change(s))"
-                for idx, p in enumerate(verified_plans, 1))
-            reply += ("\n\nBoth operations independently validated and queued: "
-                      + summary + ". Review and approve each in sequence; "
-                      "neither has been applied yet.")
-        else:
-            reply += ("\n\nA validated, finding-scoped edit plan is ready to inspect. "
-                      "No changes have been applied.")
+        from healthcare_data_quality.cleaning_authorization import file_sha256
+        latest_user = next((str(item.get("content") or "") for item in reversed(thread)
+                            if item.get("role") == "user" and not item.get("automatic")), "")
+        if not latest_user or latest_user == "Review source-verified remembered cleaning rule":
+            # The assessment request was automatic: retain the method rationale
+            # only in the eventual memory entry, after a fresh human approval.
+            latest_user = st.session_state.setdefault(
+                "cleaning_reviewed_rule_context_by_finding", {}).get(fid, {}).get(
+                "user_request") or latest_user
+        if latest_user.startswith("I accept Agent B's action") and full_scope_action:
+            # The actual reviewed action is more useful than the long,
+            # generic drafting authorization for future recall.
+            latest_user = full_scope_action
+        st.session_state.setdefault("cleaning_memory_candidates", {})[fid] = {
+            "operations": verified_plans,
+            "approvals_before": sum(h.get("finding_id") == fid for h in
+                                    st.session_state.cleaning_history),
+            "user_request": latest_user,
+            "agent_response": reply,
+            "source_sha256": file_sha256(source),
+        }
+        from healthcare_data_quality.compound_approval import describe_operation
+        summary = "\n".join(
+            f"{index}. {describe_operation(item)}"
+            for index, item in enumerate(verified_plans, start=1)
+        )
+        reply = summary + "\nReview below to approve or reject."
     except (ValueError, KeyError, csv.Error, TypeError) as exc:
         st.session_state.cleaning_plans_by_finding.pop(fid, None)
         st.session_state.setdefault("cleaning_batch_queue_by_finding", {}).pop(fid, None)
         st.session_state.setdefault("cleaning_batch_total_by_finding", {}).pop(fid, None)
         st.session_state.cleaning_review_statuses[fid] = "Plan validation failed"
-        reply += ("\n\nThe requested edit plan was rejected by the "
-                  "independent scope validator: " + str(exc)
-                  + ". No partial batch was queued and no data was changed.")
+        st.session_state.setdefault("cleaning_explicit_row_deletions_by_finding", {}).pop(fid, None)
+        st.session_state.setdefault("cleaning_memory_candidates", {}).pop(fid, None)
+        reply = f"Proposal not ready: {exc}. No changes made."
     thread.append({"role": "assistant", "content": reply})
 
 
@@ -2514,35 +3812,103 @@ def _finished_background_agents_for_review() -> tuple[bool, bool]:
 
 def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: list,
                                dataset_paths: list[Path], question: str, *,
-                               automatic: bool = False) -> None:
-    """Show the submitted question now, then let Agent C answer in a worker."""
+                               automatic: bool = False,
+                               require_gemma_review: bool = False) -> None:
+    """Show the submitted question now, then let Agent C answer in a worker.
+
+    Cross-dataset remembered approaches must go through actual model review;
+    text describing an old edit is not a fresh user deletion instruction.
+    """
     from interactive_chat_jobs import interactive_chat_manager
     from healthcare_data_quality.cleaning_authorization import file_sha256
     fid = finding["id"]
-    if fid not in st.session_state.get("cleaning_recommendations", {}):
-        raise ValueError("Agent C requires Agent B's saved suggestion for this finding")
+    # An explicit direct discussion is valid even when Agent B's background
+    # recommendation is missing or failed. Treat the finding's verified source
+    # evidence as context; NEVER fabricate an Agent B suggestion to pass a gate.
+    # Accepted-agent-B actions still require an actual recommendation.
+    if (fid not in st.session_state.get("cleaning_recommendations", {})
+            and st.session_state.cleaning_discussion_mode_by_finding.get(fid)
+                != "alternative"):
+        raise ValueError("Choose an Agent B suggestion or start a direct Agent C discussion")
     if fid in st.session_state.cleaning_pending_gemma_b:
         return
     st.session_state.setdefault("cleaning_completed_gemma", {}).pop(fid, None)
+    _next_agent_c_ui_generation(fid)
     fid, thread, old_thread, scoped, metadata = _prepare_finding_discussion(
         finding, source, uploaded, dataset_paths, question, automatic=automatic)
     try:
-        # For large, uniform, evidence-backed edits, never ask Gemma to emit
-        # hundreds of per-cell JSON changes. Host expands the explicit user's
-        # instruction deterministically, then the normal R preview and final
-        # human approval gates still run unchanged.
-        from healthcare_data_quality.finding_cleaning import propose_evidenced_blank_fill
-        recommendation = st.session_state.get("cleaning_recommendations", {}).get(fid) or {}
-        bulk = (propose_evidenced_blank_fill(
-            question, str(recommendation.get("suggestion") or ""), finding, source,
-            accepted_recommendation=(
-                st.session_state.cleaning_discussion_mode_by_finding.get(fid) == "accepted"
-                and question.startswith("I accept Agent B's action for this finding")
-            ),
-        ) if source else None)
-        if bulk is not None:
-            _record_gemma_b_response(fid, finding, source, bulk)
-            return
+        # Resolve the explicit absolute-value button immediately from the
+        # finding's immutable source evidence. No Gemma queue/GPU time is
+        # needed; _record_gemma_b_response still enforces scoped validation
+        # and the independent R / human-approval workflow.
+        if not require_gemma_review:
+            from healthcare_data_quality.finding_cleaning import (
+                propose_explicit_user_row_deletion, propose_bulk_blank_row_deletion,
+            )
+            if (source and question.strip().casefold() in {
+                    "fix", "fix it", "ok", "yes", "correct it", "standardize", "standardise"}):
+                from healthcare_data_quality.direct_actions import (
+                    draft_format_correction, draft_identical_column_removal)
+                direct = (draft_identical_column_removal(finding, source)
+                          if finding.get("check_key") == "compare_repeated_headers"
+                          else draft_format_correction(finding, source))
+                if direct is not None:
+                    _record_gemma_b_response(fid, finding, source, direct)
+                    return
+            # A global user-specified condition must be evaluated over the whole
+            # original CSV by Python, not guessed from the selected finding's
+            # representative evidence or emitted as hundreds of Gemma JSON edits.
+            bulk_row_plan = (propose_bulk_blank_row_deletion(question, finding, source)
+                             if source else None)
+            if bulk_row_plan is not None:
+                _record_gemma_b_response(fid, finding, source, bulk_row_plan)
+                return
+            # Typed 'approval' is not authorization: the prepared proposal always
+            # has a dedicated form button after full validation.
+            if question.strip().casefold() in {
+                "approval", "approve", "approved", "i approve", "yes approve",
+            }:
+                thread.append({"role": "assistant", "content":
+                               "Use Approve on the validated proposal. No edit was staged."})
+                return
+            user_row_plan = (propose_explicit_user_row_deletion(question, finding, source)
+                             if source else None)
+            if user_row_plan is not None:
+                _record_gemma_b_response(fid, finding, source, user_row_plan)
+                return
+            # The reviewer supplies the desired operation, not extra scientific
+            # evidence. Match unambiguous numeric Before -> After requests to
+            # exact affected cells in the immutable original CSV. Ambiguous
+            # scope still goes to Gemma, never to an invented operation.
+            from healthcare_data_quality.finding_cleaning import (
+                propose_reviewer_cell_replacements,
+            )
+            explicit_cells = (propose_reviewer_cell_replacements(
+                question, finding, source) if source else None)
+            if explicit_cells is not None:
+                _record_gemma_b_response(fid, finding, source, explicit_cells)
+                return
+            from healthcare_data_quality.cleaning_workspace import _draft_evidenced_absolute_values
+            absolute_plan = _draft_evidenced_absolute_values(question, scoped)
+            if absolute_plan is not None:
+                _record_gemma_b_response(fid, finding, source, absolute_plan)
+                return
+            # For large, uniform, evidence-backed edits, never ask Gemma to emit
+            # hundreds of per-cell JSON changes. Host expands the explicit user's
+            # instruction deterministically, then the normal R preview and final
+            # human approval gates still run unchanged.
+            from healthcare_data_quality.finding_cleaning import propose_evidenced_blank_fill
+            recommendation = st.session_state.get("cleaning_recommendations", {}).get(fid) or {}
+            bulk = (propose_evidenced_blank_fill(
+                question, str(recommendation.get("suggestion") or ""), finding, source,
+                accepted_recommendation=(
+                    st.session_state.cleaning_discussion_mode_by_finding.get(fid) == "accepted"
+                    and question.startswith("I accept Agent B's action for this finding")
+                ),
+            ) if source else None)
+            if bulk is not None:
+                _record_gemma_b_response(fid, finding, source, bulk)
+                return
         manager = interactive_chat_manager()
         # Explicit Yes/No conversations enter one C lane. A queued job may
         # borrow a newly idle A/B later, not only at click time. This is
@@ -2564,7 +3930,7 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             a_idle, b_idle = idle_probe()
             job_id, agent = manager.submit_routed(
                 ask_gemma_about_cleaning, question, old_thread, [scoped], metadata,
-                selected_finding=scoped,
+                selected_finding=scoped, force_model=require_gemma_review,
                 agent_a_idle=a_idle, agent_b_idle=b_idle,
                 idle_probe=idle_probe,
             )
@@ -2573,10 +3939,16 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             # another role without a new explicit user request.
             job_id = manager.submit(
                 ask_gemma_about_cleaning, question, old_thread, [scoped], metadata,
-                selected_finding=scoped)
+                selected_finding=scoped, force_model=require_gemma_review)
             agent = "C"
+        from healthcare_data_quality.in_memory_cleaning import sha256_bytes
+        ds_id = finding.get("dataset_id", "")
+        original = source.read_bytes() if source else b""
+        staged = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id, original)
         st.session_state.cleaning_pending_gemma_b[fid] = {
             "job_id": job_id, "source_sha256": file_sha256(source) if source else None,
+            "staged_sha256": sha256_bytes(staged),
+            "ui_generation": _active_agent_c_control_generation(fid),
             "assigned_agent": agent,
         }
         st.session_state.cleaning_review_statuses[fid] = f"Agent {agent} replying"
@@ -2615,16 +3987,63 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
                     response = outcome["result"]
                     if not isinstance(response, dict):
                         raise ValueError("Agent C did not return a structured reply")
-                    if source and file_sha256(source) != pending_b.get("source_sha256"):
-                        # The reply may refer to a previous working file.
+                    from healthcare_data_quality.in_memory_cleaning import sha256_bytes, _records
+                    ds_id = finding.get("dataset_id", "")
+                    current = (st.session_state.cleaning_staged_bytes_by_dataset.get(
+                        ds_id, source.read_bytes()) if source else b"")
+                    # Another finding may have approved an unrelated change
+                    # while Gemma was thinking. Do not throw away useful work
+                    # merely because the staged bytes hash changed: the model
+                    # can only DRAFT a plan. Source positions, current staged
+                    # conflicts and R output are checked again on approval.
+                    # Structural changes to the coordinate-stable staged CSV
+                    # are still incompatible with an in-flight answer.
+                    coordinate_compatible = True
+                    if source and pending_b.get("staged_sha256") != sha256_bytes(current):
+                        before_records, latest_records = _records(source.read_bytes()), _records(current)
+                        coordinate_compatible = (
+                            len(before_records) == len(latest_records)
+                            and all(len(a) == len(b) for a, b in
+                                    zip(before_records, latest_records))
+                        )
+                    obsolete = (
+                        pending_b.get("ui_generation") != _active_agent_c_control_generation(fid)
+                        or not coordinate_compatible
+                        or (source and file_sha256(source) != pending_b.get("source_sha256"))
+                        or st.session_state.cleaning_review_statuses.get(fid) in {
+                            "Applied and verified", "Resolved by earlier approved edit",
+                            "Approved column deletion for final export",
+                            "Approved row changes for final export",
+                            "Partially approved — remaining action rejected", "Reviewed — no change",
+                        }
+                    )
+                    if obsolete:
+                        # Preserve terminal approval state, and never revive an old widget.
+                        if st.session_state.cleaning_review_statuses.get(fid) not in {
+                            "Applied and verified", "Resolved by earlier approved edit",
+                            "Approved column deletion for final export",
+                            "Approved row changes for final export",
+                            "Partially approved — remaining action rejected", "Reviewed — no change",
+                        }:
+                            _next_agent_c_ui_generation(fid)
+                            st.session_state.cleaning_review_statuses[fid] = "Discussion open"
                         st.session_state.cleaning_messages_by_finding[fid].append({
                             "role": "assistant", "content":
-                            "The working dataset changed while I was replying. "
-                            "Please resubmit your request against the new version. "
+                            "This reply became outdated after a review or staged-data change. "
+                            "Submit a new request against the current state. "
                             "No cleaning plan was approved or executed."})
                     else:
                         message_count = len(st.session_state.cleaning_messages_by_finding.get(fid, []))
                         _record_gemma_b_response(fid, finding, source, response)
+                        cross_review = st.session_state.setdefault(
+                            "cleaning_cross_source_review_by_finding", {}).get(fid)
+                        if cross_review and cross_review.get("source_sha256") == file_sha256(source):
+                            if (st.session_state.cleaning_plans_by_finding.get(fid)
+                                    and st.session_state.cleaning_review_statuses.get(fid)
+                                        != "Plan validation failed"):
+                                cross_review["state"] = "gemma_reviewed_and_source_validated"
+                            else:
+                                cross_review["state"] = "no_verified_proposal"
                         messages = st.session_state.cleaning_messages_by_finding.get(fid, [])
                         if (len(messages) > message_count and messages[-1].get("role") == "assistant"):
                             messages[-1]["assigned_agent"] = pending_b.get("assigned_agent", "C")
@@ -2632,6 +4051,14 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
                     st.session_state.cleaning_messages_by_finding[fid].append({
                         "role": "assistant", "content": f"Could not validate Agent C's response: {exc}"})
             else:
+                if st.session_state.cleaning_review_statuses.get(fid) not in {
+                    "Applied and verified", "Resolved by earlier approved edit",
+                    "Approved column deletion for final export",
+                    "Approved row changes for final export",
+                    "Partially approved — remaining action rejected", "Reviewed — no change",
+                }:
+                    _next_agent_c_ui_generation(fid)
+                    st.session_state.cleaning_review_statuses[fid] = "Discussion open"
                 st.session_state.cleaning_messages_by_finding[fid].append({
                     "role": "assistant", "content":
                     f"Agent C's response was interrupted ({outcome.get('error', 'worker unavailable')}). "
@@ -2952,19 +4379,19 @@ def investigation_outcome(
     backend_budget_exhausted = audit.get("status") == "incomplete_budget_exhausted"
     if (gemma_error or controller_paused or exploratory_unfinished
             or no_verified_checks or backend_budget_exhausted):
-        headline = "Investigation partially completed — review results"
+        headline = "Investigation ended — coverage incomplete"
         if gemma_error:
-            details = "Exploratory analysis was interrupted. Completed QC checks and verified Gemma results remain available."
+            details = "Exploration stopped unexpectedly; verified findings remain available."
         elif controller_paused:
-            details = "Gemma's exploration paused because it could not propose another distinct test. Further issues have not been ruled out."
+            details = "Gemma could not identify another distinct test. Other issues may remain."
         elif no_verified_checks:
-            details = "No completed and verified QC checks are recorded for this run."
+            details = "No verified checks were recorded."
         elif backend_budget_exhausted:
-            details = "The registered-tool investigation reached its execution budget with objectives still outstanding."
+            details = "Investigation reached its step limit; objectives remain open."
         else:
-            details = "A completed Gemma exploration is not available for this run. The displayed results cover only completed checks."
+            details = "Only the completed checks are available for review."
         if has_findings:
-            details += " Existing issues still need review."
+            details += " Review the findings below."
         return {"state": "partial", "headline": headline, "details": details}
 
     if has_findings:
@@ -2983,8 +4410,13 @@ def investigation_outcome(
 def gemma_completed_check_title(index: int, run: dict) -> str:
     """Identical label for a completed Gemma check in Findings and Evidence."""
     result = run.get("result") or {}
-    summary = str(result.get("summary") or "Exploratory check completed").strip()
-    title = summary.splitlines()[0].strip()[:160] or "Exploratory check completed"
+    summary = str(result.get("summary") or "").strip()
+    # Whitespace-only summaries have no splitlines()[0]. Use a safe title
+    # while retaining the completed check in the investigation audit trail.
+    title = next(
+        (line.strip()[:160] for line in summary.splitlines() if line.strip()),
+        "Exploratory check completed",
+    )
     return f"Check {index}: {title}"
 
 
@@ -3110,6 +4542,48 @@ def _status_card_visible(panel: str, run_identity: str) -> bool:
     return st.session_state.get(f"hdq_hidden_{panel}_run") != run_identity
 
 
+STATUS_CARD_AUTO_HIDE_SECONDS = 10.0
+
+
+def _status_card_auto_visible(
+    panel: str, run_identity: str, *, finished: bool, now: float | None = None,
+) -> bool:
+    """Show finished agent cards for 10 seconds, then release their layout space.
+
+    The two-second status *fragment* calls this on its own reruns, so
+    no page rerun, JavaScript timer, or change to the researcher's draft is
+    required. Each run has independent completion timers for A, B, and C.
+    A/B also support the existing immediate manual close button.
+
+    Agent C starts idle and has no finished-job event yet: leave its card
+    visible until it has actually handled a request. A subsequent request
+    immediately makes its card visible again.
+    """
+    if panel not in {"investigation", "recommendations", "agent_c"}:
+        raise ValueError("Unknown status card")
+    moment = monotonic() if now is None else now
+    state_key = f"hdq_auto_hide_{panel}"
+    state = st.session_state.get(state_key)
+    if not isinstance(state, dict) or state.get("run") != run_identity:
+        state = {"run": run_identity, "saw_work": False, "finished_at": None}
+
+    if not finished:
+        state["saw_work"] = True
+        state["finished_at"] = None
+        # A new job in this run supersedes an earlier manual dismissal.
+        if st.session_state.get(f"hdq_hidden_{panel}_run") == run_identity:
+            st.session_state.pop(f"hdq_hidden_{panel}_run", None)
+    elif panel != "agent_c" or state["saw_work"]:
+        if state["finished_at"] is None:
+            state["finished_at"] = moment
+
+    st.session_state[state_key] = state
+    if not _status_card_visible(panel, run_identity):
+        return False
+    finished_at = state["finished_at"]
+    return finished_at is None or moment - finished_at < STATUS_CARD_AUTO_HIDE_SECONDS
+
+
 
 
 def _agent_c_status_counts(recommendation_state: dict | None) -> tuple[int, int, int]:
@@ -3199,10 +4673,22 @@ def render_live_investigation_status(
             or cache_key
         )
         investigation_complete = not (registered_running or (live and live.get("status") == "running"))
-        recommendations_complete = bool(investigation_complete and recommendation_is_complete(recommendation_state))
+        # B's terminal state is independent of A's exploration: finished B
+        # may disappear while A is still running, and reappears if new work
+        # joins its recommendation queue.
+        recommendations_complete = recommendation_is_complete(recommendation_state)
+        ready, total, responding = _agent_c_status_counts(recommendation_state)
+        show_a = _status_card_auto_visible(
+            "investigation", run_identity, finished=investigation_complete,
+        )
+        show_b = _status_card_auto_visible(
+            "recommendations", run_identity, finished=recommendations_complete,
+        )
+        show_c = _status_card_auto_visible(
+            "agent_c", run_identity, finished=not bool(responding),
+        )
         def show_status_cards() -> None:
-            if (not investigation_complete
-                    or _status_card_visible("investigation", run_identity)):
+            if show_a:
                 with st.container(key="hdq_investigation_status_card"):
                     components.html(investigation_html, height=170, scrolling=False)
                     if investigation_complete:
@@ -3215,8 +4701,7 @@ def render_live_investigation_status(
                                 on_click=_hide_completed_status,
                                 args=("investigation", run_identity),
                             )
-            if (not recommendations_complete
-                    or _status_card_visible("recommendations", run_identity)):
+            if show_b:
                 with st.container(key="hdq_recommendation_status_card"):
                     components.html(render_recommendation_banner_html(recommendation_state),
                                     height=151, scrolling=False)
@@ -3231,15 +4716,15 @@ def render_live_investigation_status(
             # Agent C is on-demand: no false completion percentage and no
             # terminal-state close button. Keep it visible even when A/B are
             # dismissed; the next conversation animates this third card.
-            ready, total, responding = _agent_c_status_counts(recommendation_state)
-            with st.container(key="hdq_agent_c_status_card"):
-                components.html(
-                    render_agent_c_banner_html(
-                        ready_findings=ready, total_findings=total,
-                        active_conversations=responding, idle=not bool(ready),
-                    ),
-                    height=151, scrolling=False,
-                )
+            if show_c:
+                with st.container(key="hdq_agent_c_status_card"):
+                    components.html(
+                        render_agent_c_banner_html(
+                            ready_findings=ready, total_findings=total,
+                            active_conversations=responding, idle=not bool(ready),
+                        ),
+                        height=151, scrolling=False,
+                    )
 
         if banner_slot is not None:
             with banner_slot.container():
@@ -3251,11 +4736,29 @@ def render_live_investigation_status(
                 st.info("**" + outcome["headline"] + "** — " + outcome["details"])
             else:
                 st.warning("**" + outcome["headline"] + "** — " + outcome["details"])
-        if objective_ledger.get("completion") != "evidence_checks_resolved_only":
-            st.caption(
-                "Coverage limitation: some scientific questions, blocked objectives, "
-                "or evidence checks remain unresolved."
-            )
+        # These are THREE distinct lifecycle states. In particular, an
+        # old reviewed solution is never counted as a currently staged edit.
+        current_review_context = (f"{cache_key}:{run_id}" if run_id else cache_key)
+        if st.session_state.get("cleaning_context_key") == current_review_context:
+            staged_events = st.session_state.get("cleaning_history") or []
+            review_statuses = st.session_state.get("cleaning_review_statuses") or {}
+            no_change_reviews = sum(v == "Reviewed — no change" for v in review_statuses.values())
+            clean_summary = (f"{len(staged_events)} approved actions staged in this session"
+                             if staged_events else "No changes staged in this session")
+            if no_change_reviews:
+                clean_summary += f"; {no_change_reviews} no-change reviews"
+        else:
+            clean_summary = "No changes staged in this session"
+        if recommendation_state and (recommendation_state.get("entries") or {}):
+            count_info = recommendation_progress_counts(recommendation_state)
+            rec_summary = f"{count_info['ready']}/{count_info['total']} ready"
+        else:
+            rec_summary = "No matching recommendation status"
+        coverage_summary = ("Running" if registered_running or (live and live["status"] == "running")
+                            else "Incomplete coverage" if outcome["state"] == "partial"
+                            else "Completed checks recorded")
+        st.caption(f"Investigation: {coverage_summary}  ·  "
+                   f"Recommendations: {rec_summary}  ·  Cleaning: {clean_summary}")
         with st.expander("Investigation run status (advanced)"):
             st.write("Agent stop reason:", status)
             st.write("Objective assessment:", objective_ledger.get("completion", "unknown"))
@@ -3557,6 +5060,10 @@ def render_ui() -> None:
 
     if run_requested:
         run_id = uuid4().hex
+        # A fresh run must not inherit Streamlit's previous cleaning context,
+        # an old approval checkpoint, or the user's prior opt-in to memory.
+        st.session_state.cleaning_fresh_review_run_id = run_id
+        st.session_state.pop("cleaning_context_key", None)
         st.session_state.registered_investigation_run_id = run_id
         st.session_state.registered_investigation_context = (cache_key, fingerprint)
         # Clear prior cached audit before presenting this new read-only run.
@@ -3670,7 +5177,7 @@ def render_ui() -> None:
     # Its Streamlit key must not be mounted twice; refreshing fragments update
     # the existing slot without changing the viewport-following CSS.
     if hasattr(st, "fragment"):
-        live_status = st.fragment(run_every="3s")(render_live_investigation_status)
+        live_status = st.fragment(run_every="2s")(render_live_investigation_status)
         live_status(audit, cache_key, header_reports, include_exploration, live_banner_slot)
     else:
         render_live_investigation_status(audit, cache_key, header_reports, include_exploration, live_banner_slot)
@@ -3737,16 +5244,17 @@ def render_ui() -> None:
         st.caption("Keep downloaded audits in approved secure storage. They may contain sample identifiers and detailed source observations.")
     with cleaning_tab:
         def refresh_cleaning():
-            # A stable fragment means Agent C's textarea is not destroyed every
-            # three seconds while the researcher types. Only a click or an
-            # explicit completion notification changes this review surface.
+            # Render directly into the fragment's OWN root, not an external
+            # st.empty/container. Streamlit replaces fragment-owned elements
+            # on scoped reruns; explicitly emptying an external tab container
+            # unmounts the entire finding and jumps the browser scroll.
+            # Never run this editable review on a polling timer.
             current = st.session_state.get("audit_result") or audit
             sync_live_exploration(current, cache_key)
             render_cleaning_workspace(paths, uploaded, current, cache_key)
+
         if hasattr(st, "fragment"):
             st.fragment(refresh_cleaning)()
-            # Poll *only* background completion in a tiny sibling fragment.
-            # It never re-renders editable forms while Agent A/B are busy.
             st.fragment(run_every="3s")(_poll_agent_c_completion)()
         else:
             refresh_cleaning()

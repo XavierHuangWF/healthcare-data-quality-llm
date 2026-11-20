@@ -21,39 +21,53 @@ AGENT_C_IDLE_MASCOT = Path(__file__).resolve().parent / "assets" / "gemma_agent_
 AGENT_C_WORKING_MASCOT = Path(__file__).resolve().parent / "assets" / "gemma_agent_c_working.png"
 
 
+def _local_mascot_data_url(path: Path) -> str:
+    """Return bundled artwork or a safe local fallback if assets were not copied.
+
+    The project intentionally ignores assets in Git. Missing images must not
+    interrupt an investigation or a review just because the UI is cloned.
+    """
+    if path.is_file():
+        mime = 'image/webp' if path.suffix.lower() == '.webp' else 'image/png'
+        return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode('ascii')
+    placeholder = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+                   b'<circle cx="50" cy="50" r="42" fill="#dbeafe"/>'
+                   b'<rect x="24" y="35" width="52" height="36" rx="12" fill="#2563eb"/>'
+                   b'<circle cx="40" cy="51" r="5" fill="white"/>'
+                   b'<circle cx="60" cy="51" r="5" fill="white"/></svg>')
+    return 'data:image/svg+xml;base64,' + base64.b64encode(placeholder).decode('ascii')
+
+
 @lru_cache(maxsize=1)
 def mascot_data_url() -> str:
-    return "data:image/webp;base64," + base64.b64encode(MASCOT.read_bytes()).decode("ascii")
+    return _local_mascot_data_url(MASCOT)
 
 
 @lru_cache(maxsize=1)
 def idle_mascot_data_url() -> str:
     """Calm captain mascot for waiting and finished investigation states."""
-    return "data:image/png;base64," + base64.b64encode(IDLE_MASCOT.read_bytes()).decode("ascii")
-
-
+    return _local_mascot_data_url(IDLE_MASCOT)
 
 
 @lru_cache(maxsize=1)
 def agent_c_idle_mascot_data_url() -> str:
-    return "data:image/png;base64," + base64.b64encode(AGENT_C_IDLE_MASCOT.read_bytes()).decode("ascii")
+    return _local_mascot_data_url(AGENT_C_IDLE_MASCOT)
 
 
 @lru_cache(maxsize=1)
 def agent_c_working_mascot_data_url() -> str:
-    return "data:image/png;base64," + base64.b64encode(AGENT_C_WORKING_MASCOT.read_bytes()).decode("ascii")
+    return _local_mascot_data_url(AGENT_C_WORKING_MASCOT)
+
 
 @lru_cache(maxsize=1)
 def recommendation_mascot_data_url() -> str:
-    """Calm Agent B mascot for waiting, finished, or failed states."""
-    return "data:image/png;base64," + base64.b64encode(RECOMMENDATION_MASCOT.read_bytes()).decode("ascii")
+    """Agent B mascot for waiting, finished, or failed states."""
+    return _local_mascot_data_url(RECOMMENDATION_MASCOT)
 
 
 @lru_cache(maxsize=1)
 def recommendation_processing_mascot_data_url() -> str:
-    """The user's angry dinosaur, shown only while Agent B has active work."""
-    return "data:image/webp;base64," + base64.b64encode(
-        RECOMMENDATION_PROCESSING_MASCOT.read_bytes()).decode("ascii")
+    return _local_mascot_data_url(RECOMMENDATION_PROCESSING_MASCOT)
 
 
 def exploration_elapsed(started_at: object, *, now: datetime | None = None) -> str:

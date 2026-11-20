@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 from zipfile import ZipFile, ZIP_DEFLATED
 
@@ -176,8 +177,115 @@ def apply_verified_in_memory(original: bytes, staged: bytes, insertion: dict, *,
     }
 
 
+def _sum_count_cells(a: str, b: str) -> str:
+    """Merge a count field without silently overwriting either measurement."""
+    absent = {"", "NA"}
+    aa, bb = a.strip().upper(), b.strip().upper()
+    if aa in absent and bb in absent:
+        return a if a else b
+    if aa in absent:
+        return b
+    if bb in absent:
+        return a
+    try:
+        total = Decimal(a) + Decimal(b)
+    except InvalidOperation as exc:
+        raise ValueError("Merging requires numeric counts or empty/NA values") from exc
+    if not total.is_finite():
+        raise ValueError("Cannot merge non-finite counts")
+    value = format(total, "f")
+    return value.rstrip("0").rstrip(".") if "." in value else value
+
+
+def apply_approved_row_operations(original: bytes, staged: bytes,
+                                  approvals: list[dict]) -> bytes:
+    """Apply reviewed row deletion/merge at EXPORT only using original CSV row IDs.
+
+    An edited row stays at its original coordinate in session memory. Row merges
+    use the latest staged values and sum count columns, retaining the first row.
+    Every dropped original row is bound to the immutable original taxon label.
+    """
+    original_rows, staged_rows = _records(original), _records(staged)
+    if len(original_rows) != len(staged_rows) or any(
+            len(a) != len(b) for a, b in zip(original_rows, staged_rows)):
+        raise PermissionError("Staged CSV dimensions differ from original row evidence")
+    if not isinstance(approvals, list):
+        raise ValueError("Row approvals must be a list")
+    if not approvals:
+        return staged
+    output_rows = [list(row) for row in staged_rows]
+    touched, dropped = set(), set()
+    for approval in approvals:
+        if (not isinstance(approval, dict) or
+                approval.get("operation") not in {"merge_rows", "drop_rows"} or
+                approval.get("source_sha256") != sha256_bytes(original) or
+                not isinstance(approval.get("reviewer"), str) or
+                not approval["reviewer"].strip()):
+            raise PermissionError("Invalid, stale or unapproved row operation")
+        changes = approval.get("changes")
+        limit = (min(len(original_rows) - 2, 20000)
+                 if approval["operation"] == "drop_rows" else 32)
+        if not isinstance(changes, list) or not 1 <= len(changes) <= limit:
+            raise PermissionError("Invalid row change count")
+        for change in changes:
+            if not isinstance(change, dict):
+                raise PermissionError("Invalid row change")
+            row = change.get("row")
+            if type(row) is not int or not 2 <= row <= len(original_rows):
+                raise PermissionError(f"Invalid original CSV row in approved {approval['operation']} operation: {row!r}")
+            if row in touched:
+                raise PermissionError(f"CSV row {row} is targeted more than once by approved row operations")
+            if change.get("before") != original_rows[row - 1][0]:
+                raise PermissionError(
+                    f"CSV row {row} no longer matches the approved original row label")
+            # Original CSV coordinates remain stable until export. A separately
+            # verified cell correction may legitimately update the staged taxon
+            # label; this must not invalidate a previously approved row DELETE.
+            # Source SHA, original row label and the exact row coordinate still
+            # bind the deletion to the immutable uploaded CSV.
+            touched.add(row)
+            if approval["operation"] == "drop_rows":
+                if change.get("after") != "":
+                    raise PermissionError("Invalid delete-row payload")
+                dropped.add(row)
+                continue
+            other = change.get("source_row")
+            if (type(other) is not int or not 2 <= other <= len(original_rows)
+                    or other == row or change.get("after") != "sum_numeric"
+                    or original_rows[other - 1][0] != original_rows[row - 1][0]):
+                raise PermissionError(
+                    f"CSV rows {row} and {other!r} do not match the approved original merge")
+            if other in touched:
+                raise PermissionError(
+                    f"CSV row {other} is targeted more than once by approved row operations")
+            # Unlike a deletion, a merge must still represent the same current
+            # taxon on BOTH sides. If only one label was edited, require the user
+            # to revisit the merge rather than silently combine distinct taxa.
+            if staged_rows[row - 1][0] != staged_rows[other - 1][0]:
+                raise PermissionError(
+                    f"CSV rows {row} and {other} now have different staged taxon "
+                    "labels; review this merge before export")
+            touched.add(other)
+            merged = [staged_rows[row-1][0]]
+            for a, b in zip(staged_rows[row-1][1:], staged_rows[other-1][1:]):
+                merged.append(_sum_count_cells(a, b))
+            output_rows[row-1] = merged
+            dropped.add(other)
+    if len(dropped) >= len(original_rows) - 1:
+        raise PermissionError("Cannot remove every data row")
+    kept = [row for i, row in enumerate(output_rows, 1) if i not in dropped]
+    buffer = StringIO(newline="")
+    csv.writer(buffer).writerows(kept)
+    encoded = (b"\xef\xbb\xbf" if staged.startswith(b"\xef\xbb\xbf") else b"") + buffer.getvalue().encode("utf-8")
+    if _records(encoded) != kept:
+        raise AssertionError("Row export did not reproduce the verified result")
+    return encoded
+
+
 def apply_approved_column_deletions(original: bytes, staged: bytes,
-                                    deletions: list[dict]) -> bytes:
+                                    deletions: list[dict], *,
+                                    approved_row_operations: list[dict] | None = None,
+                                    staged_before_rows: bytes | None = None) -> bytes:
     """Apply explicitly approved physical-column removals only at final export.
 
     Cell/rename modifications remain in the coordinate-stable staged CSV until
@@ -186,7 +294,13 @@ def apply_approved_column_deletions(original: bytes, staged: bytes,
     changed. Each retained value is checked against the latest staged input.
     """
     original_rows, staged_rows = _records(original), _records(staged)
-    if (len(original_rows) != len(staged_rows) or
+    if approved_row_operations:
+        if staged_before_rows is None or apply_approved_row_operations(
+                original, staged_before_rows, approved_row_operations) != staged:
+            raise PermissionError("Exported rows do not match the approved structural operations")
+        if any(len(row) != len(original_rows[0]) for row in staged_rows):
+            raise PermissionError("Exported CSV column dimensions changed unexpectedly")
+    elif (len(original_rows) != len(staged_rows) or
             any(len(a) != len(b) for a, b in zip(original_rows, staged_rows))):
         raise PermissionError("Staged CSV dimensions differ from original evidence")
     if not isinstance(deletions, list):
@@ -244,6 +358,7 @@ def review_completion(findings: list[dict], statuses: dict[str, str]) -> tuple[i
     done = sum(statuses.get(f["id"]) in {
         "Applied and verified", "Resolved by earlier approved edit",
         "Approved column deletion for final export",
+        "Approved row changes for final export",
         "Partially approved — remaining action rejected",
         "Reviewed — no change",
     } for f in findings)
