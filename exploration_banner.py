@@ -284,7 +284,10 @@ html,
     from { translate: 0 0; }
     to { translate: 0 max(0px, calc(100dvh - 35.5rem)); }
 }
-/* A genuine viewport-following mini-panel, rather than an in-flow banner.
+/* Keep desktop status cards compact so they do not obscure the dataset.
+   Retain the existing mobile width to avoid clipping text at small sizes.
+   The internal mascots and their aspect ratios stay unchanged.
+   A genuine viewport-following mini-panel, rather than an in-flow banner.
    The same rule applies to the synchronous phases and async exploration. */
 .st-key-hdq_investigation_banner,
 .st-key-hdq_investigation_banner_blocking {
@@ -292,8 +295,8 @@ html,
     top: 4.1rem !important;
     right: 1.1rem !important;
     left: auto !important;
-    width: min(490px, calc(100vw - 2.2rem)) !important;
-    max-width: min(490px, calc(100vw - 2.2rem)) !important;
+    width: min(390px, calc(100vw - 2.2rem)) !important;
+    max-width: min(390px, calc(100vw - 2.2rem)) !important;
     z-index: 999 !important;
     pointer-events: none !important;
     margin: 0 !important;

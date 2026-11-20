@@ -45,6 +45,17 @@ def _verified(operations: list[dict], rows: list[list[str]], finding: dict) -> l
         elif isinstance(group, (list, tuple)):
             allowed_rows.update(num for num in group if type(num) is int)
     allowed_cells = {(e.get('CSV row'), e.get('Column')) for e in evidence}
+    # Taxonomy-level evidence has no numeric "Column" field: its editable
+    # source value is always C1. Bind it to the verbatim original label before
+    # allowing Gemma's proposed Before -> After to become a clickable choice.
+    if finding.get('check_key') in {'inspect_taxonomy_structure', 'inspect_taxonomy_naming'}:
+        for item in evidence:
+            row = item.get('CSV row')
+            original = item.get('Original classification (verbatim)',
+                                item.get('Original classification'))
+            if (type(row) is int and 2 <= row <= len(rows)
+                    and isinstance(original, str) and original == rows[row - 1][0]):
+                allowed_cells.add((row, 1))
     allowed_cols = {v for e in evidence for v in (e.get('Column'), e.get('Column A'), e.get('Column B'))}
     if finding.get('check_key') == 'gemma_check':
         allowed_cols.update(i for i, h in enumerate(rows[0], 1) if 'blank' in h.casefold())
@@ -140,6 +151,52 @@ def _replacements_from_evidence(finding: dict, rows: list[list[str]], after: str
     return changes
 
 
+def _taxonomy_na_padding(finding: dict, rows: list[list[str]], advice: str) -> list[dict]:
+    """Create one conservative, exact option for the seven-level QC finding.
+
+    This is positional padding, NOT an inferred biological rank assignment.
+    The original labels and all affected source rows must match the QC
+    evidence.  Missing rank positions cannot be inferred from plain labels.
+    """
+    if finding.get('check_key') != 'inspect_taxonomy_structure':
+        return []
+    if not (re.search(r'\b(?:pad|append|fill|complete|missing)\b', advice, re.I)
+            and re.search(r'\bNA\b', advice, re.I)):
+        return []
+    evidence = finding.get('evidence') or []
+    if (not isinstance(evidence, list) or not evidence
+            or len(evidence) != finding.get('total_evidence_records', len(evidence))):
+        return []
+    observed_problem_rows = {
+        row for row, cells in enumerate(rows[1:], start=2)
+        if len(re.split(r'[;|]', cells[0])) != 7
+    }
+    changed = []
+    evidenced_rows = set()
+    for item in evidence:
+        if not isinstance(item, dict):
+            return []
+        row = item.get('CSV row')
+        if type(row) is not int or not 2 <= row <= len(rows) or row in evidenced_rows:
+            return []
+        before = rows[row - 1][0]
+        if item.get('Original classification (verbatim)') != before:
+            return []
+        levels = re.split(r'[;|]', before)
+        # The source report counts NA as a level, including repeated NA.
+        if ('|' in before or not all(level.strip() for level in levels)
+                or not 1 <= len(levels) < 7
+                or item.get('Levels found') != len(levels)
+                or item.get('Expected levels') != 7):
+            return []
+        evidenced_rows.add(row)
+        changed.append({'row': row, 'column': 1, 'before': before,
+                        'after': before + '; NA' * (7 - len(levels))})
+    if evidenced_rows != observed_problem_rows:
+        return []  # Source changed or QC provided only an evidence sample.
+    return changed
+
+
 def source_backed_choices(finding: dict, source: Path | None,
                           suggestion: dict) -> list[dict]:
     """Select 1–3 model-proposed controls only when exact CSV proof is available.
@@ -190,6 +247,17 @@ def source_backed_choices(finding: dict, source: Path | None,
         checked = _verified([{'operation': 'replace_cells', 'changes': changes}], rows, finding)
         if checked:
             return [{'label': 'Use suggested replacements', 'operations': checked,
+                     'rows': _display(checked)}]
+    # A seven-level suggestion must not degrade to prose just because Gemma
+    # omitted per-row coordinates. The host can derive exact before/after from
+    # the complete, source-matched taxonomy QC evidence.  Offer only trailing
+    # positional NA padding; do not guess where an unknown biological rank goes.
+    taxonomy_changes = _taxonomy_na_padding(finding, rows, advice)
+    if taxonomy_changes:
+        checked = _verified([{'operation': 'replace_cells',
+                              'changes': taxonomy_changes}], rows, finding)
+        if checked:
+            return [{'label': 'Append NA to reach 7 levels', 'operations': checked,
                      'rows': _display(checked)}]
     # Narrow fallback for a fully evidenced, explicit constant replacement.
     if re.search(r'\b(?:replace|set|fill)\b', advice, flags=re.I):

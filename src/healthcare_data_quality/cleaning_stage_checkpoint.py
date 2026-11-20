@@ -117,6 +117,26 @@ def _approval_ledger_matches_stage(
                     (d['row'], d['column']) for d in changes
                 ):
                     raise PermissionError('Approved cell position list differs from exact approved edits')
+            elif op == 'flag_cells':
+                # A style-only annotation must never account for a CSV delta.
+                # Verify its exact original coordinates and values from the
+                # same immutable source while leaving `replay` unchanged.
+                flags = event.get('flags')
+                if (positions != [] or not isinstance(flags, list)
+                        or not flags or len(flags) > 50
+                        or event.get('changes') != len(flags)):
+                    raise PermissionError('Visual flag approval lacks exact source-bound targets')
+                unique = set()
+                for flag in flags:
+                    if not isinstance(flag, dict):
+                        raise PermissionError('Malformed visual flag target')
+                    r, c = flag.get('row'), flag.get('column')
+                    if (type(r) is not int or type(c) is not int or c != 1
+                            or r < 2 or r > len(initial)
+                            or (r, c) in unique or flag.get('style') != 'bold_red'
+                            or flag.get('before') != initial[r - 1][c - 1]):
+                        raise PermissionError('Visual flag target does not match the original CSV')
+                    unique.add((r, c))
             elif op == 'drop_column':
                 if len(positions) != 1 or type(positions[0].get('column')) is not int:
                     raise PermissionError('Invalid column approval event')
@@ -507,7 +527,17 @@ def verify_and_reconstruct(checkpoint: dict, sources: list[Path],
                 or event.get('finding_id') not in finding_titles):
             raise PermissionError('Saved approval cannot be matched to this investigation')
     _approval_ledger_matches_stage(sources, staged, cols, rows, history, statuses, finding_titles)
+    visual_flags = {}
+    for event in history:
+        if event.get('operation') != 'flag_cells':
+            continue
+        ds_id = event['dataset_id']
+        flagged = visual_flags.setdefault(ds_id, [])
+        flagged.extend({**flag, 'finding_id': event['finding_id'],
+                        'reviewer': event['reviewer']}
+                       for flag in event['flags'])
     return {
+        'cleaning_visual_flags_by_dataset': visual_flags,
         'cleaning_completed_audits_by_finding': audits,
         'cleaning_staged_bytes_by_dataset': staged,
         'cleaning_approved_columns_by_dataset': cols,

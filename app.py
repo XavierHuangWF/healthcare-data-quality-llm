@@ -82,7 +82,7 @@ from run_workflow import build_scientific_recommendations  # noqa: E402
 
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
-MAX_DATASETS = 4
+MAX_DATASETS = 1
 
 # Cached audits can include source values and identifying metadata. Keep them
 # outside the Git repository, in a private local directory. Each re-run is
@@ -1208,6 +1208,7 @@ def _review_action_button_css() -> str:
        Streamlit remount and jumped the reviewer back to the top. */
     details:has(.hdq-cleaning-completed-marker) {
         border-color: #15803d !important;
+        scroll-margin-top: 22px;
     }
     details:has(.hdq-cleaning-completed-marker) > summary {
         background-color: rgba(22, 163, 74, 0.14) !important;
@@ -1342,35 +1343,96 @@ def _agent_c_control_phase(*, mode: str | None, transcript: list,
     return "discussion", []
 
 
-def _rerun_cleaning_fragment(fid: str | None = None) -> None:
-    """Refresh the cleaning UI without rerendering the entire Streamlit page.
+def _finding_review_completed(fid: str) -> bool:
+    """A final review may collapse; partial/queued approvals must stay open.
 
-    Cleaning cards live inside ``st.fragment``. A bare ``st.rerun()`` requests
-    a *full-app* rerun, which disrupts the browser scroll position and active
-    finding during a chat/approval click. If the page runs without fragment
-    support (or a direct compatibility test calls this outside a fragment),
-    fall back to the normal full rerun.
+    Use the same terminal statuses as the review renderer. A historical
+    approval on its own is not enough: a new discussion or pending batch
+    must still be available for the reviewer to finish.
+    """
+    status = st.session_state.get("cleaning_review_statuses", {}).get(fid)
+    terminal = {
+        "Applied and verified", "Resolved by earlier approved edit",
+        "Approved column deletion for final export",
+        "Approved row changes for final export", "Reviewed — no change",
+    }
+    if status not in terminal:
+        return False
+    if st.session_state.get("cleaning_plans_by_finding", {}).get(fid):
+        return False
+    if st.session_state.get("cleaning_batch_queue_by_finding", {}).get(fid):
+        return False
+    if fid in st.session_state.get("cleaning_batch_rejected_by_finding", set()):
+        return False
+    return status == "Reviewed — no change" or any(
+        event.get("finding_id") == fid
+        for event in st.session_state.get("cleaning_history", [])
+    )
+
+
+def _scroll_to_completed_finding_once(fid: str) -> None:
+    """Restore viewport focus to the just-approved header, only once.
+
+    Native Streamlit fragments preserve position across most reruns, but
+    collapsing a tall card can move its header out of view. This optional,
+    zero-height browser helper targets only our stable completed marker and
+    never reads user data or changes approval state. If a browser disallows
+    parent access from the component iframe, normal collapse still works.
+    """
+    if st.session_state.get("cleaning_scroll_to_completed_finding") != fid:
+        return
+    st.session_state.pop("cleaning_scroll_to_completed_finding", None)
+    try:
+        from streamlit.components.v1 import html
+    except ImportError:
+        return
+    marker_id = hashlib.sha256(fid.encode("utf-8")).hexdigest()[:20]
+    # The selector embeds only a SHA-256 hex digest, never filename/CSV text.
+    html('''<script>
+    (() => {
+      const markerId = "{marker_id}";
+      let attempts = 0;
+      const restore = () => {
+        try {
+          const node = window.parent.document.querySelector(
+            '.hdq-cleaning-completed-marker[data-review-focus="' + markerId + '"]');
+          const card = node && node.closest('details');
+          if (card) {
+            // Do not rely on Streamlit accepting the new expanded=False
+            // prop after the card was opened manually in the browser.
+            if (card.open) card.open = false;
+            card.scrollIntoView({ block: 'start', behavior: 'instant' });
+            return;
+          }
+        } catch (error) { return; }
+        if (++attempts < 12) window.setTimeout(restore, 75);
+      };
+      window.requestAnimationFrame(restore);
+    })();
+    </script>'''.replace("{marker_id}", marker_id), height=0, scrolling=False)
+
+
+def _rerun_cleaning_fragment(fid: str | None = None) -> None:
+    """Refresh cleaning without jumping to another finding.
+
+    A successful final approval closes its card, leaving the green completed
+    header visible. When a batch still has pending actions, or the user opens
+    discussion, retain that card's expanded state instead.
     """
     if fid:
-        # Stable expander label + remembered focus prevent approval from
-        # folding the finding and remounting the review/scroll position.
-        # Keep the current finding open, not every previously visited finding.
-        # Older completed findings may therefore remain collapsed normally.
         open_map = st.session_state.setdefault("cleaning_keep_open_by_finding", {})
         open_map.clear()
-        open_map[fid] = True
+        if _finding_review_completed(fid):
+            st.session_state["cleaning_scroll_to_completed_finding"] = fid
+        else:
+            open_map[fid] = True
+            st.session_state.pop("cleaning_scroll_to_completed_finding", None)
         st.session_state["cleaning_active_finding"] = fid
     try:
         st.rerun(scope="fragment")
     except TypeError:
-        # Older Streamlit/mocked ``st.rerun`` without the ``scope`` keyword.
         st.rerun()
     except Exception as exc:
-        # Depending on the Streamlit release, a fragment-scoped rerun during
-        # the *initial full-app pass* raises StreamlitAPIException or the
-        # more specific StreamlitInvalidLayoutContextError. Both indicate a
-        # rerun-context mismatch, NOT a failed cleaning/approval operation.
-        # Fall back to an app-scoped rerun; do not mask unrelated failures.
         if type(exc).__name__ not in {
             "StreamlitAPIException", "StreamlitInvalidLayoutContextError",
         }:
@@ -1564,6 +1626,98 @@ def _render_live_agent_b_finding(
         st.rerun()
 
 
+def _is_blank_control_check(finding: dict) -> bool:
+    """Only a Gemma check about blank controls may offer control deletion."""
+    if finding.get("check_key") != "gemma_check":
+        return False
+    description = " ".join(str(finding.get(k) or "") for k in ("title", "method")).casefold()
+    return "blank" in description and ("control" in description or "negative control" in description)
+
+
+def _reconcile_approved_column_review(fid: str, ds_id: str, source: Path) -> bool:
+    """Retire redundant column proposals after another finding approved them.
+
+    Never interpret a model suggestion as approval: a match requires an existing
+    named approval, original column position/header, and immutable source hash.
+    New operations remain pending for ordinary independent verification.
+    Returns whether all pending actions were already approved elsewhere.
+    """
+    plans_by_finding = st.session_state.setdefault("cleaning_plans_by_finding", {})
+    current = plans_by_finding.get(fid)
+    if not current:
+        return False
+    plans = [current, *st.session_state.setdefault(
+        "cleaning_batch_queue_by_finding", {}).get(fid, [])]
+    if not plans:
+        return False
+    from healthcare_data_quality.cleaning_authorization import file_sha256
+    from healthcare_data_quality.in_memory_cleaning import _records
+    headers = _records(source.read_bytes())[0]
+    source_hash = file_sha256(source)
+    approved = {
+        int(item["position"]): item
+        for item in st.session_state.setdefault(
+            "cleaning_approved_columns_by_dataset", {}).get(ds_id, [])
+        if isinstance(item, dict) and isinstance(item.get("position"), int)
+    }
+    remaining, already_approved = [], []
+    for plan in plans:
+        if (plan.get("operation") == "drop_column" and
+                len(plan.get("changes") or []) == 1):
+            item = plan["changes"][0]
+            position = item.get("position")
+            record = approved.get(position)
+            if (type(position) is int and 1 <= position <= len(headers) and
+                    record and plan.get("dataset_id") == ds_id and
+                    plan.get("source_sha256") in (None, "", source_hash) and
+                    record.get("source_sha256") == source_hash and
+                    record.get("before") == item.get("before") == headers[position - 1] and
+                    str(record.get("reviewer") or "").strip()):
+                already_approved.append(plan)
+                continue
+        remaining.append(plan)
+    if not already_approved:
+        return False
+    st.session_state.setdefault("cleaning_compound_previews_by_finding", {}).pop(fid, None)
+    if remaining:
+        plans_by_finding[fid] = remaining[0]
+        st.session_state.cleaning_batch_queue_by_finding[fid] = remaining[1:]
+        st.session_state.setdefault("cleaning_batch_total_by_finding", {})[fid] = len(remaining)
+        return False
+    # All requested edits have already been approved. Never create a second
+    # approval event, revert the prior deletion, or show stale chat controls.
+    for name in ("cleaning_plans_by_finding", "cleaning_batch_queue_by_finding",
+                 "cleaning_batch_total_by_finding", "cleaning_compound_previews_by_finding",
+                 "cleaning_memory_candidates", "cleaning_explicit_column_deletions_by_finding"):
+        st.session_state.setdefault(name, {}).pop(fid, None)
+    st.session_state.setdefault("cleaning_discussion_mode_by_finding", {}).pop(fid, None)
+    st.session_state.setdefault("cleaning_pending_gemma_b", {}).pop(fid, None)
+    # This finding owns NO second approval event. Record a reviewed-without-
+    # additional-change decision, which the recovery ledger permits without
+    # inventing a duplicate named approval for this finding.
+    st.session_state.setdefault("cleaning_review_statuses", {})[fid] = "Reviewed — no change"
+    return True
+
+
+def _cleaning_export_gate(catalog: list[dict], review_statuses: dict,
+                          plans: dict, queues: dict, pending: dict,
+                          visual_flags: dict, *, investigation_running: bool) -> tuple[bool, int, int]:
+    """No export until every current finding and check reaches terminal review."""
+    terminal = {
+        "Applied and verified", "Reviewed — no change",
+        "Resolved by earlier approved edit", "Approved column deletion for final export",
+        "Approved row changes for final export",
+    }
+    ids = {str(f["id"]) for f in catalog}
+    done = sum(
+        review_statuses.get(fid) in terminal and
+        not plans.get(fid) and not queues.get(fid) and
+        fid not in pending and not visual_flags.get(fid)
+        for fid in ids
+    )
+    return bool(ids and done == len(ids) and not investigation_running), done, len(ids)
+
+
 def render_cleaning_workspace(
     dataset_paths: list[Path], uploaded: list, audit: dict, context_key: str,
     gemma_runs: list[dict] | None = None,
@@ -1626,6 +1780,8 @@ def render_cleaning_workspace(
         st.session_state.cleaning_explicit_row_deletions_by_finding = {}
         st.session_state.cleaning_explicit_column_deletions_by_finding = {}
         st.session_state.cleaning_history = []
+        st.session_state.cleaning_pending_visual_flags_by_finding = {}
+        st.session_state.cleaning_visual_flags_by_dataset = {}
         # A user-initiated NEW investigation is a new review, even when the
         # source CSV is byte-identical to a previous run. Keep the saved
         # checkpoint on disk, but never automatically offer/import it here.
@@ -1676,6 +1832,8 @@ def render_cleaning_workspace(
             ("cleaning_explicit_row_deletions_by_finding", {}),
             ("cleaning_explicit_column_deletions_by_finding", {}),
             ("cleaning_history", []),
+            ("cleaning_pending_visual_flags_by_finding", {}),
+            ("cleaning_visual_flags_by_dataset", {}),
             ("cleaning_recovery_dismissed", False),
             ("cleaning_approved_reviewer", ""),
             ("cleaning_rebased_previews_by_finding", {}),
@@ -2001,6 +2159,17 @@ def render_cleaning_workspace(
         if group != last_group:
             st.markdown(f"#### {group}")
             last_group = group
+        # Bind single-dataset Gemma checks before terminal-state reconciliation.
+        # Otherwise an already-approved control deletion in another check can
+        # leave a stale, blocked duplicate plan visible here.
+        if finding.get("check_key") == "gemma_check" and source is None and len(dataset_paths) == 1:
+            source = Path(dataset_paths[0])
+            ds_id = "dataset_1"
+            finding = {**finding, "dataset_id": ds_id, "name": uploaded[0].name}
+        if source is not None and _reconcile_approved_column_review(fid, ds_id, source):
+            # Persist the new terminal review status immediately rather than
+            # leaving it only in UI state until an unrelated click occurs.
+            _rerun_cleaning_fragment(fid)
         status = st.session_state.cleaning_review_statuses.get(fid, "Awaiting review")
         applied = [event for event in history_all if event["finding_id"] == fid]
         if applied:
@@ -2008,9 +2177,8 @@ def render_cleaning_workspace(
                 status = "Resolved by earlier approved edit — no additional cells changed"
             else:
                 status = f"Staged in memory ({len(applied)} approved edit{'s' if len(applied) != 1 else ''})"
-        # Unfinished discussions stay open so submitted text remains visible.
-        # Keep the expander label stable even after verified approval. The
-        # completed status appears inside the card; do not collapse it.
+        # Unfinished discussions stay open. After final named approval, close
+        # the same card and keep its stable, green Completed heading visible.
         remaining_batch = st.session_state.cleaning_batch_queue_by_finding.get(fid, [])
         current_plan = st.session_state.cleaning_plans_by_finding.get(fid)
         raw_status = st.session_state.cleaning_review_statuses.get(fid)
@@ -2044,8 +2212,9 @@ def render_cleaning_workspace(
             "Approved column deletion for final export",
             "Approved row changes for final export", "Reviewed — no change",
         }
-        completed = (bool(applied) or reviewed_no_change) and not current_plan and not remaining_batch and (
-            raw_status in completed_statuses)
+        completed = (bool(applied) or reviewed_no_change or
+                     raw_status == "Resolved by earlier approved edit") and (
+            not current_plan and not remaining_batch and raw_status in completed_statuses)
         # A review decision itself is an active interaction, even before the
         # researcher sends any text. In particular, clicking "No — discuss
         # another action" sets mode="alternative" with an EMPTY transcript.
@@ -2062,14 +2231,22 @@ def render_cleaning_workspace(
         # The expander title must remain stable through approvals; the green
         # Completed suffix is rendered by a marker-based CSS rule.
         keep_open = st.session_state.setdefault("cleaning_keep_open_by_finding", {}).get(fid, False)
+        # A finished review collapses even if an earlier interaction left a
+        # stale keep-open flag. Unfinished groups retain their active position.
+        if completed:
+            _scroll_to_completed_finding_once(fid)
         with st.expander(f"{label} · {finding['title']}",
-                         expanded=bool(active_conversation or keep_open or (fid in ready_ids and not completed))):
+                         expanded=bool(not completed and (
+                             active_conversation or keep_open or fid in ready_ids))):
             if completed and fid not in st.session_state.cleaning_batch_rejected_by_finding:
                 # Do not mark a partially rejected batch as fully completed.
                 # No extra caption: tint the whole heading green and append
                 # " · Completed" to its visible title using the style above.
-                st.markdown('<span class="hdq-cleaning-completed-marker" aria-hidden="true">&#8203;</span>',
-                            unsafe_allow_html=True)
+                marker_id = hashlib.sha256(fid.encode("utf-8")).hexdigest()[:20]
+                st.markdown(
+                    f'<span class="hdq-cleaning-completed-marker" '
+                    f'data-review-focus="{marker_id}" aria-hidden="true">&#8203;</span>',
+                    unsafe_allow_html=True)
             if finding.get("check_key") == "gemma_check" and source is None and len(dataset_paths) == 1:
                 source = Path(dataset_paths[0])
                 ds_id = "dataset_1"
@@ -2091,6 +2268,8 @@ def render_cleaning_workspace(
                     source = Path(dataset_paths[index])
                     finding = {**finding, "dataset_id": ds_id,
                                "name": uploaded[index].name}
+                    if _reconcile_approved_column_review(fid, ds_id, source):
+                        _rerun_cleaning_fragment(fid)
             if completed:
                 if st.checkbox("Show completed finding audit",
                                key=f"review_completed_audit_{fid}"):
@@ -2151,6 +2330,15 @@ def render_cleaning_workspace(
                         rows_for_display = current_change_rows(reviewed_plans)
                     except (ValueError, KeyError, TypeError):
                         rows_for_display = []
+                    visual_flag_events = [item for item in applied
+                                          if item.get("operation") == "flag_cells"]
+                    if visual_flag_events:
+                        from healthcare_data_quality.visual_flags import flag_preview_html
+                        approved_visual = [item for event in visual_flag_events
+                                           for item in event.get("flags", [])]
+                        if approved_visual:
+                            st.markdown(flag_preview_html(approved_visual),
+                                        unsafe_allow_html=True)
                     if rows_for_display:
                         st.dataframe(pd.DataFrame([
                             {"Location": row["Target"], "Before": row["Before"],
@@ -2158,6 +2346,8 @@ def render_cleaning_workspace(
                         ]), hide_index=True, width="stretch")
                     elif reviewed_no_change:
                         st.caption("Reviewed without changes")
+                    elif raw_status == "Resolved by earlier approved edit":
+                        st.caption("Already completed in an earlier approved review")
                     else:
                         st.caption("Approved changes recorded")
                     if st.button("Revise completed action", key=f"review_reopen_{fid}"):
@@ -2166,7 +2356,16 @@ def render_cleaning_workspace(
                         else:
                             try:
                                 from healthcare_data_quality.interaction_memory import revoke_reviewed_solution
-                                if applied:
+                                visual_only = bool(applied) and all(
+                                    event.get("operation") == "flag_cells" for event in applied)
+                                if visual_only:
+                                    snapshot = {"staged": st.session_state.cleaning_staged_bytes_by_dataset.get(
+                                                    ds_id, source.read_bytes()),
+                                                "columns": st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, []),
+                                                "rows": st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, []),
+                                                "history": [event for event in st.session_state.cleaning_history
+                                                            if event.get("finding_id") != fid]}
+                                elif applied:
                                     from healthcare_data_quality.approved_revision import reverse_approved_finding
                                     snapshot = reverse_approved_finding(
                                         source,
@@ -2190,6 +2389,11 @@ def render_cleaning_workspace(
                                     from healthcare_data_quality.cleaning_stage_checkpoint import invalidate_approved_stage
                                     invalidate_approved_stage(source_paths)
                                 revoke_reviewed_solution(finding, source)
+                                if visual_only:
+                                    flags_by_ds = st.session_state.cleaning_visual_flags_by_dataset.get(ds_id, [])
+                                    st.session_state.cleaning_visual_flags_by_dataset[ds_id] = [
+                                        flag for flag in flags_by_ds if flag.get("finding_id") != fid]
+                                st.session_state.cleaning_pending_visual_flags_by_finding.pop(fid, None)
                                 if applied:
                                     st.session_state.cleaning_staged_bytes_by_dataset[ds_id] = snapshot["staged"]
                                     st.session_state.cleaning_approved_columns_by_dataset[ds_id] = snapshot["columns"]
@@ -2220,12 +2424,85 @@ def render_cleaning_workspace(
             evidence = finding.get("evidence") or []
             if evidence and st.checkbox("Show original evidence",
                                         value=True, key=f"review_evidence_{fid}"):
-                st.dataframe(pd.DataFrame(evidence), hide_index=True, width="stretch")
+                from healthcare_data_quality.visual_flags import styled_evidence
+                current_flags = st.session_state.cleaning_visual_flags_by_dataset.get(ds_id, [])
+                st.dataframe(styled_evidence(evidence, current_flags),
+                             hide_index=True, width="stretch")
+
+            # Visual annotations are a separate kind of reviewer operation:
+            # never replace taxonomy text with markup or force a value-change
+            # clarification. This form is the one named approval for all flags.
+            flag_plan = st.session_state.cleaning_pending_visual_flags_by_finding.get(fid)
+            if flag_plan and source:
+                from healthcare_data_quality.visual_flags import flag_preview_html, requested_visual_flag
+                st.markdown('**Flag taxonomy — bold red (display only)**')
+                st.markdown(flag_preview_html(flag_plan["flags"]), unsafe_allow_html=True)
+                with st.form(f"review_visual_flag_{fid}_{_active_agent_c_control_generation(fid)}"):
+                    flag_reviewer = st.session_state.get("cleaning_approved_reviewer") or ""
+                    if flag_reviewer:
+                        st.caption("Reviewer: " + flag_reviewer)
+                    else:
+                        flag_reviewer = st.text_input(
+                            "Reviewer identifier", key=f"visual_flag_reviewer_{fid}",
+                            max_chars=120)
+                    yes_col, no_col = st.columns(2)
+                    with yes_col:
+                        accept_flag = st.form_submit_button(
+                            "Yes — Approve & Execute",
+                            key=f"flag_yes_{fid}_{_active_agent_c_control_generation(fid)}")
+                    with no_col:
+                        decline_flag = st.form_submit_button(
+                            "No — Discuss Another Idea",
+                            key=f"flag_no_{fid}_{_active_agent_c_control_generation(fid)}")
+                if decline_flag:
+                    st.session_state.cleaning_pending_visual_flags_by_finding.pop(fid, None)
+                    _open_agent_c_alternative_chat(fid, discard_plan=True)
+                    _rerun_cleaning_fragment(fid)
+                if accept_flag:
+                    reviewer = str(flag_reviewer or "").strip()
+                    if not reviewer:
+                        st.error("Enter your reviewer identifier to approve this flag.")
+                    else:
+                        try:
+                            # Verify the *current source bytes and coordinates*
+                            # immediately before approval. Flags carry no CSV edit.
+                            from healthcare_data_quality.visual_flags import requested_visual_flag
+                            original_request = flag_plan["request"]
+                            checked = requested_visual_flag(original_request, finding, source)
+                            if (checked is None or checked["source_sha256"] != flag_plan["source_sha256"]
+                                    or checked["flags"] != flag_plan["flags"]):
+                                raise PermissionError("Original source or flagged targets changed")
+                            existing = st.session_state.cleaning_visual_flags_by_dataset.setdefault(ds_id, [])
+                            keys = {(item["row"], item["column"]) for item in checked["flags"]}
+                            existing[:] = [item for item in existing
+                                           if (item["row"], item["column"]) not in keys]
+                            existing.extend({**item, "finding_id": fid, "reviewer": reviewer}
+                                            for item in checked["flags"])
+                            st.session_state.cleaning_approved_reviewer = reviewer
+                            st.session_state.cleaning_history.append({
+                                "dataset_id": ds_id, "finding_id": fid, "finding": finding["title"],
+                                "operation": "flag_cells", "flags": checked["flags"],
+                                "changes": len(checked["flags"]), "reviewer": reviewer,
+                                "source_sha256": checked["source_sha256"],
+                                "staged_sha256": hashlib.sha256(
+                                    st.session_state.cleaning_staged_bytes_by_dataset.get(
+                                        ds_id, source.read_bytes())).hexdigest(),
+                                "modified_positions": [],  # style-only, no CSV change
+                                "storage": "session_visual_annotations_no_csv_change",
+                            })
+                            st.session_state.cleaning_review_statuses[fid] = "Applied and verified"
+                            st.session_state.cleaning_pending_visual_flags_by_finding.pop(fid, None)
+                            st.session_state.cleaning_messages_by_finding.get(fid, []).append({
+                                "role": "assistant", "content": "Flag applied. CSV values unchanged."})
+                            _rerun_cleaning_fragment(fid)
+                        except (ValueError, PermissionError, OSError, csv.Error, KeyError) as exc:
+                            st.error(f"Flag could not be approved: {exc}")
+                continue
             # Even a zero-issue Gemma negative-control check can provide an
             # optional actionable deletion choice. The original column headers
             # and user-selected positions are the only draft source; one named
             # approval follows exact Before -> After review. No prepare step.
-            if source and fid in ready_ids and finding.get("check_key") == "gemma_check":
+            if source and fid in ready_ids and _is_blank_control_check(finding):
                 try:
                     whole_source = source_inventory(source)
                 except (OSError, ValueError, UnicodeError, csv.Error) as inv_exc:
@@ -2234,7 +2511,23 @@ def render_cleaning_workspace(
                     blank_columns = whole_source["blank_control_columns"]
                     if blank_columns:
                         columns = whole_source["columns"]
-                        options = [c["position"] for c in blank_columns]
+                        # Ignore columns already approved for removal by ANY
+                        # finding/check. A repeated selector must not generate
+                        # duplicate plans and a blocked final approval.
+                        approved_positions = {
+                            int(entry["position"])
+                            for entry in st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
+                            if isinstance(entry, dict) and type(entry.get("position")) is int
+                        }
+                        options = [c["position"] for c in blank_columns
+                                   if c["position"] not in approved_positions]
+                        if not options:
+                            st.session_state.cleaning_review_statuses[fid] = (
+                                "Reviewed — no change")
+                            st.session_state.cleaning_plans_by_finding.pop(fid, None)
+                            st.session_state.cleaning_batch_queue_by_finding.pop(fid, None)
+                            st.session_state.cleaning_explicit_column_deletions_by_finding.pop(fid, None)
+                            _rerun_cleaning_fragment(fid)
                         lookup = {c["position"]: c for c in columns}
                         selected = st.multiselect(
                             "Remove control columns (optional)", options=options,
@@ -3167,6 +3460,21 @@ def render_cleaning_workspace(
                                             RuntimeError, csv.Error, KeyError) as exc:
                                         st.error(f"In-memory insertion failed; no changes were staged: {exc}")
 
+            # A partially approved batch may leave valid staged edits plus
+            # intentionally rejected remainder. Require an explicit final
+            # review decision, not an impossible "all reviewed" download gate.
+            if (applied and not plan and not remaining_batch and not b_pending and
+                    st.session_state.cleaning_review_statuses.get(fid) ==
+                    "Partially approved — remaining action rejected" and
+                    st.button("Finish review — keep approved changes",
+                              key=f"review_finish_partial_{fid}")):
+                st.session_state.cleaning_review_statuses[fid] = "Applied and verified"
+                st.session_state.cleaning_batch_rejected_by_finding.discard(fid)
+                st.session_state.cleaning_decisions.append({
+                    "finding_id": fid,
+                    "decision": "remaining_proposal_declined_existing_approvals_retained",
+                })
+                _rerun_cleaning_fragment(fid)
             if (not plan and not applied and not b_pending and not remaining_batch and
                     st.session_state.cleaning_review_statuses.get(fid) != "Reviewed — no change" and
                     st.button("Mark reviewed (no change)",
@@ -3187,36 +3495,96 @@ def render_cleaning_workspace(
                 _rerun_cleaning_fragment(fid)
 
 
-    # Offer one concise download at every stage. Export contains only changes
-    # that have passed explicit approval and final source verification; pending
-    # suggestions/discussions are never applied. The original upload remains
-    # untouched. The same exact row/column conflict safeguards still run.
-    try:
-        datasets_for_download = []
-        for i, file in enumerate(uploaded):
-            ds_id = f"dataset_{i+1}"
-            staged_bytes = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id)
-            original = dataset_paths[i].read_bytes()
-            data = staged_bytes if staged_bytes is not None else original
-            row_approvals = st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, [])
-            data = apply_approved_row_operations(original, data, row_approvals)
-            approvals = st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
-            data = apply_approved_column_deletions(
-                original, data, approvals,
-                approved_row_operations=row_approvals,
-                staged_before_rows=staged_bytes if staged_bytes is not None else original)
-            datasets_for_download.append((ds_id, file.name, data))
-        file_name, mime, data = build_final_download(datasets_for_download)
-    except (ValueError, PermissionError, AssertionError, OSError, csv.Error) as exc:
-        st.error(f"Download unavailable: {exc}")
-    else:
+    # Export is intentionally locked until EVERY current finding and Gemma
+    # check is finished; no partially reviewed file should look final.
+    # A still-running Agent A investigation can append new checks, so it also
+    # holds the gate closed until the check catalog is stable.
+    from exploration_jobs import exploration_manager
+    run_key = (audit.get("cleaning_recommendation_run_id") or
+               st.session_state.get("registered_investigation_run_id"))
+    active_investigation = False
+    if run_key:
+        exploration = exploration_manager().snapshot(run_key)
+        registered = investigation_manager().snapshot(run_key)
+        active_investigation = any(
+            isinstance(job, dict) and job.get("status") == "running"
+            for job in (exploration, registered)
+        )
+    can_download, reviewed_count, review_count = _cleaning_export_gate(
+        catalog, st.session_state.cleaning_review_statuses,
+        st.session_state.cleaning_plans_by_finding,
+        st.session_state.cleaning_batch_queue_by_finding,
+        st.session_state.cleaning_pending_gemma_b,
+        st.session_state.cleaning_pending_visual_flags_by_finding,
+        investigation_running=active_investigation,
+    )
+    # Explicit button size; use Streamlit's native primary (green-themed) button
+    # plus narrow, local styling for the download widget only.
+    st.markdown("""
+    <style>
+    div[data-testid="stDownloadButton"] button[kind="primary"] {
+        background-color: #15803d !important;
+        border-color: #15803d !important;
+        color: #ffffff !important;
+        font-size: 1.1rem !important;
+        font-weight: 700 !important;
+        min-height: 3.3rem !important;
+        padding: 0.8rem 1.6rem !important;
+    }
+    div[data-testid="stDownloadButton"] button[kind="primary"]:hover:not(:disabled) {
+        background-color: #166534 !important;
+        border-color: #166534 !important;
+    }
+    div[data-testid="stDownloadButton"] button:disabled {
+        opacity: 0.46 !important;
+        cursor: not-allowed !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    if not can_download:
+        if active_investigation:
+            st.caption(f"Review complete: {reviewed_count}/{review_count} · Investigation still running")
+        else:
+            st.caption(f"Review complete: {reviewed_count}/{review_count}")
+    # Never compute or expose download bytes before the gate is satisfied.
+    # The disabled button is a visual indicator; `data` must not be an
+    # early-exportable partial output.
+    if not can_download:
         if hasattr(st, "download_button"):
             st.download_button(
-                "Download cleaned CSV" if len(uploaded) == 1
-                else "Download cleaned datasets (ZIP)",
-                data=data, file_name=file_name, mime=mime,
+                "Download cleaned CSV" if len(uploaded) == 1 else "Download cleaned datasets (ZIP)",
+                data=b"", file_name="review_required.txt", mime="text/plain",
                 key=f"cleaning_download_final_{session_context}",
+                type="primary", disabled=True,
             )
+    else:
+        try:
+            datasets_for_download = []
+            for i, file in enumerate(uploaded):
+                ds_id = f"dataset_{i+1}"
+                staged_bytes = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id)
+                original = dataset_paths[i].read_bytes()
+                data = staged_bytes if staged_bytes is not None else original
+                row_approvals = st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, [])
+                data = apply_approved_row_operations(original, data, row_approvals)
+                approvals = st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
+                data = apply_approved_column_deletions(
+                    original, data, approvals,
+                    approved_row_operations=row_approvals,
+                    staged_before_rows=staged_bytes if staged_bytes is not None else original)
+                datasets_for_download.append((ds_id, file.name, data))
+            file_name, mime, data = build_final_download(datasets_for_download)
+        except (ValueError, PermissionError, AssertionError, OSError, csv.Error) as exc:
+            st.error(f"Download unavailable: {exc}")
+        else:
+            if hasattr(st, "download_button"):
+                st.download_button(
+                    "Download cleaned CSV" if len(uploaded) == 1
+                    else "Download cleaned datasets (ZIP)",
+                    data=data, file_name=file_name, mime=mime,
+                    key=f"cleaning_download_final_{session_context}",
+                    type="primary", disabled=False,
+                )
 
 
 def _prepare_finding_discussion(
@@ -3842,6 +4210,30 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
         # needed; _record_gemma_b_response still enforces scoped validation
         # and the independent R / human-approval workflow.
         if not require_gemma_review:
+            # A visual flag is NOT a replacement-cell operation. The host
+            # resolves its coordinates and original values deterministically.
+            # Never forward this intent to Gemma's numeric-edit-only schema.
+            if source:
+                from healthcare_data_quality.visual_flags import requested_visual_flag
+                try:
+                    flag_plan = requested_visual_flag(question, finding, source)
+                except ValueError as exc:
+                    thread.append({"role": "assistant", "content": f"Flag not prepared: {exc}"})
+                    st.session_state.cleaning_review_statuses[fid] = "Discussion open"
+                    return
+                if flag_plan is not None:
+                    for item in thread:
+                        if item.get("role") == "assistant":
+                            item["controls_expired"] = True
+                    st.session_state.cleaning_plans_by_finding.pop(fid, None)
+                    st.session_state.cleaning_batch_queue_by_finding.pop(fid, None)
+                    st.session_state.cleaning_pending_visual_flags_by_finding[fid] = {
+                        **flag_plan, "request": question}
+                    st.session_state.cleaning_review_statuses[fid] = "Visual flag awaiting approval"
+                    thread.append({"role": "assistant", "content":
+                                   f"Flag {len(flag_plan['flags'])} taxonomy names bold red. "
+                                   "Values unchanged; review below."})
+                    return
             from healthcare_data_quality.finding_cleaning import (
                 propose_explicit_user_row_deletion, propose_bulk_blank_row_deletion,
             )
@@ -4851,7 +5243,11 @@ def render_full_dataset_section(
         full_table.index = pd.RangeIndex(
             start=2, stop=len(full_table) + 2, name="CSV row"
         )
-        st.dataframe(full_table, hide_index=False, width="stretch", height=650)
+        from healthcare_data_quality.visual_flags import styled_dataset_preview
+        flags = st.session_state.get("cleaning_visual_flags_by_dataset", {}).get(
+            f"dataset_{index + 1}", [])
+        st.dataframe(styled_dataset_preview(full_table, flags),
+                     hide_index=False, width="stretch", height=650)
     except (UnicodeError, csv.Error, OSError) as exc:
         st.error(f"Could not display the complete CSV: {exc}")
         return False
@@ -4887,6 +5283,112 @@ def _poll_agent_c_completion() -> None:
         st.rerun()
 
 
+def _agent_b_first_suggestion_ready(audit: dict, context_key: str) -> bool:
+    """Only a fresh model-generated recommendation from THIS run unlocks Agent C.
+
+    Historical review-memory markers, pending and failed queue records are not
+    valid suggestions. Agent A can continue exploring while C is unlocked.
+    """
+    from cleaning_jobs import recommendation_manager, job_fingerprint
+
+    run_id = audit.get("cleaning_recommendation_run_id")
+    if not isinstance(run_id, str) or not run_id:
+        return False
+    try:
+        key = job_fingerprint(context_key, [], run_id=run_id)
+        snapshot = recommendation_manager().snapshot(key) or {}
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return False
+    return any(isinstance(entry, dict) and entry.get("status") == "ready"
+               and entry.get("origin") != "review_memory"
+               and bool(entry.get("suggestion"))
+               for entry in (snapshot.get("entries") or {}).values())
+
+
+def render_skills_memory_page() -> None:
+    """Review learning capacity, disable historical recall and manage safe skills."""
+    from skills_memory_manager import (
+        overview, human_bytes, disable_rule, delete_skill, clear_learning_events,
+    )
+
+    st.subheader("Manage skills & memory")
+    st.caption("Learns from named approvals and review feedback. Saved methods and generated skills are advisory; each new edit still needs source verification and your approval.")
+    try:
+        stats = overview()
+    except (OSError, ValueError, TypeError, PermissionError) as exc:
+        st.error(f"Local learning storage is unavailable: {exc}")
+        return
+
+    cols = st.columns(4)
+    for col, title, amount in zip(cols,
+                                  ("Reusable rules", "Learning events", "Generated skills", "Disk usage"),
+                                  (stats["active_rules"], stats["learning_events"],
+                                   stats["skills"], human_bytes(stats["storage_bytes"]))):
+        col.metric(title, amount)
+    import shutil
+    free_bytes = shutil.disk_usage(Path(__file__).resolve().parent).free
+    st.caption(
+        f"{stats['stored_reviews']} saved approval record(s) · {human_bytes(free_bytes)} free disk. "
+        "No fixed application storage quota. Method recall considers recent review history; "
+        "skill generation uses the latest 300 learning events and requires repeated approvals."
+    )
+
+    st.markdown("**Generated skills**")
+    if not stats["skill_details"]:
+        st.caption("No learned skills yet. Repeated approved actions can create advisory skills through local Gemma.")
+    else:
+        for skill in stats["skill_details"]:
+            with st.expander(f"{skill['title']} · {skill['approval_count']} approved examples"):
+                st.write("When useful:", skill["when_to_suggest"] or "Not specified")
+                st.write("Suggested method:", skill["recommended_method"] or "Not specified")
+                st.write("Limit:", skill["do_not_assume"] or "Always validate the new source")
+                st.caption(f"Updated {skill['updated_at'] or 'unknown'} · {human_bytes(skill['bytes'])}")
+                confirm = st.checkbox("Confirm removal of this skill", key=f"memory_skill_confirm_{skill['family']}")
+                if st.button("Remove skill", key=f"memory_skill_delete_{skill['family']}",
+                             disabled=not confirm):
+                    try:
+                        if delete_skill(skill["family"]):
+                            st.success("Skill removed. Historical approved decisions are retained.")
+                            st.rerun()
+                    except (OSError, ValueError) as exc:
+                        st.error(str(exc))
+
+    st.markdown("**Previously approved methods**")
+    st.caption("These methods are suggestions for future investigations, not pre-approved actions. Disabling recall preserves their audit trail and existing staged changes.")
+    rules = stats["rules"]
+    if rules:
+        names = {r["id"]: (f"{r['title']} · {r['reviewed_at'][:10]} "
+                           f"· {r['operation_count']} operation(s)") for r in rules if r["id"]}
+        if names:
+            selected = st.selectbox("Remembered rule", options=list(names),
+                                    format_func=lambda key: names.get(key, key), key="memory_manage_rule")
+            if st.checkbox("Confirm disabling this rule for future suggestions", key="memory_confirm_rule"):
+                if st.button("Disable rule recall", key="memory_disable_rule"):
+                    try:
+                        if disable_rule(selected):
+                            st.success("Historical rule disabled for future suggestions.")
+                            st.rerun()
+                        else:
+                            st.info("This rule is already disabled or unavailable.")
+                    except (OSError, ValueError) as exc:
+                        st.error(str(exc))
+    else:
+        st.caption("No active approved methods to recall.")
+
+    with st.expander("Learning-history controls"):
+        st.caption("Removes preference-learning events only. It does not delete approvals, current edits, or generated skills.")
+        confirm = st.text_input("Type CLEAR LEARNING to confirm", key="memory_clear_learning_confirmation")
+        if st.button("Clear learning history", disabled=confirm.strip() != "CLEAR LEARNING",
+                     key="memory_clear_learning"):
+            try:
+                clear_learning_events()
+            except (OSError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.success("Learning events cleared; approved decisions preserved.")
+                st.rerun()
+
+
 def render_ui() -> None:
     st.set_page_config(page_title="Healthcare Data Quality AI", page_icon="🔬", layout="wide")
     # Style the named host container: an iframe cannot stick to the page by
@@ -4902,16 +5404,19 @@ def render_ui() -> None:
     with st.container(key="hdq_investigation_banner"):
         live_banner_slot = st.empty()
 
-    uploaded = st.file_uploader(
-        "Upload one or more CSV datasets",
+    uploaded_file = st.file_uploader(
+        "Upload one CSV dataset",
         type=["csv"],
-        accept_multiple_files=True,
-        help="Up to four local CSV files, maximum 20 MiB each. The first is the primary dataset.",
+        accept_multiple_files=False,
+        help="One local CSV file (maximum 20 MiB) per investigation.",
     )
+    uploaded = [uploaded_file] if uploaded_file is not None else []
     if not uploaded:
         render_pre_investigation_status(live_banner_slot, state="no_dataset")
         st.info("Upload a CSV dataset to inspect its structure and start the investigation.")
         render_saved_file_manager(None)
+        with st.expander("Manage skills & memory"):
+            render_skills_memory_page()
         return
     if len(uploaded) > MAX_DATASETS:
         st.error(f"Limit: {MAX_DATASETS} datasets per investigation.")
@@ -5182,16 +5687,16 @@ def render_ui() -> None:
     else:
         render_live_investigation_status(audit, cache_key, header_reports, include_exploration, live_banner_slot)
 
-    results_tab_labels = ["Data quality findings", "Supporting evidence", "Clean data with Gemma"]
+    results_tab_labels = ["Data quality findings", "Clean data with Gemma", "Supporting evidence", "Manage skills & memory"]
     # On Streamlit releases with stateful tabs, persist the selected tab across
     # *any* unavoidable full-app rerun. Older releases retain the old API;
     # fragment isolation below still prevents routine polling from remounting it.
     try:
-        summary_tab, evidence_tab, cleaning_tab = st.tabs(
+        summary_tab, cleaning_tab, evidence_tab, skills_memory_tab = st.tabs(
             results_tab_labels, key="hdq_active_results_tab", on_change="rerun",
         )
     except TypeError:
-        summary_tab, evidence_tab, cleaning_tab = st.tabs(results_tab_labels)
+        summary_tab, cleaning_tab, evidence_tab, skills_memory_tab = st.tabs(results_tab_labels)
     with summary_tab:
         for dataset_id, baseline in (audit.get("dataset_baselines") or {"dataset_1": audit.get("baseline") or {}}).items():
             label_index = int(dataset_id.rsplit("_", 1)[-1]) - 1
@@ -5242,22 +5747,38 @@ def render_ui() -> None:
         else:
             refresh_export()
         st.caption("Keep downloaded audits in approved secure storage. They may contain sample identifiers and detailed source observations.")
+    with skills_memory_tab:
+        render_skills_memory_page()
     with cleaning_tab:
-        def refresh_cleaning():
-            # Render directly into the fragment's OWN root, not an external
-            # st.empty/container. Streamlit replaces fragment-owned elements
-            # on scoped reruns; explicitly emptying an external tab container
-            # unmounts the entire finding and jumps the browser scroll.
-            # Never run this editable review on a polling timer.
+        # Lock the main cleaning workflow until Agent B has produced at least
+        # one real, source-scoped recommendation for this investigation.
+        # Historical remembered rules and queued model jobs never unlock it.
+        def _wait_for_first_suggestion():
             current = st.session_state.get("audit_result") or audit
-            sync_live_exploration(current, cache_key)
-            render_cleaning_workspace(paths, uploaded, current, cache_key)
+            if _agent_b_first_suggestion_ready(current, cache_key):
+                st.rerun()
+            st.caption("Agent C is locked until Agent B's first suggestion is ready.")
 
-        if hasattr(st, "fragment"):
-            st.fragment(refresh_cleaning)()
-            st.fragment(run_every="3s")(_poll_agent_c_completion)()
+        if not _agent_b_first_suggestion_ready(st.session_state.get("audit_result") or audit, cache_key):
+            st.info("Waiting for the first Agent B suggestion. Cleaning and Gemma discussion are unavailable until then.")
+            if hasattr(st, "fragment"):
+                st.fragment(run_every="3s")(_wait_for_first_suggestion)()
         else:
-            refresh_cleaning()
+            def refresh_cleaning():
+                # Render directly into the fragment's OWN root, not an external
+                # st.empty/container. Streamlit replaces fragment-owned elements
+                # on scoped reruns; explicitly emptying an external tab container
+                # unmounts the entire finding and jumps the browser scroll.
+                # Never run this editable review on a polling timer.
+                current = st.session_state.get("audit_result") or audit
+                sync_live_exploration(current, cache_key)
+                render_cleaning_workspace(paths, uploaded, current, cache_key)
+
+            if hasattr(st, "fragment"):
+                st.fragment(refresh_cleaning)()
+                st.fragment(run_every="3s")(_poll_agent_c_completion)()
+            else:
+                refresh_cleaning()
 
 
 if __name__ == "__main__":

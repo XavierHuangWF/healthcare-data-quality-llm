@@ -138,16 +138,29 @@ def allowed_positions(finding: dict, source: Path) -> tuple[set[tuple[int, int]]
 # evidence. A row can be deleted even when the current finding concerns missing
 # values, but only when the actual user text identifies an exact CSV row.
 # This parser is used on the USER message in the host, never on Gemma's reply.
+# Parse whole *explicit* row-ID lists, not just the first number.  A command
+# such as "delete row 9, row 10 and row 11; keep row 12" identifies three
+# deletions; the separate KEEP clause is never a deletion authorization.
 _EXPLICIT_DELETE_ROW_RE = re.compile(
     r"\b(?:delete|drop|remove)\s+(?:the\s+)?(?:both\s+)?"
     r"(?:(?:entire|whole|full)\s+)?(?:(?:original|csv)\s+){0,2}"
-    r"rows?\s*#?\s*(\d+(?:\s*(?:,\s*|and\s+|&\s*)+\d+)*)\b",
+    r"rows?\s*#?\s*(\d+)\b", re.IGNORECASE,
+)
+_NEXT_DELETE_ROW_RE = re.compile(
+    r"\s*(?:(?:[,;.&]|\band\b)\s*(?:\band\b\s*)?"
+    r"(?:(?:original|csv)\s+)?(?:rows?\s*#?\s*)?(\d+)\b"
+    r"|(?:(?:original|csv)\s+)?rows?\s*#?\s*(\d+)\b)",
     re.IGNORECASE,
 )
 
 
 def explicitly_requested_row_deletions(user_text: str) -> frozenset[int]:
-    """Extract specific user-selected CSV row IDs, never model-inferred IDs."""
+    """Parse *all* source row IDs explicitly included in deletion clauses.
+
+    Never parse the IDs in a subsequent "keep row", "merge row" or Gemma
+    explanation as deletions.  This parser is invoked on the real user's
+    request; model-generated coordinates do not count as permission.
+    """
     if not isinstance(user_text, str) or len(user_text) > 4000:
         return frozenset()
     value = user_text.strip()
@@ -159,8 +172,19 @@ def explicitly_requested_row_deletions(user_text: str) -> frozenset[int]:
         r"(?:delete|drop|remove)\b", value, re.I
     ):
         return frozenset()
-    matches = list(_EXPLICIT_DELETE_ROW_RE.finditer(value))
-    ids = [int(n) for match in matches for n in re.findall(r"\d+", match.group(1))]
+    ids = []
+    for matched in _EXPLICIT_DELETE_ROW_RE.finditer(value):
+        # A "keep row N" clause may appear after the first deletion number.
+        # Follow only an adjacent list of numbers and optional 'row' labels.
+        group = [int(matched.group(1))]
+        offset = matched.end()
+        while True:
+            next_row = _NEXT_DELETE_ROW_RE.match(value, offset)
+            if next_row is None:
+                break
+            group.append(int(next_row.group(1) or next_row.group(2)))
+            offset = next_row.end()
+        ids.extend(group)
     if not ids or len(ids) > 32 or len(set(ids)) != len(ids) or any(row < 2 for row in ids):
         return frozenset()
     return frozenset(ids)
