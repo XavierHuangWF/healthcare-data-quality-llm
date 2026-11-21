@@ -11,6 +11,7 @@ for any verified derived-copy operation. All data and audits stay local.
 
 import csv
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -25,8 +26,8 @@ from uuid import uuid4
 import pandas as pd
 import streamlit as st
 
-from investigation_progress import InvestigationProgress, format_elapsed, live_timer_html
-from exploration_banner import (
+from healthcare_data_quality.ui.investigation_progress import InvestigationProgress, format_elapsed, live_timer_html
+from healthcare_data_quality.ui.exploration_banner import (
     recommendation_is_complete,
     recommendation_progress_counts,
     render_agent_c_banner_html,
@@ -38,15 +39,15 @@ from exploration_banner import (
     sticky_banner_css,
 )
 
-from history_store import (
+from healthcare_data_quality.storage.history_store import (
     list_history, update_annotations, delete_saved_file, build_history_zip,
     human_size, select_history_rows, latest_checkpoint_view,
     resolve_viewer_timezone, format_saved_time,
     DELETE_CONFIRMATION_TEXT, is_batch_delete_authorized, FILE_RE,
 )
 
-from healthcare_data_quality.ingestion import inspect_headers
-from healthcare_data_quality.finding_presentation import (
+from healthcare_data_quality.investigation.ingestion import inspect_headers
+from healthcare_data_quality.ui.finding_presentation import (
     CHECK_NAMES,
     STATUS_LABELS,
     TOOL_NAMES,
@@ -56,22 +57,22 @@ from healthcare_data_quality.finding_presentation import (
     history_observations,
 )
 from healthcare_data_quality.workflow import run_initial_audit
-from investigation_jobs import investigation_manager
-from healthcare_data_quality.llm_client import model_request_priority
-from healthcare_data_quality.exploratory_agent import MAX_ROUNDS
-from healthcare_data_quality.exploratory_combined import run_exploratory_series
-from healthcare_data_quality.exploratory_sandbox import sandbox_available, SandboxUnavailable
-from healthcare_data_quality.finding_evidence import (
+from healthcare_data_quality.jobs.investigation_jobs import investigation_manager
+from healthcare_data_quality.services.llm_client import model_request_priority
+from healthcare_data_quality.agents.exploratory_agent import MAX_ROUNDS
+from healthcare_data_quality.agents.exploratory_combined import run_exploratory_series
+from healthcare_data_quality.agents.exploratory_sandbox import sandbox_available, SandboxUnavailable
+from healthcare_data_quality.investigation.finding_evidence import (
     dataset_finding_evidence,
 )
-from evidence_view import (
+from healthcare_data_quality.ui.evidence_view import (
     baseline_evidence_trace, deterministic_detection_code, measurement_rows_for_display,
 )
-from healthcare_data_quality.cleaning_workspace import (
+from healthcare_data_quality.cleaning.cleaning_workspace import (
     ask_gemma_about_cleaning, validate_header_plan, agent_c_clarification_options,
 )
-from healthcare_data_quality.cleaning_authorization import file_sha256
-from healthcare_data_quality.source_inventory import source_inventory, concise_source_context
+from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
+from healthcare_data_quality.investigation.source_inventory import source_inventory, concise_source_context
 
 # Reuse the CLI's existing recommendation assessment, including its provenance
 # and partial-coverage rules. No CLI main() or remediation entry point is called.
@@ -193,11 +194,32 @@ EXPLORATION_CACHE_DIR = (
 )
 
 
+# Resolve the actual installed modules instead of assuming a flat src/ layout.
+# This fingerprint must follow future package refactors without breaking the UI.
+_EXPLORATION_SOURCE_MODULES = (
+    "healthcare_data_quality.agents.exploratory_agent",
+    "healthcare_data_quality.agents.exploratory_dedup",
+    "healthcare_data_quality.agents.exploratory_combined",
+    "healthcare_data_quality.agents.exploratory_sandbox",
+    "healthcare_data_quality.agents.exploratory_runner",
+)
+
+
 def exploration_cache_key(baseline_key: str) -> str:
     digest = hashlib.sha256(("exploration-v1:" + baseline_key).encode("utf-8"))
-    root = Path(__file__).resolve().parent / "src" / "healthcare_data_quality"
-    for name in ("exploratory_agent.py", "exploratory_dedup.py", "exploratory_combined.py", "exploratory_sandbox.py", "exploratory_runner.py"):
-        digest.update((root / name).read_bytes())
+    project_source = (Path(__file__).resolve().parent / "src").resolve()
+    for module_name in _EXPLORATION_SOURCE_MODULES:
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or not spec.origin:
+            raise FileNotFoundError(f"Exploration source module cannot be resolved: {module_name}")
+        source_path = Path(spec.origin).resolve()
+        if (not source_path.is_file() or source_path.suffix != ".py"
+                or not source_path.is_relative_to(project_source)):
+            raise FileNotFoundError(
+                f"Exploration source module is missing or outside this project: {module_name}"
+            )
+        digest.update(module_name.encode("utf-8"))
+        digest.update(hashlib.sha256(source_path.read_bytes()).digest())
     digest.update(os.environ.get("HDQ_MODEL_REVISION", "").encode("utf-8"))
     return digest.hexdigest()
 
@@ -1128,8 +1150,7 @@ def schedule_agent_b_once(context_key: str, audit: dict, paths: list[Path],
     First call follows deterministic QC; a second call after Gemma exploration
     only appends new checks. No UI action or cleaned version re-runs advice.
     """
-    from cleaning_jobs import recommendation_manager
-    from healthcare_data_quality.finding_cleaning import build_cleaning_findings
+    from healthcare_data_quality.cleaning.finding_cleaning import build_cleaning_findings
     run_id = audit.get("cleaning_recommendation_run_id")
     if not run_id:
         return None
@@ -1139,7 +1160,7 @@ def schedule_agent_b_once(context_key: str, audit: dict, paths: list[Path],
     # Historical approvals are inputs to NEW Gemma assessments, never ready
     # recommendations. Reuse only relevant, bounded method summaries, including
     # related finding/check types, before the worker publishes a suggestion.
-    from cleaning_jobs import recommendation_manager, reviewed_method_context
+    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, reviewed_method_context
     reviewed_methods = {}
     for finding in findings:
         ds_id = str(finding.get("dataset_id") or "")
@@ -1165,8 +1186,23 @@ def schedule_agent_b_once(context_key: str, audit: dict, paths: list[Path],
             if len(candidates) >= 16:
                 break
         reviewed_methods[finding["id"]] = candidates
+    # Source paths are intentionally held only in the worker's process
+    # memory. A later approval can therefore influence findings that were
+    # queued but had not yet received their Gemma inference call.
+    source_paths_by_finding = {}
+    for finding in findings:
+        ds_id = str(finding.get("dataset_id") or "")
+        try:
+            index = int(ds_id.rsplit("_", 1)[-1]) - 1
+        except (ValueError, IndexError):
+            index = -1
+        if 0 <= index < len(paths):
+            source_paths_by_finding[str(finding["id"])] = Path(paths[index])
+        elif len(paths) == 1:
+            source_paths_by_finding[str(finding["id"])] = Path(paths[0])
     return recommendation_manager().start(
         context_key, findings, run_id=run_id, reviewed_methods=reviewed_methods,
+        source_paths_by_finding=source_paths_by_finding,
     )
 
 
@@ -1255,7 +1291,7 @@ def _open_agent_c_alternative_chat(fid: str, *, discard_plan: bool = False) -> N
     finding_for_memory = st.session_state.get("cleaning_finding_type_lookup", {}).get(fid)
     if finding_for_memory:
         try:
-            from healthcare_data_quality.adaptive_skill_memory import record_review
+            from healthcare_data_quality.learning.adaptive_skill_memory import record_review
             record_review(finding_for_memory, "declined_proposal", build_skill=False)
         except (OSError, ValueError, RuntimeError, TypeError):
             pass
@@ -1295,7 +1331,7 @@ def _render_before_after(plans: list[dict]) -> None:
     Model prose and aggregate statistics are not substitutes for each source
     target's actual original value and proposed outcome.
     """
-    from healthcare_data_quality.reviewed_rule_replay import current_change_rows
+    from healthcare_data_quality.cleaning.reviewed_rule_replay import current_change_rows
     changes = current_change_rows(plans)
     if changes:
         st.dataframe(pd.DataFrame([
@@ -1471,7 +1507,7 @@ def _render_live_finding_assignment(fid: str) -> None:
     fragment reruns inside an expander/tab can leave stale form blocks mounted.
     The separate background completion poller delivers the final reply.
     """
-    from interactive_chat_jobs import interactive_chat_manager
+    from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
 
     pending = st.session_state.get("cleaning_pending_gemma_b", {}).get(fid)
     if not isinstance(pending, dict) or not pending.get("job_id"):
@@ -1513,9 +1549,10 @@ def _render_live_agent_b_finding(
     Yes/No buttons are redrawn when Agent B finishes; the chat textarea and
     approval forms elsewhere in the finding stay mounted.
     """
-    from cleaning_jobs import recommendation_manager
+    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager
 
     entry = {}
+    first_ready = False
     if job_id:
         try:
             snapshot = recommendation_manager().snapshot(job_id) or {}
@@ -1537,6 +1574,10 @@ def _render_live_agent_b_finding(
                 "suggestion": entry["suggestion"],
                 "decision_needed": entry.get("decision_needed", ""),
                 "memory_assessed": entry.get("memory_assessed", False),
+                "method_candidates_considered": entry.get("method_candidates_considered", 0),
+                "skill_candidates_considered": entry.get("skill_candidates_considered", 0),
+                "memory_assessment": entry.get("memory_assessment") or {},
+                "memory_context": entry.get("memory_context") or [],
                 "choices": entry.get("choices") or [],
                 "_source": "background",
             }
@@ -1558,7 +1599,14 @@ def _render_live_agent_b_finding(
     if suggestion and suggestion.get("_source") == "review_memory":
         return
     if suggestion:
-        from recommendation_options import source_backed_choices
+        from healthcare_data_quality.ui.recommendation_memory_trace import memory_trace
+        trace = memory_trace(suggestion)
+        st.caption(trace["summary"])
+        if trace["details"]:
+            with st.expander("Memory assessment", expanded=False):
+                for line in trace["details"]:
+                    st.caption(line)
+        from healthcare_data_quality.services.recommendation_options import source_backed_choices
         options = source_backed_choices(finding, source, suggestion)
         # Exact Before -> After is the primary interface. Do not turn a
         # plausible model narrative into an unverified operation button.
@@ -1617,13 +1665,51 @@ def _render_live_agent_b_finding(
             st.caption('Recommendation queued')
         elif background_status == 'failed':
             st.caption('Recommendation unavailable — use Agent C to discuss')
-    # A child polling fragment cannot expand its parent directly. Rerun the
-    # main cleaning fragment once, when this finding first becomes ready.
-    if (entry.get("status") == "ready" and first_ready
-            and fid not in st.session_state.get("cleaning_parent_ready_ids", set())):
-        # A child fragment rerun cannot change its parent's expander state.
-        # One full rerun, never continuous polling reruns, opens the card.
-        st.rerun()
+    # Do NOT st.rerun() here. The default scope causes a FULL app rerun
+    # from nested Streamlit fragments, dimming/remounting the chat or a
+    # pending approval every time another background suggestion arrives.
+    # This fragment already shows new choices immediately. The parent card
+    # expands on its next intentional redraw; a ready marker can open it in
+    # the browser without re-executing Python or disrupting other findings.
+    if first_ready and entry.get("status") == "ready":
+        _expand_ready_finding_without_rerun(fid)
+
+
+def _expand_ready_finding_without_rerun(fid: str) -> None:
+    """Open the existing card without a Streamlit script rerun.
+
+    Only the card that contains this fragment is touched; do not scroll or
+    change an active reviewer decision. Browsers that disallow iframe parent
+    access simply keep the normal manually expandable heading.
+    """
+    from html import escape
+    try:
+        from streamlit.components.v1 import html as component_html
+    except ImportError:
+        # Minimal unit-test stubs intentionally have no component runtime.
+        return
+    marker = hashlib.sha256(fid.encode("utf-8")).hexdigest()[:20]
+    st.markdown(
+        f'<span class="hdq-agent-b-ready" data-finding="{marker}" '
+        'style="display:none" aria-hidden="true"></span>',
+        unsafe_allow_html=True,
+    )
+    component_html('''<script>
+    (() => {
+      const marker = "{marker}";
+      const expand = () => {
+        try {
+          const element = window.parent.document.querySelector(
+            '.hdq-agent-b-ready[data-finding="' + marker + '"]');
+          const card = element && element.closest('details');
+          if (card && !card.querySelector('.hdq-cleaning-completed-marker')) {
+            card.open = true;
+          }
+        } catch (_) { /* UI-only fallback: manual expansion remains available */ }
+      };
+      window.requestAnimationFrame(expand);
+    })();
+    </script>'''.replace("{marker}", marker), height=0, scrolling=False)
 
 
 def _is_blank_control_check(finding: dict) -> bool:
@@ -1650,8 +1736,8 @@ def _reconcile_approved_column_review(fid: str, ds_id: str, source: Path) -> boo
         "cleaning_batch_queue_by_finding", {}).get(fid, [])]
     if not plans:
         return False
-    from healthcare_data_quality.cleaning_authorization import file_sha256
-    from healthcare_data_quality.in_memory_cleaning import _records
+    from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
+    from healthcare_data_quality.cleaning.in_memory_cleaning import _records
     headers = _records(source.read_bytes())[0]
     source_hash = file_sha256(source)
     approved = {
@@ -1724,23 +1810,22 @@ def render_cleaning_workspace(
 ) -> None:
     """Agent C reviews Agent B advice, negotiates scoped changes and R approval."""
     from contextlib import nullcontext
-    from cleaning_review import (
-        ask_gemma_for_review_options, indexed_review_catalog, review_question,
-    )
-    from healthcare_data_quality.finding_cleaning import (
+    from healthcare_data_quality.ui.cleaning_review import (
+        indexed_review_catalog, )
+    from healthcare_data_quality.cleaning.finding_cleaning import (
         allowed_positions, build_cleaning_findings, validate_scoped_plan,
     )
-    from healthcare_data_quality.in_memory_cleaning import (
+    from healthcare_data_quality.cleaning.in_memory_cleaning import (
         apply_verified_in_memory, assess_verified_in_memory, build_final_download,
         review_completion, apply_approved_column_deletions,
         apply_approved_row_operations, _records, sha256_bytes,
     )
 
-    from healthcare_data_quality.scoped_r_execution import (
+    from healthcare_data_quality.r_runtime.scoped_r_execution import (
         prepare_and_execute_scoped_r_preview, verify_prepared_r_insertion,
         verify_r_against_current_staged_values,
     )
-    from healthcare_data_quality.r_diagnostics import (
+    from healthcare_data_quality.r_runtime.r_diagnostics import (
         diagnose_r_preview_failure, run_r_environment_self_test,
     )
     st.subheader("Agent C — Interactive cleaning")
@@ -1788,7 +1873,9 @@ def render_cleaning_workspace(
         st.session_state.cleaning_recovery_dismissed = bool(
             run_id and st.session_state.get("cleaning_fresh_review_run_id") == run_id
         )
-        st.session_state.cleaning_approved_reviewer = ""
+        st.session_state.cleaning_approved_reviewer = (
+            st.session_state.get("hdq_registered_reviewer") or ""
+        )
         st.session_state.cleaning_rebased_previews_by_finding = {}
         st.session_state.cleaning_completed_audits_by_finding = {}
         st.session_state.cleaning_keep_open_by_finding = {}
@@ -1848,6 +1935,12 @@ def render_cleaning_workspace(
             if key not in st.session_state:
                 st.session_state[key] = empty
 
+    # Keep one registered reviewer for every approval in this investigation,
+    # including when a cached result or saved checkpoint initializes Agent C.
+    registered_identity = str(st.session_state.get("hdq_registered_reviewer") or "").strip()
+    if registered_identity:
+        st.session_state.cleaning_approved_reviewer = registered_identity
+
     # Migrate older sessions that already contain saved working CSVs. Read the
     # latest version into memory; NEVER create or delete any CSV here.
     legacy_paths = st.session_state.get("cleaning_working_paths") or {}
@@ -1875,7 +1968,7 @@ def render_cleaning_workspace(
     # A cached investigation and a remembered decision are not a staged edit.
     # Save only approved DELTAS and explicit no-change reviews, never the whole
     # source CSV. Restoration requires one affirmative click and revalidation.
-    from healthcare_data_quality.cleaning_stage_checkpoint import (
+    from healthcare_data_quality.cleaning.cleaning_stage_checkpoint import (
         save_approved_stage, load_approved_stage,
         verify_and_reconstruct, checkpoint_counts, LegacyCheckpointError,
         inspect_legacy_stage, archive_legacy_stage,
@@ -2041,12 +2134,8 @@ def render_cleaning_workspace(
     if restored_count is not None:
         st.success(f"Stage restored · {restored_count} findings with approved changes")
 
-    # The reviewer identifier is requested inside the FIRST approval form,
-    # next to the action it authorizes. Once verified staging succeeds, it is
-    # stored for this investigation and never requested again.
-    session_reviewer = st.session_state.get("cleaning_approved_reviewer") or ""
-    if session_reviewer:
-        st.caption(f"Reviewer for this cleaning session: {session_reviewer}")
+    # Reviewer identity was registered at upload; individual approval cards
+    # do not request it again. Each verified action still needs its own Yes.
 
     # Recall saved methods only as suggestions. Even exact-source matches
     # receive a fresh local Gemma applicability assessment before any plan is
@@ -2054,7 +2143,7 @@ def render_cleaning_workspace(
     # Agent B saves one suggestion per finding in the background. Agent C
     # handles interactive discussion, plans and authorization review.
     # Individual Agent B suggestion panels poll automatically.
-    from cleaning_jobs import recommendation_manager, job_fingerprint
+    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, job_fingerprint
     jobs = recommendation_manager()
     # Agent B runs once per finding during investigation, not by this tab.
     # Agent C consumes its immutable advice and never reruns Agent B.
@@ -2098,6 +2187,10 @@ def render_cleaning_workspace(
                 "suggestion": entry["suggestion"],
                 "decision_needed": entry.get("decision_needed", ""),
                 "memory_assessed": entry.get("memory_assessed", False),
+                "method_candidates_considered": entry.get("method_candidates_considered", 0),
+                "skill_candidates_considered": entry.get("skill_candidates_considered", 0),
+                "memory_assessment": entry.get("memory_assessment") or {},
+                "memory_context": entry.get("memory_context") or [],
                 "choices": entry.get("choices") or [],
                 "_source": "background",
             }
@@ -2189,7 +2282,7 @@ def render_cleaning_workspace(
         if (source and not applied and finding.get("check_key") in {
                 "inspect_taxonomy_structure", "inspect_taxonomy_naming"}
                 and any(event.get("dataset_id") == ds_id for event in history_all)):
-            from healthcare_data_quality.direct_actions import already_resolved_format_issue
+            from healthcare_data_quality.cleaning.direct_actions import already_resolved_format_issue
             staged_now = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id)
             if staged_now and already_resolved_format_issue(finding, source, staged_now):
                 for field in (
@@ -2275,7 +2368,7 @@ def render_cleaning_workspace(
                                key=f"review_completed_audit_{fid}"):
                     completed_audit = st.session_state.cleaning_completed_audits_by_finding.get(fid) or {}
                     changes = completed_audit.get("changes") or []
-                    from healthcare_data_quality.reviewed_rule_replay import current_change_rows
+                    from healthcare_data_quality.cleaning.reviewed_rule_replay import current_change_rows
                     operation_types = {event.get("operation") for event in applied}
                     reviewed_plans = []
                     for change in changes:
@@ -2297,7 +2390,7 @@ def render_cleaning_workspace(
                     # lack a completed_audit. Recover exact BEFORE values from
                     # the immutable CSV, never infer a value from Gemma prose.
                     if not reviewed_plans and source:
-                        from healthcare_data_quality.in_memory_cleaning import _records
+                        from healthcare_data_quality.cleaning.in_memory_cleaning import _records
                         original_records = _records(source.read_bytes())
                         for event in applied:
                             op = event.get("operation")
@@ -2333,10 +2426,12 @@ def render_cleaning_workspace(
                     visual_flag_events = [item for item in applied
                                           if item.get("operation") == "flag_cells"]
                     if visual_flag_events:
-                        from healthcare_data_quality.visual_flags import flag_preview_html
+                        from healthcare_data_quality.cleaning.visual_flags import flag_preview_html
                         approved_visual = [item for event in visual_flag_events
                                            for item in event.get("flags", [])]
                         if approved_visual:
+                            st.caption("Visual flag — original cell values unchanged. "
+                                       "Use the highlighted Excel download to retain red/bold formatting.")
                             st.markdown(flag_preview_html(approved_visual),
                                         unsafe_allow_html=True)
                     if rows_for_display:
@@ -2355,7 +2450,7 @@ def render_cleaning_workspace(
                             st.error("Select the original CSV before revising this review.")
                         else:
                             try:
-                                from healthcare_data_quality.interaction_memory import revoke_reviewed_solution
+                                from healthcare_data_quality.learning.interaction_memory import revoke_reviewed_solution
                                 visual_only = bool(applied) and all(
                                     event.get("operation") == "flag_cells" for event in applied)
                                 if visual_only:
@@ -2366,7 +2461,7 @@ def render_cleaning_workspace(
                                                 "history": [event for event in st.session_state.cleaning_history
                                                             if event.get("finding_id") != fid]}
                                 elif applied:
-                                    from healthcare_data_quality.approved_revision import reverse_approved_finding
+                                    from healthcare_data_quality.cleaning.approved_revision import reverse_approved_finding
                                     snapshot = reverse_approved_finding(
                                         source,
                                         st.session_state.cleaning_staged_bytes_by_dataset.get(
@@ -2386,7 +2481,7 @@ def render_cleaning_workspace(
                                     for other_id, review_status in
                                     st.session_state.cleaning_review_statuses.items())
                                 if not remaining_history and not remaining_reviews:
-                                    from healthcare_data_quality.cleaning_stage_checkpoint import invalidate_approved_stage
+                                    from healthcare_data_quality.cleaning.cleaning_stage_checkpoint import invalidate_approved_stage
                                     invalidate_approved_stage(source_paths)
                                 revoke_reviewed_solution(finding, source)
                                 if visual_only:
@@ -2424,7 +2519,7 @@ def render_cleaning_workspace(
             evidence = finding.get("evidence") or []
             if evidence and st.checkbox("Show original evidence",
                                         value=True, key=f"review_evidence_{fid}"):
-                from healthcare_data_quality.visual_flags import styled_evidence
+                from healthcare_data_quality.cleaning.visual_flags import styled_evidence
                 current_flags = st.session_state.cleaning_visual_flags_by_dataset.get(ds_id, [])
                 st.dataframe(styled_evidence(evidence, current_flags),
                              hide_index=True, width="stretch")
@@ -2434,21 +2529,15 @@ def render_cleaning_workspace(
             # clarification. This form is the one named approval for all flags.
             flag_plan = st.session_state.cleaning_pending_visual_flags_by_finding.get(fid)
             if flag_plan and source:
-                from healthcare_data_quality.visual_flags import flag_preview_html, requested_visual_flag
-                st.markdown('**Flag taxonomy — bold red (display only)**')
+                from healthcare_data_quality.cleaning.visual_flags import flag_preview_html, requested_visual_flag
+                st.markdown('**Flag taxonomy — bold red (visible in Excel export)**')
                 st.markdown(flag_preview_html(flag_plan["flags"]), unsafe_allow_html=True)
                 with st.form(f"review_visual_flag_{fid}_{_active_agent_c_control_generation(fid)}"):
                     flag_reviewer = st.session_state.get("cleaning_approved_reviewer") or ""
-                    if flag_reviewer:
-                        st.caption("Reviewer: " + flag_reviewer)
-                    else:
-                        flag_reviewer = st.text_input(
-                            "Reviewer identifier", key=f"visual_flag_reviewer_{fid}",
-                            max_chars=120)
                     yes_col, no_col = st.columns(2)
                     with yes_col:
                         accept_flag = st.form_submit_button(
-                            "Yes — Approve & Execute",
+                            "Yes — Approve & Execute", disabled=not bool(flag_reviewer),
                             key=f"flag_yes_{fid}_{_active_agent_c_control_generation(fid)}")
                     with no_col:
                         decline_flag = st.form_submit_button(
@@ -2466,7 +2555,7 @@ def render_cleaning_workspace(
                         try:
                             # Verify the *current source bytes and coordinates*
                             # immediately before approval. Flags carry no CSV edit.
-                            from healthcare_data_quality.visual_flags import requested_visual_flag
+                            from healthcare_data_quality.cleaning.visual_flags import requested_visual_flag
                             original_request = flag_plan["request"]
                             checked = requested_visual_flag(original_request, finding, source)
                             if (checked is None or checked["source_sha256"] != flag_plan["source_sha256"]
@@ -2493,7 +2582,9 @@ def render_cleaning_workspace(
                             st.session_state.cleaning_review_statuses[fid] = "Applied and verified"
                             st.session_state.cleaning_pending_visual_flags_by_finding.pop(fid, None)
                             st.session_state.cleaning_messages_by_finding.get(fid, []).append({
-                                "role": "assistant", "content": "Flag applied. CSV values unchanged."})
+                                "role": "assistant", "content":
+                                "Flag approved. Download highlighted Excel to retain formatting; "
+                                "CSV values are unchanged."})
                             _rerun_cleaning_fragment(fid)
                         except (ValueError, PermissionError, OSError, csv.Error, KeyError) as exc:
                             st.error(f"Flag could not be approved: {exc}")
@@ -2579,6 +2670,26 @@ def render_cleaning_workspace(
             # Job results are consumed by the UI, never by the worker. A
             # submitted user message is already visible while inference runs.
             _sync_gemma_conversations(finding, source)
+            # Recover an already-received prose-only "I will pad" reply from
+            # a prior UI version. Do not require the researcher to press a
+            # second "Prepare Changes" button for the same explicit request.
+            # Reconciliation is source-exact and never bypasses final approval.
+            prior_thread = st.session_state.cleaning_messages_by_finding.get(fid, [])
+            if (source and not completed and not st.session_state.cleaning_plans_by_finding.get(fid)
+                    and not st.session_state.cleaning_batch_queue_by_finding.get(fid)
+                    and fid not in st.session_state.cleaning_pending_gemma_b
+                    and st.session_state.cleaning_discussion_mode_by_finding.get(fid) == "alternative"
+                    and prior_thread and prior_thread[-1].get("role") == "assistant"
+                    and not prior_thread[-1].get("controls_expired")
+                    and "pad" in str(prior_thread[-1].get("content", "")).casefold()):
+                last_request = next((str(m.get("content") or "") for m in reversed(prior_thread)
+                                     if m.get("role") == "user" and not m.get("automatic")), "")
+                from healthcare_data_quality.cleaning.direct_actions import (
+                    propose_explicit_taxonomy_padding,
+                )
+                recovered = propose_explicit_taxonomy_padding(last_request, finding, source)
+                if recovered is not None:
+                    _record_gemma_b_response(fid, finding, source, recovered)
             # Obvious, reversible formatting inconsistencies do not need a
             # separate "fix" / "ok" / "draft" conversation. Construct exact
             # original BEFORE and AFTER values in Python, validate scope and R,
@@ -2590,7 +2701,7 @@ def render_cleaning_workspace(
                     and not st.session_state.cleaning_messages_by_finding.get(fid)
                     and fid not in st.session_state.cleaning_pending_gemma_b
                     and not st.session_state.cleaning_discussion_mode_by_finding.get(fid)):
-                from healthcare_data_quality.direct_actions import (
+                from healthcare_data_quality.cleaning.direct_actions import (
                     draft_format_correction, draft_identical_column_removal)
                 direct = (draft_identical_column_removal(finding, source)
                           if finding.get("check_key") == "compare_repeated_headers"
@@ -2622,7 +2733,11 @@ def render_cleaning_workspace(
                 with (agent_b_slot.container() if agent_b_slot is not None
                       else nullcontext()):
                     if hasattr(st, "fragment"):
-                        st.fragment(run_every="3s")(_render_live_agent_b_finding)(
+                        # Once this finding's recommendation is ready, stop
+                        # its polling timer. Otherwise ready cards keep
+                        # remounting their widgets every three seconds.
+                        st.fragment(run_every=None if fid in ready_ids else "3s")(
+                            _render_live_agent_b_finding)(
                             fid, finding, source, uploaded, dataset_paths, job_id, ds_id,
                         )
                     else:
@@ -2859,7 +2974,11 @@ def render_cleaning_workspace(
                             and st.session_state.cleaning_review_statuses.get(fid) != "Reviewed — no change"):
                         placeholder = ("Enter exact replacement values…" if custom_value_input
                                        else "Describe the new action or ask Agent C…")
-                        chat_key = f"review_message_{fid}_{_active_agent_c_control_generation(fid)}"
+                        # Keep the same widget identity across background
+                        # suggestions and model replies; rotating a generation
+                        # on every reply remounts chat and loses input focus.
+                        chat_key = (f"review_message_{fid}_" +
+                                    hashlib.sha256(session_context.encode("utf-8")).hexdigest()[:12])
                         message = (st.chat_input(placeholder, key=chat_key,
                                                  max_chars=4000, disabled=b_pending)
                                    if hasattr(st, "chat_input") else None)
@@ -2916,15 +3035,10 @@ def render_cleaning_workspace(
                                 can_delete = False
                         with st.form(f"review_drop_column_{fid}_{_active_agent_c_control_generation(fid)}"):
                             reviewer_for_approval = st.session_state.get("cleaning_approved_reviewer") or ""
-                            if reviewer_for_approval:
-                                st.caption("Reviewer: " + reviewer_for_approval)
-                            else:
-                                reviewer_for_approval = st.text_input(
-                                    "Reviewer identifier", key=f"review_drop_reviewer_{fid}", max_chars=120)
                             yes_col, no_col = st.columns(2)
                             with yes_col:
                                 approved = st.form_submit_button(
-                                    "Yes — Approve & Execute", disabled=not can_delete,
+                                    "Yes — Approve & Execute", disabled=not (can_delete and reviewer_for_approval),
                                     key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_column")
                             with no_col:
                                 decline_column = st.form_submit_button(
@@ -3026,7 +3140,7 @@ def render_cleaning_workspace(
                                 _render_before_after([checked])
                                 item = checked["changes"][0]
                                 # Show the actual numeric impact of merging before approval.
-                                from healthcare_data_quality.in_memory_cleaning import _sum_count_cells
+                                from healthcare_data_quality.cleaning.in_memory_cleaning import _sum_count_cells
                                 staged_rows = _records(staged_bytes)
                                 target, source_row = item["row"], item["source_row"]
                                 changes_preview = []
@@ -3060,15 +3174,10 @@ def render_cleaning_workspace(
                                 can_approve_rows = False
                         with st.form(f"review_row_operation_{fid}_{_active_agent_c_control_generation(fid)}"):
                             row_reviewer = st.session_state.get("cleaning_approved_reviewer") or ""
-                            if row_reviewer:
-                                st.caption("Reviewer: " + row_reviewer)
-                            else:
-                                row_reviewer = st.text_input(
-                                    "Reviewer identifier", key=f"review_row_reviewer_{fid}", max_chars=120)
                             yes_col, no_col = st.columns(2)
                             with yes_col:
                                 row_approved = st.form_submit_button(
-                                    "Yes — Approve & Execute", disabled=not can_approve_rows,
+                                    "Yes — Approve & Execute", disabled=not (can_approve_rows and row_reviewer),
                                     key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_rows")
                             with no_col:
                                 decline_rows = st.form_submit_button(
@@ -3292,7 +3401,7 @@ def render_cleaning_workspace(
                                     # a second approval checkbox is redundant.
                                     # Both edits still have isolated R proof,
                                     # and the final named Yes validates stage SHA.
-                                    from healthcare_data_quality.direct_actions import same_taxonomy_identity
+                                    from healthcare_data_quality.cleaning.direct_actions import same_taxonomy_identity
                                     prior_format_changes = {
                                         (pos.get("csv_row"), pos.get("column"))
                                         for event in history_all
@@ -3329,28 +3438,13 @@ def render_cleaning_workspace(
                                 can_approve = False
                                 st.error(f"In-memory insertion failed; no changes were staged: {exc}")
                             with st.form(f"review_execute_r_{fid}_{_active_agent_c_control_generation(fid)}"):
-                                # Only the first approval asks for an identifier. It
-                                # appears beside the approval button so researchers
-                                # never have to scroll back to the top of a long page.
                                 reviewer_for_approval = (
                                     st.session_state.get("cleaning_approved_reviewer") or ""
                                 )
-                                if reviewer_for_approval:
-                                    st.caption("Reviewer: " + reviewer_for_approval)
-                                elif hasattr(st, "text_input"):
-                                    reviewer_for_approval = st.text_input(
-                                        "Reviewer identifier (required once for this investigation)",
-                                        # More than one finding may have a pending
-                                        # cell-edit approval form in the same render.
-                                        # The investigation key alone is shared by
-                                        # every finding and raises DuplicateElementKey.
-                                        key=f"cleaning_reviewer_once_{session_context}_{fid}",
-                                        max_chars=120,
-                                    )
                                 yes_col, no_col = st.columns(2)
                                 with yes_col:
                                     execute = st.form_submit_button(
-                                        "Yes — Approve & Execute", disabled=not can_approve,
+                                        "Yes — Approve & Execute", disabled=not (can_approve and reviewer_for_approval),
                                         key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_cells")
                                 with no_col:
                                     decline_cells = st.form_submit_button(
@@ -3484,7 +3578,7 @@ def render_cleaning_workspace(
                     "finding_id": fid, "decision": "no_change_authorized_or_executed",
                 })
                 if source:
-                    from healthcare_data_quality.interaction_memory import save_reviewed_solution
+                    from healthcare_data_quality.learning.interaction_memory import save_reviewed_solution
                     try:
                         save_reviewed_solution(
                             finding, source, decision="reviewed_no_change",
@@ -3499,7 +3593,7 @@ def render_cleaning_workspace(
     # check is finished; no partially reviewed file should look final.
     # A still-running Agent A investigation can append new checks, so it also
     # holds the gate closed until the check catalog is stable.
-    from exploration_jobs import exploration_manager
+    from healthcare_data_quality.jobs.exploration_jobs import exploration_manager
     run_key = (audit.get("cleaning_recommendation_run_id") or
                st.session_state.get("registered_investigation_run_id"))
     active_investigation = False
@@ -3546,15 +3640,34 @@ def render_cleaning_workspace(
             st.caption(f"Review complete: {reviewed_count}/{review_count} · Investigation still running")
         else:
             st.caption(f"Review complete: {reviewed_count}/{review_count}")
-    # Never compute or expose download bytes before the gate is satisfied.
-    # The disabled button is a visual indicator; `data` must not be an
-    # early-exportable partial output.
+    # One export control. The user chooses the file format in a compact selector;
+    # when named visual flags were approved, XLSX is the default so their
+    # red/bold highlights are not lost in a plain-text CSV download.
+    from healthcare_data_quality.cleaning.styled_export import approved_flags_for_export
+    source_for_export = dataset_paths[0].read_bytes() if len(uploaded) == 1 else b""
+    try:
+        downloadable_flags = approved_flags_for_export(
+            st.session_state.get("cleaning_history", []), "dataset_1", source_for_export)
+    except (ValueError, PermissionError, KeyError, TypeError) as exc:
+        st.error(f"Approved visual flags cannot be exported: {exc}")
+        downloadable_flags = []
+        can_download = False
+    has_visual_flags = bool(downloadable_flags)
+    want_excel = False
+    if has_visual_flags:
+        # Keep CSV available for pipelines, but make formatting-preserving XLSX
+        # the first, default option. Neither format gets a second download button.
+        file_format = st.selectbox(
+            "Download format",
+            ["Excel (.xlsx) — preserves highlights", "CSV (.csv) — data only"],
+            index=0, key=f"cleaning_download_format_{session_context}",
+        )
+        want_excel = str(file_format).startswith("Excel")
     if not can_download:
         if hasattr(st, "download_button"):
             st.download_button(
-                "Download cleaned CSV" if len(uploaded) == 1 else "Download cleaned datasets (ZIP)",
-                data=b"", file_name="review_required.txt", mime="text/plain",
-                key=f"cleaning_download_final_{session_context}",
+                "Download cleaned dataset", data=b"", file_name="review_required.txt",
+                mime="text/plain", key=f"cleaning_download_final_{session_context}",
                 type="primary", disabled=True,
             )
     else:
@@ -3574,13 +3687,44 @@ def render_cleaning_workspace(
                     staged_before_rows=staged_bytes if staged_bytes is not None else original)
                 datasets_for_download.append((ds_id, file.name, data))
             file_name, mime, data = build_final_download(datasets_for_download)
+            if want_excel:
+                from healthcare_data_quality.cleaning.styled_export import build_styled_excel_download
+                file_name, data = build_styled_excel_download(
+                    datasets_for_download[0][2], original_csv=source_for_export,
+                    original_filename=uploaded[0].name,
+                    approved_flags=downloadable_flags,
+                    approved_row_operations=st.session_state.cleaning_approved_rows_by_dataset.get(
+                        "dataset_1", []),
+                    approved_column_deletions=st.session_state.cleaning_approved_columns_by_dataset.get(
+                        "dataset_1", []),
+                )
+                mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        except ImportError:
+            st.error("Excel export needs openpyxl in this Python environment. "
+                     "Install it with: python -m pip install openpyxl")
         except (ValueError, PermissionError, AssertionError, OSError, csv.Error) as exc:
             st.error(f"Download unavailable: {exc}")
         else:
+            if has_visual_flags:
+                from healthcare_data_quality.cleaning.styled_export import surviving_flag_count
+                visible_flags = surviving_flag_count(
+                    datasets_for_download[0][2], original_csv=source_for_export,
+                    approved_flags=downloadable_flags,
+                    approved_row_operations=st.session_state.cleaning_approved_rows_by_dataset.get(
+                        "dataset_1", []),
+                    approved_column_deletions=st.session_state.cleaning_approved_columns_by_dataset.get(
+                        "dataset_1", []),
+                )
+                removed_flags = len(downloadable_flags) - visible_flags
+                st.caption(f"{visible_flags} highlighted cell(s)" +
+                           (" · Excel includes red/bold text and yellow fill" if want_excel else
+                            " · CSV cannot retain styling") +
+                           (f" · {removed_flags} flagged target(s) were deleted" if removed_flags else ""))
             if hasattr(st, "download_button"):
                 st.download_button(
-                    "Download cleaned CSV" if len(uploaded) == 1
-                    else "Download cleaned datasets (ZIP)",
+                    "Download cleaned Excel (.xlsx)" if want_excel else
+                    "Download cleaned CSV" if len(uploaded) == 1 else
+                    "Download cleaned datasets (ZIP)",
                     data=data, file_name=file_name, mime=mime,
                     key=f"cleaning_download_final_{session_context}",
                     type="primary", disabled=False,
@@ -3592,7 +3736,7 @@ def _prepare_finding_discussion(
     dataset_paths: list[Path], question: str, *, automatic: bool = False,
 ):
     """Capture the exact submitted text and immutable context on the UI thread."""
-    from healthcare_data_quality.finding_cleaning import allowed_positions
+    from healthcare_data_quality.cleaning.finding_cleaning import allowed_positions
     fid = finding["id"]
     ds_id = finding.get("dataset_id", "")
     index = int(ds_id.rsplit("_", 1)[-1]) - 1 if ds_id.startswith("dataset_") else -1
@@ -3616,7 +3760,7 @@ def _prepare_finding_discussion(
     st.session_state.cleaning_r_errors_by_finding.pop(fid, None)
     st.session_state.cleaning_r_diagnostics_by_finding.pop(fid, None)
     st.session_state.cleaning_r_selfchecks_by_finding.pop(fid, None)
-    from healthcare_data_quality.evidence_registry import (
+    from healthcare_data_quality.investigation.evidence_registry import (
         build_finding_registry, verify_finding_registry, prompt_evidence,
     )
     registry = (verify_finding_registry(finding, source, enforce_source_hash=True) if source else None)
@@ -3648,7 +3792,7 @@ def _prepare_finding_discussion(
         }
     metadata = []
     if source and 0 <= index < len(dataset_paths):
-        from healthcare_data_quality.in_memory_cleaning import _records, sha256_bytes
+        from healthcare_data_quality.cleaning.in_memory_cleaning import _records, sha256_bytes
         original_bytes = source.read_bytes()
         original_records = _records(original_bytes)
         staged_bytes = st.session_state.cleaning_staged_bytes_by_dataset.get(
@@ -3692,7 +3836,7 @@ def _normalize_agent_c_current_before_values(response: dict, finding: dict,
     verifier. The later in-memory R recheck runs against the actual staged
     value. This never changes coordinates, suggested replacements or scope.
     """
-    from healthcare_data_quality.in_memory_cleaning import _records
+    from healthcare_data_quality.cleaning.in_memory_cleaning import _records
     if response.get("operation") not in {"replace_cells", "rename_headers"}:
         return response
     changes = response.get("changes")
@@ -3731,10 +3875,10 @@ def _normalize_agent_c_current_before_values(response: dict, finding: dict,
 def _render_compound_approval(fid: str, finding: dict, source: Path,
                               ds_id: str, catalog: list[dict]) -> None:
     """One atomic review/approval for all actions in one Agent C request."""
-    from healthcare_data_quality.compound_approval import (
+    from healthcare_data_quality.cleaning.compound_approval import (
         describe_operation, evaluate_compound, proposal_digest,
     )
-    from healthcare_data_quality.in_memory_cleaning import sha256_bytes
+    from healthcare_data_quality.cleaning.in_memory_cleaning import sha256_bytes
 
     plans = [st.session_state.cleaning_plans_by_finding[fid],
              *st.session_state.cleaning_batch_queue_by_finding.get(fid, [])]
@@ -3776,15 +3920,10 @@ def _render_compound_approval(fid: str, finding: dict, source: Path,
                 preview = None
         with st.form(f"review_compound_{fid}_{_active_agent_c_control_generation(fid)}"):
             reviewer = st.session_state.get("cleaning_approved_reviewer") or ""
-            if reviewer:
-                st.caption(f"Reviewer: {reviewer}")
-            else:
-                reviewer = st.text_input("Reviewer", max_chars=120,
-                                         key=f"review_compound_reviewer_{fid}")
             approve_col, reject_col = st.columns(2)
             with approve_col:
                 approve = st.form_submit_button(
-                    "Yes — Approve & Execute", disabled=preview is None,
+                    "Yes — Approve & Execute", disabled=preview is None or not reviewer,
                     key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_compound")
             with reject_col:
                 reject = st.form_submit_button(
@@ -3937,10 +4076,10 @@ def _remember_approved_agent_c_solution(fid: str, finding: dict,
     if len(approvals) - candidate["approvals_before"] < len(candidate["operations"]):
         return
     try:
-        from healthcare_data_quality.interaction_memory import save_reviewed_solution
+        from healthcare_data_quality.learning.interaction_memory import save_reviewed_solution
         if file_sha256(source) != candidate["source_sha256"]:
             raise ValueError("The source changed since the review proposal")
-        from healthcare_data_quality.reviewed_rule_replay import annotate_source_headers
+        from healthcare_data_quality.cleaning.reviewed_rule_replay import annotate_source_headers
         save_reviewed_solution(
             finding, source, operations=annotate_source_headers(candidate["operations"], source),
             decision="approved_edit", user_request=candidate["user_request"],
@@ -3958,7 +4097,7 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
     Multiple operations are independent plans. Approval of the first never
     silently discards the second, and no action executes at proposal time.
     """
-    from healthcare_data_quality.finding_cleaning import (
+    from healthcare_data_quality.cleaning.finding_cleaning import (
         expand_uniform_evidence_plan, explicitly_requested_row_deletions,
         requested_blank_row_scope,
     )
@@ -3973,10 +4112,10 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
         return
     st.session_state.setdefault("cleaning_compound_previews_by_finding", {}).pop(fid, None)
     thread = st.session_state.cleaning_messages_by_finding.setdefault(fid, [])
-    from healthcare_data_quality.cleaning_workspace import concise_agent_c_reply
+    from healthcare_data_quality.cleaning.cleaning_workspace import concise_agent_c_reply
     reply = concise_agent_c_reply(str(response["reply"]))
     if source:
-        from healthcare_data_quality.evidence_registry import (
+        from healthcare_data_quality.investigation.evidence_registry import (
             build_finding_registry, evidence_bound_response,
         )
         try:
@@ -4065,7 +4204,7 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
             expanded_total += expanded_count
         # Repeating an operation TYPE is safe. Repeating a SOURCE TARGET is
         # not: reject overlaps before the researcher can approve the group.
-        from healthcare_data_quality.compound_approval import validate_compound_targets
+        from healthcare_data_quality.cleaning.compound_approval import validate_compound_targets
         validate_compound_targets(verified_plans)
         # Only the current real user message can authorize out-of-finding row
         # deletion. This state is not populated from Gemma JSON or old chats.
@@ -4087,7 +4226,7 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
         st.session_state.setdefault("cleaning_batch_queue_by_finding", {})[fid] = remaining
         st.session_state.setdefault("cleaning_batch_total_by_finding", {})[fid] = len(verified_plans)
         st.session_state.cleaning_review_statuses[fid] = "Exact plan awaiting approval"
-        from healthcare_data_quality.cleaning_authorization import file_sha256
+        from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
         latest_user = next((str(item.get("content") or "") for item in reversed(thread)
                             if item.get("role") == "user" and not item.get("automatic")), "")
         if not latest_user or latest_user == "Review source-verified remembered cleaning rule":
@@ -4108,7 +4247,7 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
             "agent_response": reply,
             "source_sha256": file_sha256(source),
         }
-        from healthcare_data_quality.compound_approval import describe_operation
+        from healthcare_data_quality.cleaning.compound_approval import describe_operation
         summary = "\n".join(
             f"{index}. {describe_operation(item)}"
             for index, item in enumerate(verified_plans, start=1)
@@ -4149,8 +4288,8 @@ def _background_agents_idle_for_run(context_key: str, run_id: str) -> tuple[bool
     """
     if not context_key or not run_id:
         return False, False
-    from exploration_jobs import exploration_manager
-    from cleaning_jobs import recommendation_manager, job_fingerprint
+    from healthcare_data_quality.jobs.exploration_jobs import exploration_manager
+    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, job_fingerprint
     try:
         a_idle = (not investigation_manager().has_running_jobs()
                   and not exploration_manager().has_running_jobs())
@@ -4187,8 +4326,8 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
     Cross-dataset remembered approaches must go through actual model review;
     text describing an old edit is not a fresh user deletion instruction.
     """
-    from interactive_chat_jobs import interactive_chat_manager
-    from healthcare_data_quality.cleaning_authorization import file_sha256
+    from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+    from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
     fid = finding["id"]
     # An explicit direct discussion is valid even when Agent B's background
     # recommendation is missing or failed. Treat the finding's verified source
@@ -4214,7 +4353,7 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             # resolves its coordinates and original values deterministically.
             # Never forward this intent to Gemma's numeric-edit-only schema.
             if source:
-                from healthcare_data_quality.visual_flags import requested_visual_flag
+                from healthcare_data_quality.cleaning.visual_flags import requested_visual_flag
                 try:
                     flag_plan = requested_visual_flag(question, finding, source)
                 except ValueError as exc:
@@ -4234,12 +4373,12 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
                                    f"Flag {len(flag_plan['flags'])} taxonomy names bold red. "
                                    "Values unchanged; review below."})
                     return
-            from healthcare_data_quality.finding_cleaning import (
+            from healthcare_data_quality.cleaning.finding_cleaning import (
                 propose_explicit_user_row_deletion, propose_bulk_blank_row_deletion,
             )
             if (source and question.strip().casefold() in {
                     "fix", "fix it", "ok", "yes", "correct it", "standardize", "standardise"}):
-                from healthcare_data_quality.direct_actions import (
+                from healthcare_data_quality.cleaning.direct_actions import (
                     draft_format_correction, draft_identical_column_removal)
                 direct = (draft_identical_column_removal(finding, source)
                           if finding.get("check_key") == "compare_repeated_headers"
@@ -4250,6 +4389,18 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             # A global user-specified condition must be evaluated over the whole
             # original CSV by Python, not guessed from the selected finding's
             # representative evidence or emitted as hundreds of Gemma JSON edits.
+            # A request to pad the evidenced taxonomy to seven positions is
+            # already complete: derive exact before/after from original CSV,
+            # then present the ordinary final named approval immediately.
+            # Never ask Gemma to "prepare" a second draft of this same intent.
+            from healthcare_data_quality.cleaning.direct_actions import (
+                propose_explicit_taxonomy_padding,
+            )
+            taxonomy_plan = (propose_explicit_taxonomy_padding(
+                question, finding, source) if source else None)
+            if taxonomy_plan is not None:
+                _record_gemma_b_response(fid, finding, source, taxonomy_plan)
+                return
             bulk_row_plan = (propose_bulk_blank_row_deletion(question, finding, source)
                              if source else None)
             if bulk_row_plan is not None:
@@ -4272,7 +4423,7 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             # evidence. Match unambiguous numeric Before -> After requests to
             # exact affected cells in the immutable original CSV. Ambiguous
             # scope still goes to Gemma, never to an invented operation.
-            from healthcare_data_quality.finding_cleaning import (
+            from healthcare_data_quality.cleaning.finding_cleaning import (
                 propose_reviewer_cell_replacements,
             )
             explicit_cells = (propose_reviewer_cell_replacements(
@@ -4280,7 +4431,7 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             if explicit_cells is not None:
                 _record_gemma_b_response(fid, finding, source, explicit_cells)
                 return
-            from healthcare_data_quality.cleaning_workspace import _draft_evidenced_absolute_values
+            from healthcare_data_quality.cleaning.cleaning_workspace import _draft_evidenced_absolute_values
             absolute_plan = _draft_evidenced_absolute_values(question, scoped)
             if absolute_plan is not None:
                 _record_gemma_b_response(fid, finding, source, absolute_plan)
@@ -4289,7 +4440,7 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             # hundreds of per-cell JSON changes. Host expands the explicit user's
             # instruction deterministically, then the normal R preview and final
             # human approval gates still run unchanged.
-            from healthcare_data_quality.finding_cleaning import propose_evidenced_blank_fill
+            from healthcare_data_quality.cleaning.finding_cleaning import propose_evidenced_blank_fill
             recommendation = st.session_state.get("cleaning_recommendations", {}).get(fid) or {}
             bulk = (propose_evidenced_blank_fill(
                 question, str(recommendation.get("suggestion") or ""), finding, source,
@@ -4333,7 +4484,7 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
                 ask_gemma_about_cleaning, question, old_thread, [scoped], metadata,
                 selected_finding=scoped, force_model=require_gemma_review)
             agent = "C"
-        from healthcare_data_quality.in_memory_cleaning import sha256_bytes
+        from healthcare_data_quality.cleaning.in_memory_cleaning import sha256_bytes
         ds_id = finding.get("dataset_id", "")
         original = source.read_bytes() if source else b""
         staged = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id, original)
@@ -4356,8 +4507,8 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
 
 def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
     """Collect both agents' results without blocking the Streamlit UI."""
-    from interactive_chat_jobs import interactive_chat_manager
-    from healthcare_data_quality.cleaning_authorization import file_sha256
+    from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+    from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
     fid = finding["id"]
     manager = interactive_chat_manager()
     pending_b = st.session_state.cleaning_pending_gemma_b.get(fid)
@@ -4379,7 +4530,7 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
                     response = outcome["result"]
                     if not isinstance(response, dict):
                         raise ValueError("Agent C did not return a structured reply")
-                    from healthcare_data_quality.in_memory_cleaning import sha256_bytes, _records
+                    from healthcare_data_quality.cleaning.in_memory_cleaning import sha256_bytes, _records
                     ds_id = finding.get("dataset_id", "")
                     current = (st.session_state.cleaning_staged_bytes_by_dataset.get(
                         ds_id, source.read_bytes()) if source else b"")
@@ -4499,7 +4650,7 @@ def start_live_exploration(
     Background callbacks use only plain Python and private file checkpoints;
     never touch st.* or a user's Streamlit Session State.
     """
-    from exploration_jobs import exploration_manager
+    from healthcare_data_quality.jobs.exploration_jobs import exploration_manager
 
     run_id = audit["cleaning_recommendation_run_id"]
     key = exploration_cache_key(cache_key)
@@ -4531,7 +4682,7 @@ def start_live_exploration(
 
 def sync_live_exploration(audit: dict, cache_key: str) -> dict | None:
     """Read the latest verified checks on the UI thread without invoking Gemma."""
-    from exploration_jobs import exploration_manager
+    from healthcare_data_quality.jobs.exploration_jobs import exploration_manager
 
     run_id = audit.get("cleaning_recommendation_run_id")
     if not run_id:
@@ -4897,7 +5048,7 @@ def render_exploratory_findings(
     elif len(runs) >= MAX_ROUNDS:
         st.caption("The exploratory safety limit was reached. Coverage may be incomplete.")
     elif not runs and not error:
-        from exploration_jobs import exploration_manager
+        from healthcare_data_quality.jobs.exploration_jobs import exploration_manager
         live = exploration_manager().snapshot(audit.get("cleaning_recommendation_run_id", ""))
         if live and live["status"] == "running":
             st.caption("Exploratory tests are in progress. Verified results will appear here automatically.")
@@ -5026,7 +5177,7 @@ def render_live_investigation_status(
         # Render Agent A, Agent B, and Agent C read-only statuses in the SAME floating host.
         # A completed investigation remains visible while the once-only Agent B
         # queue continues; all three cards retain their own live status.
-        from cleaning_jobs import recommendation_manager, job_fingerprint
+        from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, job_fingerprint
         import streamlit.components.v1 as components
         run_id = audit.get("cleaning_recommendation_run_id")
         recommendation_state = None
@@ -5243,7 +5394,7 @@ def render_full_dataset_section(
         full_table.index = pd.RangeIndex(
             start=2, stop=len(full_table) + 2, name="CSV row"
         )
-        from healthcare_data_quality.visual_flags import styled_dataset_preview
+        from healthcare_data_quality.cleaning.visual_flags import styled_dataset_preview
         flags = st.session_state.get("cleaning_visual_flags_by_dataset", {}).get(
             f"dataset_{index + 1}", [])
         st.dataframe(styled_dataset_preview(full_table, flags),
@@ -5262,7 +5413,7 @@ def _poll_agent_c_completion() -> None:
     only once, when a submitted Agent C job actually finishes; the active tab
     is preserved by the stateful tab key on supported Streamlit releases.
     """
-    from interactive_chat_jobs import interactive_chat_manager
+    from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
 
     pending = st.session_state.get("cleaning_pending_gemma_b") or {}
     ready = st.session_state.setdefault("cleaning_completed_gemma", {})
@@ -5289,7 +5440,7 @@ def _agent_b_first_suggestion_ready(audit: dict, context_key: str) -> bool:
     Historical review-memory markers, pending and failed queue records are not
     valid suggestions. Agent A can continue exploring while C is unlocked.
     """
-    from cleaning_jobs import recommendation_manager, job_fingerprint
+    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, job_fingerprint
 
     run_id = audit.get("cleaning_recommendation_run_id")
     if not isinstance(run_id, str) or not run_id:
@@ -5307,7 +5458,7 @@ def _agent_b_first_suggestion_ready(audit: dict, context_key: str) -> bool:
 
 def render_skills_memory_page() -> None:
     """Review learning capacity, disable historical recall and manage safe skills."""
-    from skills_memory_manager import (
+    from healthcare_data_quality.ui.skills_memory_manager import (
         overview, human_bytes, disable_rule, delete_skill, clear_learning_events,
     )
 
@@ -5430,6 +5581,45 @@ def render_ui() -> None:
             return
 
     fingerprint = upload_fingerprint(uploaded)
+    registered_reviewer = str(st.session_state.get("hdq_registered_reviewer") or "").strip()
+    same_review_dataset = (
+        st.session_state.get("hdq_registered_reviewer_fingerprint") == fingerprint
+    )
+    if not registered_reviewer or not same_review_dataset:
+        # No audit/model/cache or data-quality work can start until a person
+        # registers for this specific upload. Enter submits the form.
+        render_pre_investigation_status(live_banner_slot, state="ready")
+        with st.form(f"hdq_reviewer_registration_{fingerprint[:16]}"):
+            entered_reviewer = st.text_input(
+                "Reviewer identifier", max_chars=120,
+                key=f"hdq_reviewer_name_{fingerprint[:16]}",
+                help="Required before investigation. This name will authorize all future approved edits.",
+            )
+            start_with_reviewer = st.form_submit_button(
+                "Start investigation", type="primary",
+            )
+        if start_with_reviewer:
+            reviewer_name = " ".join(entered_reviewer.split())
+            if not reviewer_name:
+                st.error("Enter your reviewer identifier to start the investigation.")
+            else:
+                st.session_state.hdq_registered_reviewer = reviewer_name
+                st.session_state.hdq_registered_reviewer_fingerprint = fingerprint
+                st.session_state.cleaning_approved_reviewer = reviewer_name
+                # Consume once on the next complete render. Repeated reruns,
+                # including polling, must never start another investigation.
+                st.session_state.hdq_reviewer_pending_first_run = fingerprint
+                st.rerun()
+        else:
+            st.caption("Investigation and cleaning remain locked until a reviewer is registered.")
+        return
+
+    st.caption(f"Reviewer: {registered_reviewer}")
+    # Registering the reviewer starts one fresh investigation. If a saved
+    # result is later loaded, its actions still require this session's person.
+    first_run_for_registered_reviewer = (
+        st.session_state.pop("hdq_reviewer_pending_first_run", None) == fingerprint
+    )
     try:
         paths = ensure_local_inputs(uploaded, fingerprint)
         header_reports = [inspect_headers(path) for path in paths]
@@ -5478,7 +5668,7 @@ def render_ui() -> None:
     )
     load_requested = False
     load_session_requested = False
-    run_requested = False
+    run_requested = first_run_for_registered_reviewer
     selected_run = None
 
     if previous_runs:
@@ -5531,7 +5721,8 @@ def render_ui() -> None:
     # run reaches a terminal status, even if a button rerun slips through.
     current_run_id = st.session_state.get("registered_investigation_run_id")
     current_run_state = investigation_manager().snapshot(current_run_id) if current_run_id else None
-    if current_run_state and current_run_state["status"] == "running" and run_requested:
+    if (current_run_state and current_run_state["status"] == "running" and run_requested
+            and st.session_state.get("registered_investigation_context") == (cache_key, fingerprint)):
         run_requested = False
 
     if load_requested and selected_run is not None:
@@ -5644,7 +5835,7 @@ def render_ui() -> None:
                     started_epoch_ms=int(datetime.fromisoformat(
                         registered_state["started_at"]).timestamp() * 1000),
                 ), height=170, scrolling=False)
-                from cleaning_jobs import recommendation_manager, job_fingerprint
+                from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, job_fingerprint
                 snapshot = recommendation_manager().snapshot(job_fingerprint(
                     cache_key, [], run_id=registered_run))
                 components.html(render_recommendation_banner_html(snapshot, idle=not bool(snapshot)),

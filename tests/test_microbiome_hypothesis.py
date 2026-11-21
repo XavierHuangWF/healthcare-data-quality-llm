@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_data_quality import exploratory_agent as agent
+from healthcare_data_quality.agents import exploratory_agent as agent
 
 
 VALID_CODE = '''def investigate(datasets):

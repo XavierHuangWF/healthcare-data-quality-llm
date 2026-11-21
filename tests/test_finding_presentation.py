@@ -2,14 +2,14 @@
 import csv
 from pathlib import Path
 
-from healthcare_data_quality.finding_presentation import (
+from healthcare_data_quality.ui.finding_presentation import (
     baseline_issues,
     header_findings,
     header_issues,
     history_observations,
     readable_objective_title,
 )
-from healthcare_data_quality.ingestion import inspect_headers
+from healthcare_data_quality.investigation.ingestion import inspect_headers
 
 
 def make_csv(tmp_path: Path, headers: list[str], records: list[list[str]]) -> Path:
@@ -111,7 +111,7 @@ def test_whitespace_only_header_is_reported_as_unnamed(tmp_path):
 
 
 def test_taxonomy_shows_original_classification_and_unassigned_rank_slots(tmp_path):
-    from healthcare_data_quality.taxonomy_validation import inspect_taxonomy_structure
+    from healthcare_data_quality.validation.taxonomy_validation import inspect_taxonomy_structure
 
     source = make_csv(tmp_path, ["Taxonomy", "Sample A"], [
         ["Bacteria; Actinobacteria; Actinobacteria; Actinomycetales; Actinomycetaceae; Arcanobacterium", "5"],

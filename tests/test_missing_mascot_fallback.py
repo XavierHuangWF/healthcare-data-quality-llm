@@ -1,8 +1,6 @@
 """A Git clone without intentionally untracked art still renders safely."""
 
-from pathlib import Path
-
-import exploration_banner
+from healthcare_data_quality.ui import exploration_banner
 
 
 def test_missing_user_managed_asset_has_inline_fallback(tmp_path):

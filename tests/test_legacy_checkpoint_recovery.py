@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_data_quality import cleaning_stage_checkpoint as cp
+from healthcare_data_quality.cleaning import cleaning_stage_checkpoint as cp
 
 
 def _legacy(tmp_path: Path, monkeypatch, *, edited=True):

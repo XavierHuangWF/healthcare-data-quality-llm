@@ -7,10 +7,10 @@ from io import StringIO
 
 import pytest
 
-from healthcare_data_quality.cleaning_authorization import file_sha256
-from healthcare_data_quality.cleaning_workspace import ask_gemma_about_cleaning
-from healthcare_data_quality.finding_cleaning import validate_scoped_plan
-from healthcare_data_quality.in_memory_cleaning import (
+from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
+from healthcare_data_quality.cleaning.cleaning_workspace import ask_gemma_about_cleaning
+from healthcare_data_quality.cleaning.finding_cleaning import validate_scoped_plan
+from healthcare_data_quality.cleaning.in_memory_cleaning import (
     _records, apply_approved_column_deletions, sha256_bytes,
 )
 
@@ -43,7 +43,7 @@ def test_gemma_discusses_deletion_and_never_executes_it(monkeypatch):
         received.append((prompt, json_schema))
         return json.dumps({"reply": "I can propose removing all of column 3 (B). Confirm in the UI.",
                            **proposed()})
-    monkeypatch.setattr("healthcare_data_quality.cleaning_workspace.query_local_model", fake_query)
+    monkeypatch.setattr("healthcare_data_quality.cleaning.cleaning_workspace.query_local_model", fake_query)
     response = ask_gemma_about_cleaning("Delete column 3 entirely", [], [],
                                         [{"dataset_id": "dataset_1", "columns": [
                                             {"position": 3, "header": "B"}]}],

@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
-from cleaning_review import ask_gemma_for_review_options, indexed_review_catalog, review_question
+from healthcare_data_quality.ui.cleaning_review import ask_gemma_for_review_options, indexed_review_catalog, review_question
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +32,14 @@ class Session(dict):
 
 
 class StubUI:
+    # Streamlit st.columns returns container objects. Newer approval controls
+    # use ``with col:``; model that real context-manager contract here.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
     def __init__(self):
         self.session_state = Session()
         self.expanders = []
@@ -52,6 +60,10 @@ class StubUI:
 
     def info(self, *args, **kwargs):
         pass
+
+    def warning(self, *args, **kwargs):
+        if args:
+            self.comments.append(str(args[0]))
 
     def checkbox(self, *args, **kwargs):
         return False
@@ -76,6 +88,15 @@ class StubUI:
         return False
 
     def spinner(self, *args, **kwargs):
+        return Context()
+
+    def status(self, *args, **kwargs):
+        return Context()
+
+    def dataframe(self, data, *args, **kwargs):
+        self.comments.append(("table", data))
+
+    def container(self, *args, **kwargs):
         return Context()
 
     def error(self, text):
@@ -137,7 +158,7 @@ def test_batch_recommendations_are_non_executable_and_match_ids(monkeypatch):
               "action": "Replace invalid observations with NA in a separate reviewed copy.",
               "rationale": "No evidence linked to a known finding."}]})
 
-    monkeypatch.setattr("cleaning_review.query_local_model", fake_query)
+    monkeypatch.setattr("healthcare_data_quality.ui.cleaning_review.query_local_model", fake_query)
     catalog = _catalog()
     replies = ask_gemma_for_review_options(catalog)
     assert set(replies) == {item["id"] for item in catalog}
@@ -154,9 +175,9 @@ def test_all_findings_and_gemma_checks_visible_without_selection(monkeypatch, tm
     file.write_text("Taxon,Count\na,1\n", encoding="utf-8")
     st = StubUI()
     app = _app(monkeypatch, st)
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
                         lambda *args, **kwargs: _catalog())
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.allowed_positions",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args: (set(), set()))
     app.render_cleaning_workspace([file], [SimpleNamespace(name="one.csv")], {}, "audit-A", [])
     assert len(st.expanders) == 3
@@ -171,9 +192,9 @@ def test_one_finding_no_action_does_not_affect_other_cards(monkeypatch, tmp_path
     file.write_text("Taxon,Count\na,1\n", encoding="utf-8")
     st = StubUI()
     app = _app(monkeypatch, st)
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
                         lambda *args, **kwargs: _catalog())
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.allowed_positions",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args: (set(), set()))
     st.buttons_on.add("review_no_action_dataset_1:qc:2")
     import pytest
@@ -185,46 +206,45 @@ def test_one_finding_no_action_does_not_affect_other_cards(monkeypatch, tmp_path
     assert st.session_state.cleaning_history == []
 
 
-def test_accepting_batch_suggestion_passes_its_text_to_model(monkeypatch, tmp_path):
+def test_accepting_source_backed_suggestion_prepares_exact_review_not_execution(monkeypatch, tmp_path):
+    """Agent B's green selection prepares validated values, not a silent edit."""
+    import pytest
+    from healthcare_data_quality.cleaning.finding_cleaning import validate_scoped_plan
+
     file = tmp_path / "one.csv"
-    file.write_text("Taxon,Count\na,1\n", encoding="utf-8")
+    file.write_text("Taxon,Count\na,0.2\n", encoding="utf-8")
+    before = file.read_bytes()
+    monkeypatch.setenv("HDQ_APPROVED_STAGE_DIR", str(tmp_path / "checkpoint"))
     st = StubUI()
     app = _app(monkeypatch, st)
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
-                        lambda *args, **kwargs: _catalog())
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.allowed_positions",
-                        lambda *args: (set(), set()))
+    finding = {**_catalog()[0], "evidence": [
+        {"CSV row": 2, "Column": 2, "Original value": "0.2"}]}
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
+                        lambda *args, **kwargs: [finding])
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
+                        lambda *args: ({(2, 2)}, set()))
+
     class SavedAgentB:
         def snapshot(self, key):
-            return {"entries": {"dataset_1:qc:1": {
-                "status": "ready",
-                "suggestion": "Ask owner whether fractional values are measurements.",
-                "decision_needed": "Are these counts or concentrations?"}}}
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: SavedAgentB())
-    app.render_cleaning_workspace([file], [SimpleNamespace(name="one.csv")], {}, "audit-C", [])
-    st.buttons_on.add("review_yes_dataset_1:qc:1")
-    seen = []
-    from threading import Event
-    invoked = Event()
+            return {"entries": {finding["id"]: {
+                "status": "ready", "suggestion": "Replace invalid count 0.2 with 0",
+                "decision_needed": "", "choices": [{
+                    "label": "Replace with zero", "operations": [{
+                        "operation": "replace_cells", "changes": [
+                            {"row": 2, "column": 2, "before": "0.2", "after": "0"}]}]}]}}}
 
-    def fake_gemma(message, history, overview, datasets, *, selected_finding=None):
-        seen.append(selected_finding)
-        invoked.set()
-        return {"reply": "Scientific policy still needed.",
-                "operation": "none", "dataset_id": "", "changes": []}
-
-    monkeypatch.setattr(app, "ask_gemma_about_cleaning", fake_gemma)
-    import pytest
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager",
+                        lambda: SavedAgentB())
+    uploaded = [SimpleNamespace(name="one.csv")]
+    app.render_cleaning_workspace([file], uploaded, {}, "audit-C", [])
+    assert any(item[0] == "table" for item in st.comments)
+    st.buttons_on.add(f"review_yes_{finding['id']}_0_option_0")
     with pytest.raises(StopIteration, match="rerun"):
-        app.render_cleaning_workspace([file], [SimpleNamespace(name="one.csv")], {}, "audit-C", [])
-    # Model execution is now asynchronous; the click only queues a request.
-    assert invoked.wait(2), "Agent C job did not begin"
-    assert len(seen) == 1
-    assert st.session_state.cleaning_messages_by_finding["dataset_1:qc:1"][0]["role"] == "user"
-    assert seen[0]["finding_id"] == "dataset_1:qc:1"
-    assert "fractional values" in seen[0]["suggestion_under_discussion"]["suggestion"]
-    assert st.session_state.cleaning_plans_by_finding == {}
-    assert all(d["decision"] != "approved_and_verified" for d in st.session_state.cleaning_decisions)
+        app.render_cleaning_workspace([file], uploaded, {}, "audit-C", [])
+    assert file.read_bytes() == before
+    assert st.session_state.cleaning_history == []
+    assert st.session_state.cleaning_discussion_mode_by_finding[finding['id']] == "accepted"
+    assert st.session_state.cleaning_plans_by_finding[finding['id']]['changes'][0]['after'] == "0"
 
 
 def test_existing_open_session_migrates_to_new_card_states(monkeypatch, tmp_path):
@@ -236,14 +256,14 @@ def test_existing_open_session_migrates_to_new_card_states(monkeypatch, tmp_path
     st.session_state.cleaning_history = [{"finding_id": "old", "dataset_id": "dataset_1"}]
     st.session_state.cleaning_messages_by_finding = {"dataset_1:qc:1": []}
     app = _app(monkeypatch, st)
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
                         lambda *args, **kwargs: _catalog())
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.allowed_positions",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args: (set(), set()))
     app.render_cleaning_workspace([file], [SimpleNamespace(name="one.csv")], {}, "old-session", [])
     assert st.session_state.cleaning_plans_by_finding == {}
     assert st.session_state.cleaning_recommendations == {}
     assert st.session_state.cleaning_history[0]["finding_id"] == "old"
-    assert len(st.expanders) == 4  # includes final, optional in-memory audit history
+    assert len(st.expanders) == 3  # one card per finding/check, no duplicate audit panel
     assert st.session_state.cleaning_working_paths == {}
     assert st.session_state.cleaning_staged_bytes_by_dataset["dataset_1"] == file.read_bytes()

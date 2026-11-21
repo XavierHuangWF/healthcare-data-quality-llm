@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_data_quality.cleaning_authorization import file_sha256
-from healthcare_data_quality.finding_cleaning import (
+from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
+from healthcare_data_quality.cleaning.finding_cleaning import (
     APPROVAL_PHRASE, allowed_positions, build_cleaning_findings,
     execute_approved_scoped_plan, reviewed_python_code, validate_scoped_plan,
 )
@@ -126,8 +126,8 @@ def test_single_header_change_cannot_rename_other_columns(tmp_path):
 
 
 def test_original_fixture_qc_results_and_gemma_check_are_selectable():
-    from healthcare_data_quality.ingestion import inspect_headers
-    from healthcare_data_quality.baseline_audit import run_baseline_audit
+    from healthcare_data_quality.investigation.ingestion import inspect_headers
+    from healthcare_data_quality.investigation.baseline_audit import run_baseline_audit
     source = Path(__file__).resolve().parent.parent / "data" / "dirtyL7PVDforXav.csv"
     if not source.is_file():
         pytest.skip("Optional local fixture is not included in source-only deployments")
@@ -144,7 +144,7 @@ def test_original_fixture_qc_results_and_gemma_check_are_selectable():
 
 def test_local_gemma_prompt_is_scoped_to_selected_finding(monkeypatch):
     import json
-    from healthcare_data_quality.cleaning_workspace import ask_gemma_about_cleaning
+    from healthcare_data_quality.cleaning.cleaning_workspace import ask_gemma_about_cleaning
     reply = {"reply": "Review the missing data policy before replacing anything.",
              "operation": "none", "dataset_id": "", "changes": []}
 
@@ -156,6 +156,6 @@ def test_local_gemma_prompt_is_scoped_to_selected_finding(monkeypatch):
         assert options["json_schema"]
         return json.dumps(reply)
 
-    monkeypatch.setattr("healthcare_data_quality.cleaning_workspace.query_local_model", fake_query)
+    monkeypatch.setattr("healthcare_data_quality.cleaning.cleaning_workspace.query_local_model", fake_query)
     assert ask_gemma_about_cleaning("What does this mean?", [], [], [],
                                     selected_finding={"title": "Check 1"}) == reply

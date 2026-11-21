@@ -5,7 +5,7 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 
-from exploration_banner import (
+from healthcare_data_quality.ui.exploration_banner import (
     agent_c_idle_mascot_data_url,
     agent_c_working_mascot_data_url,
     recommendation_mascot_data_url,

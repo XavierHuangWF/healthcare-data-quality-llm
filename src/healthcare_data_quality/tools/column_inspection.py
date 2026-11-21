@@ -3,7 +3,7 @@ from collections import Counter, defaultdict
 from itertools import groupby
 from pathlib import Path
 
-from ..dataset_profiler import profile_csv
+from healthcare_data_quality.investigation.dataset_profiler import profile_csv
 
 
 MAX_VALUE_DETAILS = 24

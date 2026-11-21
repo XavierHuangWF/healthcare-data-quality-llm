@@ -2,15 +2,15 @@ import json
 import sys
 from pathlib import Path
 
-from healthcare_data_quality.agent_loop import run_investigation
-from healthcare_data_quality.ingestion import inspect_headers
+from healthcare_data_quality.agents.agent_loop import run_investigation
+from healthcare_data_quality.investigation.ingestion import inspect_headers
 
-from healthcare_data_quality.investigation_report import summarize_investigation
+from healthcare_data_quality.investigation.investigation_report import summarize_investigation
 
 from healthcare_data_quality.tools.context import verify_contexts
-from healthcare_data_quality.remediation_proposal import generate_remediation_proposals
-from healthcare_data_quality.remediation_validator import validate_remediation_proposals
-from healthcare_data_quality.decision_memory import get_decision_context
+from healthcare_data_quality.cleaning.remediation_proposal import generate_remediation_proposals
+from healthcare_data_quality.cleaning.remediation_validator import validate_remediation_proposals
+from healthcare_data_quality.learning.decision_memory import get_decision_context
 
 def terminal_progress(message: str) -> None:
     print(f"[Agent] {message}", file=sys.stderr, flush=True)

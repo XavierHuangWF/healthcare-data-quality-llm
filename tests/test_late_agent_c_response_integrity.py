@@ -28,10 +28,10 @@ def test_completed_finding_ignores_late_agent_c_response(monkeypatch, tmp_path):
     assert state.cleaning_messages_by_finding['finding'] == []
 
 
-def test_stale_stage_hash_rejects_agent_c_completion(monkeypatch, tmp_path):
+def test_unrelated_staged_edit_requires_fresh_validation_not_reply_discard(monkeypatch, tmp_path):
     from test_cleaning_review_cards import _app, StubUI
-    import interactive_chat_jobs
-    from healthcare_data_quality.in_memory_cleaning import sha256_bytes
+    from healthcare_data_quality.jobs import interactive_chat_jobs
+    from healthcare_data_quality.cleaning.in_memory_cleaning import sha256_bytes
 
     app = _app(monkeypatch, StubUI())
 
@@ -63,21 +63,22 @@ def test_stale_stage_hash_rejects_agent_c_completion(monkeypatch, tmp_path):
 
     monkeypatch.setattr(interactive_chat_jobs, 'interactive_chat_manager', lambda: Manager())
 
-    def should_not_be_called(*_args, **_kwargs):
-        raise AssertionError('Stale Agent C response reached review state')
-
-    monkeypatch.setattr(app, '_record_gemma_b_response', should_not_be_called)
+    seen = []
+    monkeypatch.setattr(app, '_record_gemma_b_response',
+                        lambda *args: seen.append(args[-1]))
     app._sync_gemma_conversations({'id': 'finding', 'dataset_id': 'dataset_1'}, source)
     assert state.cleaning_pending_gemma_b == {}
+    assert seen == [{'reply': 'Outdated', 'operation': 'none'}]
+    # The reply can be considered for a new independently validated draft,
+    # but is never a cleaning authorization or an implicit stage mutation.
     assert state.cleaning_plans_by_finding == {}
-    assert 'outdated' in state.cleaning_messages_by_finding['finding'][0]['content']
-    assert state.cleaning_review_statuses['finding'] == 'Discussion open'
+    assert state.cleaning_staged_bytes_by_dataset['dataset_1'] == stage
 
 
 def test_completed_state_rejects_matching_pending_response(monkeypatch, tmp_path):
     from test_cleaning_review_cards import _app, StubUI
-    import interactive_chat_jobs
-    from healthcare_data_quality.in_memory_cleaning import sha256_bytes
+    from healthcare_data_quality.jobs import interactive_chat_jobs
+    from healthcare_data_quality.cleaning.in_memory_cleaning import sha256_bytes
 
     app = _app(monkeypatch, StubUI())
 

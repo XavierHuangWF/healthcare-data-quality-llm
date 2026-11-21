@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from healthcare_data_quality.tools.column_inspection import compare_columns
-from healthcare_data_quality.remediation_validator import (
+from healthcare_data_quality.cleaning.remediation_validator import (
     validate_remediation_proposals,
 )
 
@@ -101,7 +101,7 @@ print("INCORRECT TARGET REJECTION: PASS")
 
 
 from pathlib import Path
-from healthcare_data_quality.remediation_validator import (
+from healthcare_data_quality.cleaning.remediation_validator import (
     validate_remediation_proposals,
 )
 

@@ -1,8 +1,8 @@
 from collections import Counter
 from pathlib import Path
 
-from ..count_validation import find_invalid_counts
-from ..dataset_profiler import profile_csv
+from healthcare_data_quality.validation.count_validation import find_invalid_counts
+from healthcare_data_quality.investigation.dataset_profiler import profile_csv
 
 
 def summarize_invalid_counts(path: Path) -> list[dict]:

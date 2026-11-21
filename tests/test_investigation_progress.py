@@ -1,7 +1,7 @@
 """Progress is about completed phases, not a fabricated ETA or total LLM rounds."""
 import pytest
 
-from investigation_progress import InvestigationProgress, format_elapsed, live_timer_html
+from healthcare_data_quality.ui.investigation_progress import InvestigationProgress, format_elapsed, live_timer_html
 
 
 def test_three_phases_with_unknown_exploration_length():

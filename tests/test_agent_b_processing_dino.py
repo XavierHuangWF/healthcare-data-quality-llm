@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from exploration_banner import (
+from healthcare_data_quality.ui.exploration_banner import (
     recommendation_mascot_data_url,
     recommendation_processing_mascot_data_url,
     render_recommendation_banner_html,

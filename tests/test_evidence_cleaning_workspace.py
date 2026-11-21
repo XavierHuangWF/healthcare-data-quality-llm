@@ -5,16 +5,16 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_data_quality.cleaning_authorization import file_sha256
-from healthcare_data_quality.cleaning_workspace import (
+from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
+from healthcare_data_quality.cleaning.cleaning_workspace import (
     validate_header_plan, create_header_request,
     execute_confirmed_header_request, ask_gemma_about_cleaning,
 )
-from healthcare_data_quality.finding_evidence import (
+from healthcare_data_quality.investigation.finding_evidence import (
     dataset_finding_evidence, exploratory_finding_evidence,
 )
-from healthcare_data_quality.finding_presentation import baseline_issues
-from healthcare_data_quality.ingestion import inspect_headers
+from healthcare_data_quality.ui.finding_presentation import baseline_issues
+from healthcare_data_quality.investigation.ingestion import inspect_headers
 
 
 def _csv(tmp_path: Path, columns=None):
@@ -119,5 +119,5 @@ def test_model_output_is_discussion_only_until_validated(monkeypatch):
         assert "never treat NA taxonomy ranks as invalid" in prompt
         assert kwargs["json_schema"]
         return json.dumps(payload)
-    monkeypatch.setattr("healthcare_data_quality.cleaning_workspace.query_local_model", fake_llm)
+    monkeypatch.setattr("healthcare_data_quality.cleaning.cleaning_workspace.query_local_model", fake_llm)
     assert ask_gemma_about_cleaning("What to do?", [], [], [])["operation"] == "none"

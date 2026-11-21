@@ -6,10 +6,10 @@ import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from healthcare_data_quality.decision_memory import (
+from healthcare_data_quality.learning.decision_memory import (
     get_verified_outcome_context,
 )
-from healthcare_data_quality.decision_memory import (
+from healthcare_data_quality.learning.decision_memory import (
     get_verified_outcome_context,
     record_decision,
 )

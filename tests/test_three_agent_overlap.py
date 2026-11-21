@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 from threading import Event
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from investigation_jobs import InvestigationJobs
-from exploration_banner import render_recommendation_banner_html
+from healthcare_data_quality.jobs.investigation_jobs import InvestigationJobs
+from healthcare_data_quality.ui.exploration_banner import render_recommendation_banner_html
 from test_cleaning_review_cards import StubUI, _app, _catalog
 
 
@@ -71,33 +70,32 @@ def test_agent_c_waits_for_its_own_agent_b_recommendation(monkeypatch, tmp_path)
     st = StubUI()
     csv = tmp_path / 'data.csv'; csv.write_text('x,y\na,3\n')
     app = _app(monkeypatch, st)
-    monkeypatch.setattr('healthcare_data_quality.finding_cleaning.build_cleaning_findings',
+    monkeypatch.setattr('healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings',
                         lambda *args, **kwargs: _catalog()[:2])
-    monkeypatch.setattr('healthcare_data_quality.finding_cleaning.allowed_positions',
+    monkeypatch.setattr('healthcare_data_quality.cleaning.finding_cleaning.allowed_positions',
                         lambda *args: (set(), set()))
     entries = {'dataset_1:qc:1': {'status': 'ready', 'suggestion': 'Verify before replacing',
                                   'decision_needed': 'Confirm protocol'},
                'dataset_1:qc:2': {'status': 'running'}}
     class Manager:
         def snapshot(self, key): return {'entries': entries}
-    monkeypatch.setattr('cleaning_jobs.recommendation_manager',lambda:Manager())
-    seen_forms = []
-    original_form = st.form
-    def capture_form(name, *args, **kwargs):
-        seen_forms.append(name)
-        return original_form(name, *args, **kwargs)
-    st.form = capture_form
+    monkeypatch.setattr('healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager',lambda:Manager())
+    seen_chats = []
+    def capture_chat(_placeholder, *, key=None, **kwargs):
+        seen_chats.append(key)
+        return None
+    st.chat_input = capture_chat
     app.render_cleaning_workspace([csv], [SimpleNamespace(name='data.csv')],
                                   {'cleaning_recommendation_run_id': 'test-run'}, 'dataset-key', [])
     # Agent C is eligible but its discussion form must not appear by default.
-    assert 'review_chat_form_dataset_1:qc:1' not in seen_forms
+    assert not seen_chats
     st.session_state.cleaning_discussion_mode_by_finding['dataset_1:qc:1'] = 'alternative'
     app.render_cleaning_workspace([csv], [SimpleNamespace(name='data.csv')],
                                   {'cleaning_recommendation_run_id': 'test-run'}, 'dataset-key', [])
-    assert 'review_chat_form_dataset_1:qc:1' in seen_forms
-    assert 'review_chat_form_dataset_1:qc:2' not in seen_forms
+    assert any(key.startswith('review_message_dataset_1:qc:1_') for key in seen_chats)
+    assert not any(key.startswith('review_message_dataset_1:qc:2_') for key in seen_chats)
     assert set(st.session_state.cleaning_recommendations) == {'dataset_1:qc:1'}
-    with pytest.raises(ValueError, match='requires Agent B'):
+    with pytest.raises(ValueError, match='Choose an Agent B suggestion or start a direct Agent C discussion'):
         app._queue_agent_c_for_finding(_catalog()[1], csv, [SimpleNamespace(name='data.csv')],
                                        [csv], 'Can I replace it?')
 
@@ -111,7 +109,7 @@ def test_background_recommendations_card_is_agent_b():
 
 
 def test_sampled_original_evidence_is_prompt_only_not_stored_in_queue(tmp_path):
-    from cleaning_jobs import CleaningRecommendationJobs
+    from healthcare_data_quality.jobs.cleaning_jobs import CleaningRecommendationJobs
     seen = []
     def fake(item):
         seen.append(item)
@@ -131,7 +129,7 @@ def test_sampled_original_evidence_is_prompt_only_not_stored_in_queue(tmp_path):
 
 
 def test_baseline_callback_failure_does_not_abort_registered_tools(tmp_path):
-    from investigation_jobs import InvestigationJobs
+    from healthcare_data_quality.jobs.investigation_jobs import InvestigationJobs
     from time import sleep
     def fake_run(path, *, additional_datasets, progress_callback, baseline_ready_callback):
         baseline_ready_callback({'dataset_baselines': {'dataset_1': {}}})

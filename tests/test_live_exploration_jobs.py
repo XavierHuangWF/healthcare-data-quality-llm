@@ -4,8 +4,8 @@ import time
 
 import pytest
 
-from exploration_jobs import LiveExplorationJobs
-from healthcare_data_quality.llm_client import _RequestGate
+from healthcare_data_quality.jobs.exploration_jobs import LiveExplorationJobs
+from healthcare_data_quality.services.llm_client import _RequestGate
 
 
 def _wait(jobs, key, *, timeout=3):

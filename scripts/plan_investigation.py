@@ -3,8 +3,8 @@ import json
 import sys
 from pathlib import Path
 
-from healthcare_data_quality.dataset_profiler import profile_csv
-from healthcare_data_quality.llm_client import query_local_model
+from healthcare_data_quality.investigation.dataset_profiler import profile_csv
+from healthcare_data_quality.services.llm_client import query_local_model
 
 from healthcare_data_quality.tools.registry import (
     TOOL_REGISTRY,

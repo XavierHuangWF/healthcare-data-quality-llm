@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_data_quality import exploratory_agent as agent
-from healthcare_data_quality.exploratory_dedup import (
+from healthcare_data_quality.agents import exploratory_agent as agent
+from healthcare_data_quality.agents.exploratory_dedup import (
     known_issue_catalog, redundant_proposal_reason, filter_redundant_findings,
 )
 
@@ -172,7 +172,7 @@ def test_reject_existing_count_qc_even_with_rephrased_hypotheses(tmp_path, hypot
 
 
 def test_exact_screenshot_hypothesis_rejected_using_actual_fixture():
-    from healthcare_data_quality.baseline_audit import run_baseline_audit
+    from healthcare_data_quality.investigation.baseline_audit import run_baseline_audit
     path = Path(__file__).resolve().parent.parent / 'data' / 'dirtyL7PVDforXav.csv'
     datasets = {'dataset_1': path}
     catalog = known_issue_catalog(datasets, {'dataset_baselines': {
@@ -219,7 +219,7 @@ def test_finding_with_same_qc_source_cell_rejected_even_without_category_words(t
 
 
 def test_private_qc_cell_index_not_in_model_prompt(tmp_path):
-    from healthcare_data_quality.exploratory_dedup import prompt_issue_catalog
+    from healthcare_data_quality.agents.exploratory_dedup import prompt_issue_catalog
     _, catalog = negative_catalog(tmp_path)
     assert '2:2' in catalog['dataset_1']['_known_count_cells']
     public = prompt_issue_catalog(catalog)

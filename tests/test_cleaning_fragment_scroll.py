@@ -32,9 +32,9 @@ def test_cleaning_review_button_does_not_force_full_app_rerun(monkeypatch, tmp_p
     app = _app(monkeypatch, st)
     file = tmp_path / "one.csv"
     file.write_text("Taxon,Count\na,1\n", encoding="utf-8")
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
                         lambda *args, **kwargs: _catalog())
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.allowed_positions",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args: (set(), set()))
     calls = []
 

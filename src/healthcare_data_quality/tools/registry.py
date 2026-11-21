@@ -8,7 +8,7 @@ from .column_inspection import (
     inspect_columns,
     compare_columns,
 )
-from ..duplicate_validation import (
+from healthcare_data_quality.validation.duplicate_validation import (
     find_duplicate_ids,
     find_duplicate_conflicts,
 )
@@ -16,7 +16,7 @@ from ..duplicate_validation import (
 from .microbiome import observe_matrix_structure
 from .context import STRUCTURE_CONTEXT
 from .provenance import inspect_provenance
-from ..r_sandbox import run_r_sandbox
+from healthcare_data_quality.r_runtime.r_sandbox import run_r_sandbox
 import json
 import re
 from hashlib import sha256

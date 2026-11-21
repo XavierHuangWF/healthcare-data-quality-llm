@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from healthcare_data_quality.cleaning_workspace import (
+from healthcare_data_quality.cleaning.cleaning_workspace import (
     _clarify_ambiguous_row_edit,
     ask_gemma_about_cleaning,
 )
@@ -15,7 +15,7 @@ def test_ambiguous_delete_and_replace_asks_one_scope_question_without_model(monk
         raise AssertionError("No model call should be needed for unsafe ambiguity")
 
     monkeypatch.setattr(
-        "healthcare_data_quality.cleaning_workspace.query_local_model",
+        "healthcare_data_quality.cleaning.cleaning_workspace.query_local_model",
         model_should_not_be_called,
     )
     answer = ask_gemma_about_cleaning(
@@ -60,7 +60,7 @@ def test_not_all_delete_requests_are_ambiguous(monkeypatch):
         return json.dumps(model_reply)
 
     monkeypatch.setattr(
-        "healthcare_data_quality.cleaning_workspace.query_local_model",
+        "healthcare_data_quality.cleaning.cleaning_workspace.query_local_model",
         fake_model,
     )
     assert _clarify_ambiguous_row_edit("Clear only cell row 11 column 7 to NA") is None

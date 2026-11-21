@@ -3,12 +3,11 @@
 import json
 from io import BytesIO
 from zipfile import ZipFile
-import os
 from pathlib import Path
 
 import pytest
 
-from history_store import (
+from healthcare_data_quality.storage.history_store import (
     delete_saved_file, build_history_zip, human_size, list_history,
     select_history_rows, update_annotations,
     DELETE_CONFIRMATION_TEXT, is_batch_delete_authorized,
@@ -134,7 +133,9 @@ def test_ui_does_not_choose_an_investigation_to_load():
     assert "render_saved_file_manager(cache_key)" in source
     assert 'on_select="rerun", selection_mode="multi-row"' in source
     assert '"Clear selected rows"' in source
-    assert "st.multiselect(" not in source
+    # Skills/memory management may use multiselect; investigation history must not.
+    history_ui = source[source.index("def render_saved_file_manager("):source.index("def ", source.index("def render_saved_file_manager(")+4)]
+    assert "st.multiselect(" not in history_ui
     assert "build_history_zip(" in source
     assert "for entry in selected:" in source
     assert "saved_investigations(cache_key)" in source
@@ -163,7 +164,7 @@ def test_batch_export_rejects_invalid_targets_and_oversize(tmp_path, monkeypatch
     with pytest.raises(ValueError):
         build_history_zip([malicious], root_a, root_e)
     assert newer.exists()
-    import history_store
+    from healthcare_data_quality.storage import history_store
     monkeypatch.setattr(history_store, "MAX_BATCH_ZIP_BYTES", 1)
     with pytest.raises(ValueError, match="ZIP limit"):
         build_history_zip(inventory, root_a, root_e)
@@ -267,12 +268,13 @@ def test_delete_ui_requires_phrase_and_resets_after_row_selection_changes():
     assert 'disabled=not can_delete' in source
     assert 'if delete_clicked and is_batch_delete_authorized(' in source
     assert 'on_select="rerun", selection_mode="multi-row"' in source
-    assert 'st.multiselect(' not in source
+    history_ui = source[source.index('def render_saved_file_manager('):source.index('def ', source.index('def render_saved_file_manager(') + 4)]
+    assert 'st.multiselect(' not in history_ui
 
 
 def test_history_timestamps_follow_browser_timezone_and_dst():
     from datetime import datetime, timezone
-    from history_store import format_saved_time, resolve_viewer_timezone
+    from healthcare_data_quality.storage.history_store import format_saved_time, resolve_viewer_timezone
 
     pst, name = resolve_viewer_timezone("America/Los_Angeles")
     assert name == "America/Los_Angeles"
@@ -287,7 +289,7 @@ def test_history_timestamps_follow_browser_timezone_and_dst():
 
 def test_time_display_uses_offset_fallback_without_server_timezone():
     from datetime import datetime, timezone
-    from history_store import format_saved_time, resolve_viewer_timezone
+    from healthcare_data_quality.storage.history_store import format_saved_time, resolve_viewer_timezone
 
     at_night = datetime(2026, 11, 15, 6, 8, 41, tzinfo=timezone.utc)
     fallback, label = resolve_viewer_timezone("Invalid/Zone", 480)
@@ -304,7 +306,7 @@ def test_time_display_uses_offset_fallback_without_server_timezone():
 
 def test_fall_dst_timestamps_are_unambiguous():
     from datetime import datetime, timezone
-    from history_store import format_saved_time, resolve_viewer_timezone
+    from healthcare_data_quality.storage.history_store import format_saved_time, resolve_viewer_timezone
     la, _ = resolve_viewer_timezone("America/Los_Angeles")
     # The two instants have the same wall-clock hour on fall-back day.
     before = datetime(2026, 11, 1, 8, 30, tzinfo=timezone.utc)
@@ -314,7 +316,7 @@ def test_fall_dst_timestamps_are_unambiguous():
 
 
 def test_latest_checkpoint_view_keeps_all_audits_and_only_one_snapshot_per_key(tmp_path):
-    from history_store import latest_checkpoint_view
+    from healthcare_data_quality.storage.history_store import latest_checkpoint_view
     audit_root, exploration_root, audit_old, audit_new, other, discovery = _records(tmp_path)
     older_checkpoint = exploration_root / KEY1 / (
         "discovery-20261113T131421.000001Z-" + "b" * 10 + ".json"

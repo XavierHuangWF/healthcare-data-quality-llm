@@ -4,7 +4,7 @@ from pathlib import Path
 
 from healthcare_data_quality.workflow import run_initial_audit
 from review_proposals import review_interactively
-from healthcare_data_quality.decision_memory import fingerprint_proposal
+from healthcare_data_quality.learning.decision_memory import fingerprint_proposal
 from authorize_duplicate_removal import authorize_duplicate_removal
 from apply_duplicate_removal import apply_duplicate_removal
 from verify_remediation import (
@@ -14,19 +14,19 @@ from verify_remediation import (
 import json
 from datetime import datetime, timezone
 
-from healthcare_data_quality.qc_report import render_qc_summary
-from healthcare_data_quality.cleaning_codegen import draft_r_transformation
-from healthcare_data_quality.investigation_report import build_evidence_index
+from healthcare_data_quality.investigation.qc_report import render_qc_summary
+from healthcare_data_quality.cleaning.cleaning_codegen import draft_r_transformation
+from healthcare_data_quality.investigation.investigation_report import build_evidence_index
 
 
-from healthcare_data_quality.r_verification import verify_duplicate_column_draft
+from healthcare_data_quality.r_runtime.r_verification import verify_duplicate_column_draft
 
-from healthcare_data_quality.r_verification import inspect_r_transformation
+from healthcare_data_quality.r_runtime.r_verification import inspect_r_transformation
 from hashlib import sha256
-from healthcare_data_quality.r_verification import verify_exact_cell_edits
-from healthcare_data_quality.r_verification import verify_qc_contract_from_evidence
+from healthcare_data_quality.r_runtime.r_verification import verify_exact_cell_edits
+from healthcare_data_quality.r_runtime.r_verification import verify_qc_contract_from_evidence
 
-from healthcare_data_quality.r_verification import verify_numeric_qc_from_baseline
+from healthcare_data_quality.r_runtime.r_verification import verify_numeric_qc_from_baseline
 import csv
 from io import StringIO
 
@@ -491,7 +491,7 @@ def display_investigation_only_report(
 def _assert_read_only_agent_available() -> None:
     """Fail closed if File 2 has not been installed in this project."""
     from inspect import signature
-    from healthcare_data_quality.agent_loop import run_investigation
+    from healthcare_data_quality.agents.agent_loop import run_investigation
 
     parameter = signature(run_investigation).parameters.get(
         "allow_r_investigation"

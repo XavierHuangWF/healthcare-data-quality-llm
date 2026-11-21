@@ -26,6 +26,7 @@ def test_recommendation_expansion_replaces_preview_not_duplicates(monkeypatch, t
     source = tmp_path / "one.csv"
     source.write_text("Taxon,Count\na,0.2\n", encoding="utf-8")
     st = CaptureUI()
+    monkeypatch.setenv("HDQ_APPROVED_STAGE_DIR", str(tmp_path / "checkpoint"))
     app = _app(monkeypatch, st)
     finding = _catalog()[0]
     fid = finding["id"]
@@ -40,10 +41,10 @@ def test_recommendation_expansion_replaces_preview_not_duplicates(monkeypatch, t
             return {"entries": {fid: {"status": "ready", "suggestion": action,
                                       "decision_needed": rationale}}}
 
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: SavedAgentB())
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: SavedAgentB())
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
                         lambda *args, **kwargs: [finding])
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.allowed_positions",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args, **kwargs: (set(), set()))
 
     def render():
@@ -53,18 +54,14 @@ def test_recommendation_expansion_replaces_preview_not_duplicates(monkeypatch, t
             [source], [SimpleNamespace(name="one.csv")], {}, "test-no-repeat", []
         )
 
+    # The compact review renders the truncated recommendation once, never
+    # duplicates it or shows the deprecated full-recommendation toggle.
     render()
-    assert action not in [item[0] for item in st.written if len(item) == 1]
-    assert sum("Replace exactly the invalid measurements" in str(item)
-               for item in st.written) == 1
-    assert sum("Reason / evidence limit:" in line for line in st.captions) == 1
-
-    st.expanded = True
-    render()
-    assert [item for item in st.written if item == (action,)] == [(action,)]
-    assert [item for item in st.written if len(item) == 2 and item[1] == rationale] == [
-        ("**Reason / evidence limit:**", rationale)
-    ]
+    first = [str(item[0]) for item in st.written if item]
+    assert sum("Replace exactly the invalid measurements" in item for item in first) == 1
+    assert action not in first
     assert not any("Reason / evidence limit:" in line for line in st.captions)
-    assert sum("Replace exactly the invalid measurements" in str(item)
-               for item in st.written) == 1
+    st.expanded = True  # a legacy expansion flag must not duplicate the text
+    render()
+    second = [str(item[0]) for item in st.written if item]
+    assert sum("Replace exactly the invalid measurements" in item for item in second) == 1

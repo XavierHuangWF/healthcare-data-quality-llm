@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from exploration_banner import (
+from healthcare_data_quality.ui.exploration_banner import (
     exploration_elapsed, mascot_data_url, render_exploration_banner_html,
     render_investigation_phase_banner_html, sticky_banner_css,
 )
@@ -60,7 +60,7 @@ def test_asset_bundled_and_inline_no_external_network():
 def test_banner_replaces_old_status_not_findings_or_cleaning_tabs():
     app = (ROOT / "app.py").read_text()
     assert "investigation_html = render_exploration_banner_html(live)" in app
-    assert "[\"Data quality findings\", \"Supporting evidence\", \"Clean data with Gemma\"]" in app
+    assert "[\"Data quality findings\", \"Clean data with Gemma\", \"Supporting evidence\", \"Manage skills & memory\"]" in app
     assert "Gemma is still exploring; no verified exploratory check is available yet." not in app
 
 
@@ -122,7 +122,7 @@ def test_streamlit_phase_two_banner_rendered_before_long_model_call():
     assert 'self.hero_slot = st.empty()' in app
     assert 'self.hero_container = st.container(key="hdq_investigation_banner_blocking")' in app
     assert 'components.html(render_investigation_phase_banner_html(' in app
-    assert 'baseline_ready_callback=publish_baseline' in (ROOT / "investigation_jobs.py").read_text()
+    assert 'baseline_ready_callback=publish_baseline' in (ROOT / "src/healthcare_data_quality/jobs/investigation_jobs.py").read_text()
     assert 'render_investigation_phase_banner_html(' in app
     assert 'self.hero_slot.empty()' in app
     assert 'expanded=False' in app
@@ -147,7 +147,7 @@ def test_full_banner_floats_at_viewport_level_not_inside_iframe():
     assert ".st-key-hdq_investigation_banner_blocking" in css
     assert "position: fixed !important" in css
     assert "right: 1.1rem !important" in css
-    assert "width: min(490px" in css
+    assert "width: min(390px" in css
     assert "position: sticky" not in css
     assert "animation-timeline: --hdq-page-scroll" in css
     assert "@keyframes hdq-follow-scroll-thumb" in css
@@ -166,7 +166,7 @@ def test_larger_floating_card_keeps_scroll_tracking_and_mobile_fit():
     html = render_investigation_phase_banner_html(
         phase=2, phase_count=3, activity="Exploring", started_epoch_ms=1795000000000
     )
-    assert "width: min(490px" in css
+    assert "width: min(390px" in css
     assert "width: min(390px" in css
     assert "position: fixed !important" in css
     assert "animation-timeline: --hdq-page-scroll" in css

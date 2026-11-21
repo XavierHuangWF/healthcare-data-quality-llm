@@ -3,8 +3,8 @@
 from pathlib import Path
 import pytest
 
-from healthcare_data_quality import exploratory_combined as combo
-from healthcare_data_quality.exploratory_sandbox import SandboxUnavailable
+from healthcare_data_quality.agents import exploratory_combined as combo
+from healthcare_data_quality.agents.exploratory_sandbox import SandboxUnavailable
 
 
 def _env(monkeypatch, *, proposals, completed=None, max_rounds=30, available=True):

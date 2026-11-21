@@ -1,11 +1,11 @@
 
 from pathlib import Path
 
-from healthcare_data_quality.cleaning_authorization import (
+from healthcare_data_quality.cleaning.cleaning_authorization import (
     authorize_cleaning_request,
     verify_authorized_request,
 )
-from healthcare_data_quality.cleaning_executor import (
+from healthcare_data_quality.cleaning.cleaning_executor import (
     execute_authorized_header_cleaning,
 )
 

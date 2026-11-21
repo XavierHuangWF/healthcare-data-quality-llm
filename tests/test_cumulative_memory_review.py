@@ -5,10 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from healthcare_data_quality.in_memory_cleaning import (
+from healthcare_data_quality.cleaning.in_memory_cleaning import (
     apply_verified_in_memory, assess_verified_in_memory, review_completion, sha256_bytes,
 )
-from healthcare_data_quality.scoped_r_execution import verify_r_against_current_staged_values
+from healthcare_data_quality.r_runtime.scoped_r_execution import verify_r_against_current_staged_values
 from test_two_click_r_flow import FINDING, ReviewUI, setup_review
 
 
@@ -54,7 +54,7 @@ def test_conflicting_prior_edit_requires_bound_current_value_r_proof(monkeypatch
         "proposed": "0", "status": "conflict"}]
     with pytest.raises(PermissionError, match="CSV row 2, column 2"):
         apply_verified_in_memory(original, stage, later, reviewer="researcher")
-    import healthcare_data_quality.scoped_r_execution as scoped
+    import healthcare_data_quality.r_runtime.scoped_r_execution as scoped
     calls = []
     def fake_r(script, input_csv, *, preserve_text):
         calls.append((script, input_csv, preserve_text))
@@ -86,7 +86,7 @@ def test_unauthorized_rebased_r_value_is_rejected(monkeypatch):
     staged, _ = apply_verified_in_memory(original, original,
         plan(original, [{"row": 2, "column": 2, "before": "0.2", "after": "NA"}]), reviewer="a")
     later = plan(original, [{"row": 2, "column": 2, "before": "0.2", "after": "0"}])
-    import healthcare_data_quality.scoped_r_execution as scoped
+    import healthcare_data_quality.r_runtime.scoped_r_execution as scoped
     monkeypatch.setattr(scoped, "run_r_sandbox", lambda *args, **kwargs:
                         "kind,csv_row,csv_column,value\ncell,2,2,99\n")
     with pytest.raises(PermissionError, match="unexpected coordinate/value"):
@@ -94,32 +94,33 @@ def test_unauthorized_rebased_r_value_is_rejected(monkeypatch):
     assert b"NA" in staged
 
 
-def test_review_id_entered_once_for_all_approvals(monkeypatch, tmp_path):
+def test_review_id_registered_once_is_reused_for_all_approvals(monkeypatch, tmp_path):
     from test_r_auto_preview_insertion_flow import _mock_r
     app, ui, path, render = setup_review(monkeypatch, tmp_path)
     calls = []
     def text_input(*args, **kwargs):
-        calls.append(args[0]); return "researcher-once"
+        calls.append(args[0])
+        return 'wrong-second-identity'
     ui.text_input = text_input
+    ui.session_state.cleaning_approved_reviewer = 'researcher-once'
     _mock_r(monkeypatch)
     render()
-    first_approval_label = "Reviewer identifier (required once for this investigation)"
-    assert calls == [first_approval_label]  # shown inside first approval form only
-    ui.pressed.add("Approve & Stage in memory")
-    with pytest.raises(StopIteration, match="rerun"):
+    assert calls == []  # identification was completed at dataset upload
+    ui.pressed.add('Approve & Stage in memory')
+    with pytest.raises(StopIteration, match='rerun'):
         render()
-    assert ui.session_state.cleaning_approved_reviewer == "researcher-once"
-    assert ui.session_state.cleaning_history[0]["reviewer"] == "researcher-once"
+    assert ui.session_state.cleaning_approved_reviewer == 'researcher-once'
+    assert ui.session_state.cleaning_history[0]['reviewer'] == 'researcher-once'
     ui.pressed.clear()
     render()
-    assert calls == [first_approval_label] * 2  # no further reviewer field
-    assert ui.session_state.cleaning_review_statuses[FINDING["id"]] == "Applied and verified"
+    assert calls == []
+    assert ui.session_state.cleaning_review_statuses[FINDING['id']] == 'Applied and verified'
 
 
 def test_ui_overlapping_conflict_gets_r_rechecked_and_explicitly_approved(monkeypatch, tmp_path):
-    from healthcare_data_quality.finding_cleaning import validate_scoped_plan
-    from healthcare_data_quality.in_memory_cleaning import apply_verified_in_memory
-    import healthcare_data_quality.scoped_r_execution as scoped
+    from healthcare_data_quality.cleaning.finding_cleaning import validate_scoped_plan
+    from healthcare_data_quality.cleaning.in_memory_cleaning import apply_verified_in_memory
+    import healthcare_data_quality.r_runtime.scoped_r_execution as scoped
 
     app, ui, source, render = setup_review(monkeypatch, tmp_path)
     ui.warning = lambda *args, **kwargs: None
@@ -141,11 +142,11 @@ def test_ui_overlapping_conflict_gets_r_rechecked_and_explicitly_approved(monkey
     checkboxes = []
     def approve_conflict(label, **kwargs):
         checkboxes.append(label)
-        return label.startswith("I authorize replacing these previously approved values")
+        return label == "Override previously approved values"
     ui.checkbox = approve_conflict
     render()
     assert len(r_calls) == 2  # original-input verification + staged-input recheck
-    assert any("previously approved values" in label for label in checkboxes)
+    assert "Override previously approved values" in checkboxes
     assert b"a,NA" in ui.session_state.cleaning_staged_bytes_by_dataset["dataset_1"]
     ui.pressed.add("Approve & Stage in memory")
     with pytest.raises(StopIteration, match="rerun"):
@@ -160,7 +161,7 @@ def test_ui_overlapping_conflict_gets_r_rechecked_and_explicitly_approved(monkey
 
 
 def test_ui_resolved_overlap_stages_no_additional_change(monkeypatch, tmp_path):
-    from healthcare_data_quality.in_memory_cleaning import apply_verified_in_memory
+    from healthcare_data_quality.cleaning.in_memory_cleaning import apply_verified_in_memory
     from test_r_auto_preview_insertion_flow import _mock_r
 
     app, ui, source, render = setup_review(monkeypatch, tmp_path)
@@ -210,7 +211,7 @@ def test_rebased_r_csv_quoting_does_not_invalidate_verified_values(monkeypatch):
     staged, _ = apply_verified_in_memory(original, original,
         plan(original, [{"row": 2, "column": 2, "before": "0.2", "after": "NA"}]), reviewer="r")
     later = plan(original, [{"row": 2, "column": 2, "before": "0.2", "after": "0"}])
-    import healthcare_data_quality.scoped_r_execution as scoped
+    import healthcare_data_quality.r_runtime.scoped_r_execution as scoped
     monkeypatch.setattr(scoped, "run_r_sandbox", lambda *args, **kwargs:
         '"kind","csv_row","csv_column","value"\n"cell","2","2","0"\n')
     proof = verify_r_against_current_staged_values(original, staged, later)

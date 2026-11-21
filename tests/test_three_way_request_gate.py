@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_data_quality.llm_client import _RequestGate, _max_active_requests, model_request_priority
+from healthcare_data_quality.services.llm_client import _RequestGate, _max_active_requests, model_request_priority
 
 
 @pytest.mark.parametrize('value', ['1', '2', '3'])

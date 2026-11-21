@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cleaning_jobs import CleaningRecommendationJobs, job_fingerprint
+from healthcare_data_quality.jobs.cleaning_jobs import CleaningRecommendationJobs, job_fingerprint
 from test_cleaning_review_cards import StubUI, _app, _catalog
 
 
@@ -21,7 +21,7 @@ class AuditUI(StubUI):
 def _one_finding(monkeypatch):
     finding = _catalog()[0]
     monkeypatch.setattr(
-        "healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+        "healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
         lambda *args, **kwargs: [finding],
     )
     return finding
@@ -47,7 +47,7 @@ def test_agent_b_is_scheduled_for_each_fresh_run_not_blocked_by_invalid_keyword(
         return {"suggestion": "Check units and normalize this value", "decision_needed": "Confirm protocol"}
 
     worker = CleaningRecommendationJobs(tmp_path / "jobs", recommender=fake_recommend)
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: worker)
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: worker)
 
     for run_id in ("fresh-first", "fresh-second"):
         assert app.schedule_agent_b_once("same-csv-key", {"cleaning_recommendation_run_id": run_id},
@@ -72,11 +72,11 @@ def test_new_review_does_not_look_up_or_replay_old_decisions(monkeypatch, tmp_pa
     def unexpected(*args, **kwargs):
         raise AssertionError("Historical review must not be read automatically")
 
-    monkeypatch.setattr("healthcare_data_quality.interaction_memory.find_reviewed_solution", unexpected)
+    monkeypatch.setattr("healthcare_data_quality.learning.interaction_memory.find_reviewed_solution", unexpected)
     class EmptyQueue:
         def snapshot(self, key):
             return None
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: EmptyQueue())
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: EmptyQueue())
 
     st.session_state.cleaning_fresh_review_run_id = "new-run"
     app.render_cleaning_workspace([path], [SimpleNamespace(name=path.name)],
@@ -97,7 +97,7 @@ def test_direct_agent_c_discussion_is_available_before_agent_b(monkeypatch, tmp_
     class NoRecommendation:
         def snapshot(self, key):
             return None
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: NoRecommendation())
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: NoRecommendation())
     st.buttons_on.add(f"review_start_direct_agent_c_{finding['id']}")
     audit = {"cleaning_recommendation_run_id": "new-run"}
     with pytest.raises(StopIteration, match="streamlit rerun"):
@@ -118,7 +118,7 @@ def test_fresh_run_context_isolated_from_previous_session(monkeypatch, tmp_path)
     class EmptyQueue:
         def snapshot(self, key):
             return None
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: EmptyQueue())
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: EmptyQueue())
 
     a1 = {"cleaning_recommendation_run_id": "old-run"}
     a2 = {"cleaning_recommendation_run_id": "new-run"}
@@ -152,7 +152,7 @@ def test_existing_run_can_start_missing_agent_b_job_without_rerunning_agent_a(
             calls.append((context_key, [item["id"] for item in findings], kwargs))
             return "restored-run-job"
 
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: LostJob())
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: LostJob())
     run_id = "already-finished-run"
     st.buttons_on.add(f"cleaning_start_missing_agent_b_same-csv-key:{run_id}")
     with pytest.raises(StopIteration, match="streamlit rerun"):
@@ -160,7 +160,10 @@ def test_existing_run_can_start_missing_agent_b_job_without_rerunning_agent_a(
             [path], [SimpleNamespace(name=path.name)],
             {"cleaning_recommendation_run_id": run_id}, "same-csv-key", [],
         )
-    assert calls == [("same-csv-key", [finding["id"]], {"run_id": run_id})]
+    assert len(calls) == 1
+    context, finding_ids, options = calls[0]
+    assert context == "same-csv-key" and finding_ids == [finding["id"]]
+    assert options["run_id"] == run_id
     assert st.session_state.cleaning_history == []
     assert st.session_state.cleaning_staged_bytes_by_dataset == {}
 
@@ -175,7 +178,7 @@ def test_direct_agent_c_submission_does_not_require_agent_b_result(monkeypatch, 
     class MissingB:
         def snapshot(self, key):
             return None
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: MissingB())
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: MissingB())
     app.render_cleaning_workspace(
         [path], [SimpleNamespace(name=path.name)],
         {"cleaning_recommendation_run_id": "new-run"}, "same-csv-key", [],
@@ -189,7 +192,7 @@ def test_direct_agent_c_submission_does_not_require_agent_b_result(monkeypatch, 
         def submit_routed(self, callback, *args, **kwargs):
             submissions.append((args, kwargs))
             return "direct-chat-job", "C"
-    monkeypatch.setattr("interactive_chat_jobs.interactive_chat_manager", lambda: FakeChatManager())
+    monkeypatch.setattr("healthcare_data_quality.jobs.interactive_chat_jobs.interactive_chat_manager", lambda: FakeChatManager())
     monkeypatch.setattr(app, "_background_agents_idle_for_run", lambda *args: (False, False))
 
     app._queue_agent_c_for_finding(

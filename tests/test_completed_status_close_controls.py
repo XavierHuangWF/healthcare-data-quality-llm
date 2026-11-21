@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from exploration_banner import recommendation_is_complete
+from healthcare_data_quality.ui.exploration_banner import recommendation_is_complete
 
 
 def test_only_terminal_agent_b_recommendations_are_dismissible():
@@ -27,7 +27,7 @@ def test_close_buttons_are_real_streamlit_controls_not_embedded_html():
     source = (ROOT / "app.py").read_text()
     section = source[source.index("def render_live_investigation_status("):source.index("def render_pre_investigation_status(")]
     assert 'investigation_complete = not (registered_running or (live and live.get("status") == "running"))' in section
-    assert 'recommendations_complete = bool(investigation_complete and recommendation_is_complete(recommendation_state))' in section
+    assert 'recommendations_complete = recommendation_is_complete(recommendation_state)' in section
     assert 'if investigation_complete:' in section
     assert 'if recommendations_complete:' in section
     assert 'key="hdq_close_investigation"' in section
@@ -66,7 +66,7 @@ def test_dismissal_is_per_run_and_does_not_touch_saved_results(monkeypatch):
 
 
 def test_close_controls_are_clickable_in_fixed_overlay():
-    from exploration_banner import sticky_banner_css
+    from healthcare_data_quality.ui.exploration_banner import sticky_banner_css
     css = sticky_banner_css()
     assert "pointer-events: none !important;" in css
     # Target the dedicated keyed containers, not Streamlit's variable internal

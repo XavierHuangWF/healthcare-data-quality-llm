@@ -42,4 +42,4 @@ def test_accepted_all_evidenced_missing_cells_become_one_complete_plan(tmp_path,
     validated = state.cleaning_plans_by_finding[finding['id']]
     assert len(validated['changes']) == 618
     assert len(state.cleaning_messages_by_finding[finding['id']]) == 1
-    assert 'all 618 affected cells' in state.cleaning_messages_by_finding[finding['id']][0]['content']
+    assert 'Replace 618 cells' in state.cleaning_messages_by_finding[finding['id']][0]['content']

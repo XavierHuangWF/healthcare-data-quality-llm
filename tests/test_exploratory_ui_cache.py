@@ -23,7 +23,9 @@ def _app(monkeypatch):
 def test_new_exploratory_code_does_not_invalidate_old_baseline_cache(monkeypatch):
     app = _app(monkeypatch)
     source = ROOT / "src" / "healthcare_data_quality"
-    relevant = sorted(p for p in source.rglob("*.py") if not p.name.startswith("exploratory_"))
+    relevant = sorted(p for p in source.rglob("*.py") if not p.name.startswith("exploratory_") and p.name not in {
+        "cleaning_stage_checkpoint.py", "reviewed_rule_replay.py", "evidence_registry.py"
+    })
     relevant.extend([ROOT / "scripts" / "run_workflow.py", ROOT / "scripts" / "serve_gemma4.sh"])
     relevant.extend(sorted((ROOT / "data" / "decision_memory").glob("*.jsonl")))
     digest = hashlib.sha256(f"analysis-v{app.CACHE_SCHEMA_VERSION}".encode())
@@ -51,9 +53,9 @@ def test_exploratory_cache_is_private_and_can_restore_results(tmp_path, monkeypa
 def test_baseline_and_exploration_share_one_data_quality_tab(monkeypatch):
     _app(monkeypatch)
     source = (ROOT / "app.py").read_text(encoding="utf-8")
-    assert '["Data quality findings", "Supporting evidence", "Clean data with Gemma"]' in source
+    assert '["Data quality findings", "Clean data with Gemma", "Supporting evidence", "Manage skills & memory"]' in source
     assert 'render_finding_evidence(' in source
-    assert 'render_cleaning_workspace(paths, uploaded, audit, cache_key)' in source
+    assert 'render_cleaning_workspace(paths, uploaded, current, cache_key)' in source
     assert '"Exploratory discoveries", "Supporting evidence"' not in source
     assert 'render_exploratory_findings(paths, cache_key, audit)' in source
     assert 'render_baseline(dataset_id, baseline, source_path=paths[label_index])' in source
@@ -76,12 +78,12 @@ def test_unified_run_opt_in_starts_nonblocking_exploration(monkeypatch):
 def test_full_run_progress_publishes_real_background_events(monkeypatch):
     _app(monkeypatch)
     source = (ROOT / "app.py").read_text(encoding="utf-8")
-    worker = (ROOT / "exploration_jobs.py").read_text(encoding="utf-8")
-    registered_worker = (ROOT / "investigation_jobs.py").read_text(encoding="utf-8")
+    worker = (ROOT / "src/healthcare_data_quality/jobs/exploration_jobs.py").read_text(encoding="utf-8")
+    registered_worker = (ROOT / "src/healthcare_data_quality/jobs/investigation_jobs.py").read_text(encoding="utf-8")
     assert 'progress_callback=progress,' in registered_worker
     assert 'baseline_ready_callback=publish_baseline' in registered_worker
     assert 'st.fragment(run_every="3s")(refresh_explorations)' in source
-    assert 'st.fragment(run_every="3s")(refresh_cleaning)' in source
+    assert 'st.fragment(refresh_cleaning)()' in source
     assert 'with model_request_priority("investigation"):' in worker
     assert "components.html(live_timer_html(self.started_epoch_ms)" in source
     assert "estimated percentage or time remaining" in source
@@ -276,19 +278,19 @@ def test_investigation_status_makes_incomplete_work_explicit(monkeypatch):
         gemma_error=None, exploration_enabled=True,
     )
     assert paused["state"] == "partial"
-    assert "could not propose another distinct test" in paused["details"]
+    assert "could not identify another distinct test" in paused["details"]
     interrupted = app.investigation_outcome(
         data, header_problems=False, gemma_runs=[], gemma_stop=None,
         gemma_error="model timeout", exploration_enabled=True,
     )
     assert interrupted["state"] == "partial"
-    assert "interrupted" in interrupted["details"]
+    assert "stopped unexpectedly" in interrupted["details"]
     not_run = app.investigation_outcome(
         data, header_problems=False, gemma_runs=[], gemma_stop=None,
         gemma_error=None, exploration_enabled=True,
     )
     assert not_run["state"] == "partial"
-    assert "not available" in not_run["details"]
+    assert "completed checks" in not_run["details"]
 
 
 def test_investigation_status_does_not_miss_header_errors(monkeypatch):
@@ -324,4 +326,4 @@ def test_backend_budget_exhaustion_is_partial_even_without_found_issues(monkeypa
         gemma_error=None, exploration_enabled=True,
     )
     assert outcome["state"] == "partial"
-    assert "execution budget" in outcome["details"]
+    assert "step limit" in outcome["details"]

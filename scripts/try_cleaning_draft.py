@@ -1,8 +1,8 @@
 from pathlib import Path
 import json
 
-from healthcare_data_quality.cleaning_codegen import draft_r_transformation
-from healthcare_data_quality.r_verification import verify_duplicate_column_draft
+from healthcare_data_quality.cleaning.cleaning_codegen import draft_r_transformation
+from healthcare_data_quality.r_runtime.r_verification import verify_duplicate_column_draft
 
 def main():
     report = max(

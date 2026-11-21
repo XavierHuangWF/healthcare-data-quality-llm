@@ -5,10 +5,10 @@ from unittest.mock import patch
 
 import pytest
 
-from healthcare_data_quality.evidence_claim_validation import (
+from healthcare_data_quality.validation.evidence_claim_validation import (
     canonical_observation_fact, verify_report_claims,
 )
-from healthcare_data_quality.investigation_report import summarize_investigation
+from healthcare_data_quality.investigation.investigation_report import summarize_investigation
 
 
 EVIDENCE = {"T1.O1": {"tool": "compare_columns", "observation": {
@@ -48,7 +48,7 @@ def test_unsupported_or_fabricated_reference_is_rejected():
 def test_summarizer_returns_evidence_check_marks():
     history = [{"step": 1, "tool": "compare_columns",
                 "observations": [EVIDENCE["T1.O1"]["observation"]]}]
-    with patch("healthcare_data_quality.investigation_report.query_local_model",
+    with patch("healthcare_data_quality.investigation.investigation_report.query_local_model",
                return_value=json.dumps(report("These are the same biological specimen."))):
         output = summarize_investigation(history)
     assert output["findings"][0]["claim_verification"]["status"] == "requires_scientific_review"

@@ -1,20 +1,19 @@
 from pathlib import Path
 
-from .agent_loop import run_investigation
-from .decision_memory import (
+from healthcare_data_quality.agents.agent_loop import run_investigation
+from healthcare_data_quality.learning.decision_memory import (
     get_decision_context,
     get_verified_outcome_context,
 )
-from .ingestion import inspect_headers
-from .remediation_proposal import generate_remediation_proposals
-from .remediation_validator import validate_remediation_proposals
+from healthcare_data_quality.investigation.ingestion import inspect_headers
+from healthcare_data_quality.cleaning.remediation_proposal import generate_remediation_proposals
+from healthcare_data_quality.cleaning.remediation_validator import validate_remediation_proposals
 from collections.abc import Callable
-from .baseline_audit import run_baseline_audit
+from healthcare_data_quality.investigation.baseline_audit import run_baseline_audit
 import json
 import csv
 from collections import Counter, defaultdict
 from .tools.registry import TOOL_REGISTRY
-from .tools.context import STRUCTURE_CONTEXT
 
 OUTCOME_LOG = Path(
     "data/decision_memory/remediation_outcomes.jsonl"

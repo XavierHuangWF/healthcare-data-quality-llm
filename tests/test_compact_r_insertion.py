@@ -3,11 +3,11 @@ import csv
 from io import StringIO
 import pytest
 
-from healthcare_data_quality.scoped_r_execution import (
+from healthcare_data_quality.r_runtime.scoped_r_execution import (
     _r_insertion_function, _as_csv, _affected_changes,
     prepare_and_execute_scoped_r_preview, verify_prepared_r_insertion,
 )
-from healthcare_data_quality.finding_cleaning import validate_scoped_plan
+from healthcare_data_quality.cleaning.finding_cleaning import validate_scoped_plan
 
 
 def _plan(n=618):
@@ -53,7 +53,7 @@ def test_header_renames_are_vectorized_and_checked():
 
 
 def test_tampered_verified_insertion_manifest_is_rejected(tmp_path, monkeypatch):
-    from healthcare_data_quality import scoped_r_execution as scoped
+    from healthcare_data_quality.r_runtime import scoped_r_execution as scoped
     source = tmp_path/'data.csv'
     source.write_text('Taxon,Count\na,0.2\n', encoding='utf-8')
     finding = {"id":"dataset_1:qc:1", "dataset_id":"dataset_1", "check_key":"find_invalid_counts",

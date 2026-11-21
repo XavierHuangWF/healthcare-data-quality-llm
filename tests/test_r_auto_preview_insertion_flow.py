@@ -7,15 +7,15 @@ from io import StringIO
 import pytest
 
 from test_two_click_r_flow import setup_review, FINDING
-from healthcare_data_quality.finding_cleaning import validate_scoped_plan
-from healthcare_data_quality.scoped_r_execution import (
+from healthcare_data_quality.cleaning.finding_cleaning import validate_scoped_plan
+from healthcare_data_quality.r_runtime.scoped_r_execution import (
     prepare_and_execute_scoped_r_preview,
     verify_prepared_r_insertion,
 )
 
 
 def _mock_r(monkeypatch, output=None):
-    import healthcare_data_quality.scoped_r_execution as scoped
+    import healthcare_data_quality.r_runtime.scoped_r_execution as scoped
     calls = []
     def fake_run(r_code, input_csv, *, preserve_text=False):
         calls.append((r_code, input_csv, preserve_text))
@@ -76,10 +76,11 @@ def test_missing_reviewer_never_commits_working_csv(monkeypatch, tmp_path):
     render()
     st.pressed.add('Approve & Stage in memory')
     st.reviewer = ''
+    st.session_state.cleaning_approved_reviewer = ''
     render()
     assert st.session_state.cleaning_working_paths == {}
     assert st.session_state.cleaning_result is None
-    assert any('reviewer identifier' in e for e in st.errors)
+    assert not st.session_state.cleaning_history  # no identity means no approval action
 
 
 def test_r_output_with_unapproved_value_is_rejected(monkeypatch, tmp_path):
@@ -105,26 +106,21 @@ def test_source_change_after_preview_blocks_insertion(monkeypatch, tmp_path):
     assert any('In-memory insertion failed' in e for e in st.errors)
 
 
-def test_yes_click_queues_plan_then_hides_both_choice_buttons(monkeypatch, tmp_path):
+def test_obsolete_yes_button_cannot_approve_an_unverified_suggestion(monkeypatch, tmp_path):
+    # Agent B no longer exposes a prose-only "Yes" control. A source-backed
+    # choice and one named human approval are required.
     app, st, source, render = setup_review(monkeypatch, tmp_path)
+    original = source.read_bytes()
     fid = FINDING['id']
     st.session_state.cleaning_plans_by_finding.clear()
     st.session_state.cleaning_discussion_mode_by_finding.clear()
     queued = []
-    monkeypatch.setattr(app, '_queue_agent_c_for_finding', lambda *args, **kw: queued.append(args[-1]))
-    st.buttons_on.add(f'review_yes_{fid}')
-    with pytest.raises(StopIteration, match='rerun'):
-        render()
-    assert len(queued) == 1
-    assert 'I accept' in queued[0]
-    assert st.session_state.cleaning_discussion_mode_by_finding[fid] == 'accepted'
-    st.buttons_on.clear()
-    calls = []
-    real_button = st.button
-    def tracking_button(label, *, key=None, **kwargs):
-        calls.append(key)
-        return real_button(label, key=key, **kwargs)
-    st.button = tracking_button
+    monkeypatch.setattr(app, '_queue_agent_c_for_finding',
+                        lambda *args, **kwargs: queued.append(args))
+    st.buttons_on.add(f'review_yes_{fid}')  # old, unsupported widget key
     render()
-    assert f'review_yes_{fid}' not in calls
-    assert f'review_no_{fid}' not in calls
+    assert queued == []
+    assert st.session_state.cleaning_plans_by_finding == {}
+    assert st.session_state.cleaning_history == []
+    assert source.read_bytes() == original
+

@@ -44,7 +44,7 @@ print(result.stdout, end="")
 import csv
 import io
 
-from healthcare_data_quality.r_sandbox import run_r_sandbox
+from healthcare_data_quality.r_runtime.r_sandbox import run_r_sandbox
 
 r_function = (
     'clean_dataset <- function(df) { '

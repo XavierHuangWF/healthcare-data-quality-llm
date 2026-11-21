@@ -40,6 +40,8 @@ exec "$VLLM" serve "$MODEL_DIR" \
     --port 8000 \
     --max-model-len "$MODEL_LEN" \
     --gpu-memory-utilization 0.90 \
-    --max-num-seqs "$MAX_SEQS" \
-    --language-model-only \
-    --enforce-eager
+    --max-num-seqs "${HDQ_MAX_NUM_SEQS:-3}" \
+    --model-impl vllm \
+    --kv-cache-dtype bfloat16 \
+    --async-scheduling \
+    --language-model-only

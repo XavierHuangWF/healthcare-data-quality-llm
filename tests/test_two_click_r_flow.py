@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from test_cleaning_review_cards import StubUI, _app
-from healthcare_data_quality.finding_cleaning import validate_scoped_plan
+from healthcare_data_quality.cleaning.finding_cleaning import validate_scoped_plan
 
 
 FINDING = {
@@ -40,19 +40,24 @@ class ReviewUI(StubUI):
         return self.reviewer
 
     def form_submit_button(self, label, **kwargs):
-        return label in self.pressed
+        if kwargs.get("disabled", False):
+            return False
+        return (label in self.pressed or
+                label == "Yes — Approve & Execute" and
+                "Approve & Stage in memory" in self.pressed)
 
     def error(self, message):
         self.errors.append(message)
 
 
 def setup_review(monkeypatch, tmp_path):
-    import cleaning_jobs
+    from healthcare_data_quality.jobs import cleaning_jobs
     csv_path = tmp_path / "one.csv"
     csv_path.write_text("Taxon,Count\na,0.2\n", encoding="utf-8")
     st = ReviewUI()
+    monkeypatch.setenv("HDQ_APPROVED_STAGE_DIR", str(tmp_path / "checkpoint"))
     app = _app(monkeypatch, st)
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
                         lambda *a, **kw: [FINDING])
 
     class Saved:
@@ -74,11 +79,12 @@ def setup_review(monkeypatch, tmp_path):
     st.session_state.cleaning_plans_by_finding[FINDING["id"]] = validate_scoped_plan(
         candidate, FINDING, csv_path)
     st.session_state.cleaning_discussion_mode_by_finding[FINDING["id"]] = "accepted"
+    st.session_state.cleaning_approved_reviewer = st.reviewer
     return app, st, csv_path, render
 
 
 def test_full_r_code_available_for_review_without_extra_approval(monkeypatch, tmp_path):
-    import healthcare_data_quality.scoped_r_execution as scoped
+    import healthcare_data_quality.r_runtime.scoped_r_execution as scoped
     app, st, source, render = setup_review(monkeypatch, tmp_path)
     monkeypatch.setattr(scoped, 'run_r_sandbox', lambda *args, **kwargs:
                         'kind,csv_row,csv_column,value\ncell,2,2,NA\n')
@@ -88,15 +94,17 @@ def test_full_r_code_available_for_review_without_extra_approval(monkeypatch, tm
     preview = st.session_state.cleaning_r_previews_by_finding[fid]
     assert preview['r_result']['status'] == 'r_execution_verified'
     assert preview['insertion_plan']['changes'][0]['after'] == 'NA'
-    assert len(st.r_code) == 2
-    assert 'clean_dataset <- function(df)' in st.r_code[0]
-    assert 'df[[col]][rows[i]] <- verified_changes$replacement[i]' in st.r_code[1]
+    # The new UI intentionally hides R source code, while retaining verified
+    # reproducible R artifacts in the completed review state.
+    assert st.r_code == []
+    assert 'clean_dataset <- function(df)' in preview['r_function']
+    assert 'df[[col]][rows[i]] <- verified_changes$replacement[i]' in preview['insertion_r_function']
     assert st.session_state.cleaning_working_paths == {}
     assert not st.errors
 
 
 def test_preview_failure_does_not_run_insertion(monkeypatch, tmp_path):
-    import healthcare_data_quality.scoped_r_execution as scoped
+    import healthcare_data_quality.r_runtime.scoped_r_execution as scoped
     app, st, source, render = setup_review(monkeypatch, tmp_path)
     monkeypatch.setattr(scoped, 'run_r_sandbox', lambda *args, **kwargs:
                         'kind,csv_row,csv_column,value\ncell,2,2,UNEXPECTED\n')

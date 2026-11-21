@@ -2,10 +2,10 @@
 import csv
 from pathlib import Path
 
-from evidence_view import baseline_evidence_trace, registered_investigation_evidence
-from healthcare_data_quality.finding_evidence import dataset_finding_evidence
-from healthcare_data_quality.finding_presentation import header_findings
-from healthcare_data_quality.ingestion import inspect_headers
+from healthcare_data_quality.ui.evidence_view import baseline_evidence_trace, registered_investigation_evidence
+from healthcare_data_quality.investigation.finding_evidence import dataset_finding_evidence
+from healthcare_data_quality.ui.finding_presentation import header_findings
+from healthcare_data_quality.investigation.ingestion import inspect_headers
 from healthcare_data_quality.tools.column_inspection import compare_columns
 
 

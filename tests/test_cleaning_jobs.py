@@ -1,12 +1,10 @@
 """Background Gemma worker does not mutate datasets or approval state."""
-import json
 import threading
-from pathlib import Path
 
 import pytest
 
-from cleaning_jobs import CleaningRecommendationJobs, job_fingerprint
-from healthcare_data_quality.llm_client import _RequestGate, model_request_priority
+from healthcare_data_quality.jobs.cleaning_jobs import CleaningRecommendationJobs, job_fingerprint
+from healthcare_data_quality.services.llm_client import _RequestGate, model_request_priority
 
 
 def _findings():
@@ -122,7 +120,10 @@ def test_cancel_prevents_new_requests_after_current_finishes(tmp_path):
     assert jobs.snapshot(key)["cancel_requested"] is True
 
 
-def test_gate_prefers_waiting_interactive_request():
+def test_gate_prefers_waiting_interactive_request(monkeypatch):
+    # Priority ordering is relevant at capacity=1; capacity=3 has a dedicated
+    # Agent C lane and correctly admits chat immediately.
+    monkeypatch.setenv("HDQ_LLM_MAX_ACTIVE", "1")
     gate = _RequestGate()
     acquired = []
     started = threading.Event()
@@ -222,7 +223,7 @@ def test_once_only_interrupted_call_stays_failed_after_restart(tmp_path):
 
 
 def test_recommendation_prompt_preserves_full_count_when_evidence_is_sampled():
-    from cleaning_jobs import _minimal_finding, _prompt_finding
+    from healthcare_data_quality.jobs.cleaning_jobs import _minimal_finding, _prompt_finding
     finding = {
         "id": "dataset_1:qc:2", "dataset_id": "dataset_1", "source": "QC",
         "title": "618 missing count values", "method": "Inspect count matrix",

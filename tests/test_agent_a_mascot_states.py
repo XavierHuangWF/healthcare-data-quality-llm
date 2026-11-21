@@ -2,7 +2,7 @@
 import base64
 from datetime import datetime, timezone
 from pathlib import Path
-from exploration_banner import (
+from healthcare_data_quality.ui.exploration_banner import (
     render_idle_investigation_banner_html,
     render_investigation_phase_banner_html,
     render_finished_investigation_banner_html,

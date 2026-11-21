@@ -2,7 +2,7 @@
 import json
 
 import pytest
-from cleaning_review import ask_gemma_for_review_options
+from healthcare_data_quality.ui.cleaning_review import ask_gemma_for_review_options
 
 
 def _finding(source="QC", actionable=True):
@@ -20,7 +20,7 @@ def test_direct_action_is_returned_and_keeps_legacy_handoff(monkeypatch):
             "action": "Replace both invalid raw-count cells with NA in a derived CSV, retaining originals in the audit.",
             "rationale": "The dataset does not establish that these are raw integer counts."
         }]})
-    monkeypatch.setattr("cleaning_review.query_local_model", fake_query)
+    monkeypatch.setattr("healthcare_data_quality.ui.cleaning_review.query_local_model", fake_query)
     item = _finding()
     rec = ask_gemma_for_review_options([item])[item["id"]]
     assert rec["suggestion"].startswith("Replace both invalid")
@@ -36,7 +36,7 @@ def test_direct_action_is_returned_and_keeps_legacy_handoff(monkeypatch):
     "Determine whether the cells should be rounded.",
 ])
 def test_generic_researcher_tasks_are_rejected(monkeypatch, bad):
-    monkeypatch.setattr("cleaning_review.query_local_model", lambda *a, **k:
+    monkeypatch.setattr("healthcare_data_quality.ui.cleaning_review.query_local_model", lambda *a, **k:
         json.dumps({"recommendations": [{
             "finding_id": "sample:qc:1", "action_type": "scoped_replacement",
             "action": bad, "rationale": "The source policy is unavailable."
@@ -46,7 +46,7 @@ def test_generic_researcher_tasks_are_rejected(monkeypatch, bad):
 
 
 def test_zero_finding_check_cannot_generate_data_edit(monkeypatch):
-    monkeypatch.setattr("cleaning_review.query_local_model", lambda *a, **k:
+    monkeypatch.setattr("healthcare_data_quality.ui.cleaning_review.query_local_model", lambda *a, **k:
         json.dumps({"recommendations": [{
             "finding_id": "sample:qc:1", "action_type": "scoped_replacement",
             "action": "Replace all values with zero.",
@@ -57,7 +57,7 @@ def test_zero_finding_check_cannot_generate_data_edit(monkeypatch):
 
 
 def test_zero_finding_check_can_preserve_data(monkeypatch):
-    monkeypatch.setattr("cleaning_review.query_local_model", lambda *a, **k:
+    monkeypatch.setattr("healthcare_data_quality.ui.cleaning_review.query_local_model", lambda *a, **k:
         json.dumps({"recommendations": [{
             "finding_id": "sample:qc:1", "action_type": "no_change",
             "action": "Keep the dataset unchanged for this completed check.",
@@ -73,7 +73,7 @@ def test_zero_finding_check_can_preserve_data(monkeypatch):
     ("no_change", "Keep the observed invalid counts as they are."),
 ])
 def test_observed_issue_must_receive_real_remediation(monkeypatch, action_type, action):
-    monkeypatch.setattr("cleaning_review.query_local_model", lambda *a, **k:
+    monkeypatch.setattr("healthcare_data_quality.ui.cleaning_review.query_local_model", lambda *a, **k:
         json.dumps({"recommendations": [{
             "finding_id": "sample:qc:1", "action_type": action_type,
             "action": action, "rationale": "This is not a valid repair."
@@ -89,7 +89,7 @@ def test_observed_issue_must_receive_real_remediation(monkeypatch, action_type, 
     ("rename_header", "Rename repeated physical-column headers with unique position suffixes while preserving measurements."),
 ])
 def test_scientifically_specific_repair_methods_are_accepted(monkeypatch, kind, method):
-    monkeypatch.setattr("cleaning_review.query_local_model", lambda *a, **k:
+    monkeypatch.setattr("healthcare_data_quality.ui.cleaning_review.query_local_model", lambda *a, **k:
         json.dumps({"recommendations": [{
             "finding_id": "sample:qc:1", "action_type": kind,
             "action": method,
@@ -108,7 +108,7 @@ def test_the_prompt_preserves_total_evidence_count_and_real_cell_sample(monkeypa
             "action": "Replace the two invalid count observations with NA in a reviewed working copy.",
             "rationale": "Nonnegative integer counts should not contain fractions, assuming raw reads."
         }]})
-    monkeypatch.setattr("cleaning_review.query_local_model", fake_query)
+    monkeypatch.setattr("healthcare_data_quality.ui.cleaning_review.query_local_model", fake_query)
     finding = _finding()
     finding["evidence"] = [{"CSV row": 11, "Column": 7, "Original value": "0.2"}]
     ask_gemma_for_review_options([finding])

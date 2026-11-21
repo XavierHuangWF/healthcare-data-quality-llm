@@ -2,17 +2,17 @@ import argparse
 import json
 from pathlib import Path
 
-from healthcare_data_quality.decision_memory import (
+from healthcare_data_quality.learning.decision_memory import (
     record_decision,
     find_latest_decision,
     record_clarification,
 )
 
-from healthcare_data_quality.remediation_validator import (
+from healthcare_data_quality.cleaning.remediation_validator import (
     validate_remediation_proposals,
 )
 
-from healthcare_data_quality.remediation_proposal import (
+from healthcare_data_quality.cleaning.remediation_proposal import (
     generate_remediation_proposals,
 )
 

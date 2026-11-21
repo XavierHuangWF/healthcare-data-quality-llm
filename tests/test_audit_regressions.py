@@ -3,9 +3,9 @@
 import csv
 from pathlib import Path
 
-from healthcare_data_quality.count_validation import find_invalid_counts
-from healthcare_data_quality.finding_presentation import baseline_issues
-from healthcare_data_quality.taxonomy_validation import (
+from healthcare_data_quality.validation.count_validation import find_invalid_counts
+from healthcare_data_quality.ui.finding_presentation import baseline_issues
+from healthcare_data_quality.validation.taxonomy_validation import (
     inspect_taxonomy_naming, inspect_taxonomy_structure,
 )
 

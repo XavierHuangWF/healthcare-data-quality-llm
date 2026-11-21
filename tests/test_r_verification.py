@@ -1,5 +1,5 @@
 
-from healthcare_data_quality.r_verification import (
+from healthcare_data_quality.r_runtime.r_verification import (
     verify_r_equivalence,
     verify_duplicate_column_draft,
 )

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_data_quality import cleaning_stage_checkpoint as checkpoint
-from healthcare_data_quality.in_memory_cleaning import sha256_bytes
+from healthcare_data_quality.cleaning import cleaning_stage_checkpoint as checkpoint
+from healthcare_data_quality.cleaning.in_memory_cleaning import sha256_bytes
 
 
 def _source(tmp_path):

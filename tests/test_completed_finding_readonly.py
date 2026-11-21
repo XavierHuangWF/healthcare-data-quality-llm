@@ -40,14 +40,14 @@ def test_successfully_staged_finding_auto_collapses_and_hides_actions(monkeypatc
         return original_form(*args, **kwargs)
     ui.form = track_form
     render()
-    assert recorded_expanders[0][0].endswith('· Staged ✓')
+    assert recorded_expanders[0][0].endswith('1 fractional count')  # stable expander identity
     assert recorded_expanders[0][1] is False
     assert ui.session_state.cleaning_review_statuses[fid] == 'Applied and verified'
     assert not any(key and key.startswith(('review_yes_', 'review_no_', 'review_reject_',
                                              'review_no_action_', 'review_retry_r_'))
                    for key in button_keys)
     assert not forms
-    assert ui.session_state.cleaning_r_previews_by_finding == {}
+    assert fid not in ui.session_state.cleaning_plans_by_finding
     assert ui.session_state.cleaning_completed_audits_by_finding[fid]['changes'][0]['after'] == 'NA'
     assert original.read_text(encoding='utf-8').endswith('a,0.2\n')
 
@@ -68,9 +68,9 @@ def test_completed_audit_can_show_r_code_without_reopening_editor(monkeypatch, t
         return original_button(label, key=key, **kwargs)
     ui.button = track_button
     render()
-    assert len(ui.r_code) == 2
-    assert 'clean_dataset <- function(df)' in ui.r_code[0]
-    assert 'df[[col]][rows[i]] <- verified_changes$replacement[i]' in ui.r_code[1]
+    # Display-only audit is Before → After; technical R code stays hidden.
+    assert ui.r_code == []
+    assert 'Revise completed action' in buttons
     assert 'Yes — prepare this action' not in buttons
     assert 'No — discuss another action' not in buttons
     assert 'Mark reviewed — no change required now' not in buttons

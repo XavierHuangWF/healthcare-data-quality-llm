@@ -2,9 +2,9 @@
 import csv
 from pathlib import Path
 
-from healthcare_data_quality.baseline_audit import run_baseline_audit
-from healthcare_data_quality.taxonomy_validation import inspect_taxonomy_structure
-from healthcare_data_quality.finding_presentation import baseline_issues
+from healthcare_data_quality.investigation.baseline_audit import run_baseline_audit
+from healthcare_data_quality.validation.taxonomy_validation import inspect_taxonomy_structure
+from healthcare_data_quality.ui.finding_presentation import baseline_issues
 from healthcare_data_quality.workflow import build_investigation_objective_ledger
 
 

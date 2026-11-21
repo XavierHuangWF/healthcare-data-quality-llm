@@ -1,4 +1,4 @@
-from exploration_banner import render_agent_c_banner_html
+from healthcare_data_quality.ui.exploration_banner import render_agent_c_banner_html
 
 
 def test_agent_c_idle_card_mentions_waiting_state():

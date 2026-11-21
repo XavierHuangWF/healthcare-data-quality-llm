@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from healthcare_data_quality import exploratory_agent as agent
-from healthcare_data_quality import exploratory_sandbox as sandbox
+from healthcare_data_quality.agents import exploratory_agent as agent
+from healthcare_data_quality.agents import exploratory_sandbox as sandbox
 
 
 GOOD_CODE = '''from statistics import mean

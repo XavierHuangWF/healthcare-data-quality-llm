@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from exploration_banner import (
+from healthcare_data_quality.ui.exploration_banner import (
     render_idle_investigation_banner_html,
     render_recommendation_banner_html,
     render_finished_investigation_banner_html,
@@ -59,7 +59,7 @@ def test_page_mounts_one_floating_host_before_upload_and_uses_it_for_all_states(
     window = source[beginning:]
     host = 'with st.container(key="hdq_investigation_banner"):'
     assert window.count(host) == 1
-    assert window.index(host) < window.index('uploaded = st.file_uploader(')
+    assert window.index(host) < window.index('uploaded_file = st.file_uploader(')
     assert 'render_pre_investigation_status(live_banner_slot, state="no_dataset")' in window
     assert 'state="saved_available" if previous_runs or legacy_session_result else "ready"' in window
     assert 'live_status(audit, cache_key, header_reports, include_exploration, live_banner_slot)' in window

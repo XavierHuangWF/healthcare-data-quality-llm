@@ -8,8 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent_b_banner import agent_b_status_snapshot, render_agent_b_banner_html
-from exploration_banner import render_idle_investigation_banner_html, render_recommendation_banner_html, sticky_banner_css
+from healthcare_data_quality.ui.agent_b_banner import agent_b_status_snapshot, render_agent_b_banner_html
+from healthcare_data_quality.ui.exploration_banner import render_recommendation_banner_html, sticky_banner_css
 
 
 def test_agent_b_pre_run_is_waiting_and_has_no_false_progress():

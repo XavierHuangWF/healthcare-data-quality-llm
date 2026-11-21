@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from evidence_view import measurement_rows_for_display
+from healthcare_data_quality.ui.evidence_view import measurement_rows_for_display
 
 
 def test_mixed_observed_values_are_only_coerced_for_display():

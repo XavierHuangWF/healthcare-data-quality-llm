@@ -27,12 +27,12 @@ def _setup(monkeypatch, tmp_path, st):
     csv = tmp_path / "one.csv"
     csv.write_text("Taxon,Count\na,1.5\n", encoding="utf-8")
     app = _app(monkeypatch, st)
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
                         lambda *args, **kwargs: _catalog())
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.allowed_positions",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args: (set(), set()))
     manager = FakeManager()
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: manager)
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: manager)
     return app, csv, manager
 
 

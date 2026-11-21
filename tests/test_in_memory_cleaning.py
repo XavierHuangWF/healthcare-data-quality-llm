@@ -6,7 +6,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from healthcare_data_quality.in_memory_cleaning import (
+from healthcare_data_quality.cleaning.in_memory_cleaning import (
     apply_verified_in_memory, build_final_download, review_completion, sha256_bytes,
 )
 

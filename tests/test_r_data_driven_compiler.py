@@ -3,7 +3,7 @@ import csv
 from io import StringIO
 import pytest
 
-from healthcare_data_quality.scoped_r_execution import _generate_r, _as_csv
+from healthcare_data_quality.r_runtime.scoped_r_execution import _generate_r, _as_csv
 
 
 def test_compiler_keeps_all_untrusted_values_out_of_r_code():

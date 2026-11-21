@@ -5,7 +5,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from interactive_chat_jobs import InteractiveChatJobs
+from healthcare_data_quality.jobs.interactive_chat_jobs import InteractiveChatJobs
 from test_cleaning_review_cards import StubUI, _app, _catalog, Context
 
 
@@ -28,6 +28,14 @@ class ChatStub(StubUI):
     def text_area(self, label, *, key=None, **kwargs):
         return self.submitted_text.get(key, "")
 
+    def chat_input(self, _placeholder, *, key=None, disabled=False, **kwargs):
+        # Streamlit chat_input replaced the old form to submit with Enter.
+        if disabled or "Send to Agent C" not in self.sent_buttons:
+            return None
+        self.sent_buttons.remove("Send to Agent C")
+        prefix = key.rsplit("_", 1)[0]
+        return self.submitted_text.pop(prefix, "")
+
     def form_submit_button(self, label, *, disabled=False, **kwargs):
         if disabled:
             return False
@@ -43,9 +51,9 @@ def _one_card(monkeypatch, tmp_path):
     f = tmp_path / "one.csv"
     f.write_text("Taxon,Count\na,1.5\n", encoding="utf-8")
     one = _catalog()[0]
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
                         lambda *args, **kwargs: [one])
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.allowed_positions",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args: (set(), set()))
     audit = {"cleaning_recommendation_run_id": "same-inquiry"}
     def render():
@@ -59,7 +67,7 @@ def _one_card(monkeypatch, tmp_path):
 
 
 def test_agent_c_keeps_question_visible_while_responding(monkeypatch, tmp_path):
-    import interactive_chat_jobs
+    from healthcare_data_quality.jobs import interactive_chat_jobs
     manager = InteractiveChatJobs()
     monkeypatch.setattr(interactive_chat_jobs, "interactive_chat_manager", lambda: manager)
     app, st, one, f, render = _one_card(monkeypatch, tmp_path)
@@ -71,7 +79,7 @@ def test_agent_c_keeps_question_visible_while_responding(monkeypatch, tmp_path):
             return {"entries": {one["id"]: {"status": "ready",
                 "suggestion": "Check the provenance before changing fractional counts",
                 "decision_needed": "Were these normalized?"}}}
-    monkeypatch.setattr('cleaning_jobs.recommendation_manager', lambda: SavedB())
+    monkeypatch.setattr('healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager', lambda: SavedB())
 
     def slow_c(*args, **kwargs):
         event_start.set()
@@ -126,7 +134,7 @@ def test_worker_preserves_independent_completion_and_single_consumption():
         if result["status"] != "running":
             break
         time.sleep(0.01)
-    assert result == {"status": "done", "result": "read-only reply"}
+    assert result["status"] == "done" and result["result"] == "read-only reply"
     assert manager.take(b)["status"] == "lost"
     release.set()
     for _ in range(100):
@@ -134,7 +142,7 @@ def test_worker_preserves_independent_completion_and_single_consumption():
         if result["status"] != "running":
             break
         time.sleep(0.01)
-    assert result == {"status": "done", "result": {"reply": "done"}}
+    assert result["status"] == "done" and result["result"] == {"reply": "done"}
 
 
 def test_only_agent_c_handles_human_conversation(monkeypatch):
@@ -143,12 +151,12 @@ def test_only_agent_c_handles_human_conversation(monkeypatch):
     source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
     assert "_agent_a_readonly_answer" not in source
     assert "_queue_agent_a_clarification" not in source
-    assert "Discuss another action with Agent C" in source
-    assert "Agent B — proposed cleaning action (not approved)" in source
+    assert "No — Discuss Another Idea" in source
+    assert "Agent B suggestion ready" in source
 
 
 def test_agent_c_redundant_confirmation_continues_automatically(monkeypatch, tmp_path):
-    import interactive_chat_jobs
+    from healthcare_data_quality.jobs import interactive_chat_jobs
     manager = InteractiveChatJobs()
     monkeypatch.setattr(interactive_chat_jobs, "interactive_chat_manager", lambda: manager)
     app, st, one, f, render = _one_card(monkeypatch, tmp_path)
@@ -159,7 +167,7 @@ def test_agent_c_redundant_confirmation_continues_automatically(monkeypatch, tmp
             return {"entries": {fid: {"status": "ready",
                 "suggestion": "Replace the affected invalid cells with NA in a reviewed copy.",
                 "decision_needed": "Confirm the exact replacement value and positions."}}}
-    monkeypatch.setattr('cleaning_jobs.recommendation_manager', lambda: SavedB())
+    monkeypatch.setattr('healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager', lambda: SavedB())
 
     st.session_state.cleaning_discussion_mode_by_finding[fid] = "accepted"
     st.session_state.cleaning_messages_by_finding[fid] = [

@@ -2,9 +2,9 @@
 import csv
 from io import StringIO
 
-from healthcare_data_quality.finding_cleaning import expand_uniform_evidence_plan
-from healthcare_data_quality.scoped_r_execution import _r_insertion_function, _generate_r, _as_csv
-from healthcare_data_quality.in_memory_cleaning import assess_verified_in_memory, apply_verified_in_memory
+from healthcare_data_quality.cleaning.finding_cleaning import expand_uniform_evidence_plan
+from healthcare_data_quality.r_runtime.scoped_r_execution import _r_insertion_function, _generate_r, _as_csv
+from healthcare_data_quality.cleaning.in_memory_cleaning import assess_verified_in_memory, apply_verified_in_memory
 
 
 def _inputs(tmp_path, n=618, *, one_different=False):

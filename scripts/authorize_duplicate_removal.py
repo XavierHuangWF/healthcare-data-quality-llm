@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from healthcare_data_quality.decision_memory import fingerprint_dataset
+from healthcare_data_quality.learning.decision_memory import fingerprint_dataset
 from healthcare_data_quality.tools.column_inspection import compare_columns
 
 AUTHORIZATION_PATH = Path(

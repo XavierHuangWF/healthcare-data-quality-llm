@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from healthcare_data_quality.decision_memory import (
+from healthcare_data_quality.learning.decision_memory import (
     record_decision,
     find_latest_decision,
 )

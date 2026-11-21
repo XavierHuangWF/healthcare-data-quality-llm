@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import pytest
 
-from healthcare_data_quality.agent_loop import run_investigation
-from healthcare_data_quality.baseline_audit import run_baseline_audit
+from healthcare_data_quality.agents.agent_loop import run_investigation
+from healthcare_data_quality.investigation.baseline_audit import run_baseline_audit
 from healthcare_data_quality.tools.context import verify_contexts
 
 
@@ -32,9 +32,9 @@ def duplicate_columns(tmp_path: Path, name="sample.csv") -> Path:
 def test_invalid_or_premature_model_selection_cannot_override_worklist(tmp_path, selection):
     path = duplicate_columns(tmp_path)
     baseline = run_baseline_audit(path)
-    with (patch("healthcare_data_quality.agent_loop.query_local_model",
+    with (patch("healthcare_data_quality.agents.agent_loop.query_local_model",
                 return_value=json.dumps(selection)),
-          patch("healthcare_data_quality.agent_loop.summarize_investigation",
+          patch("healthcare_data_quality.agents.agent_loop.summarize_investigation",
                 return_value={"findings": [], "unresolved_questions": [],
                               "recommended_next_step": "Review lineage"})):
         result = run_investigation(
@@ -52,9 +52,9 @@ def test_invalid_or_premature_model_selection_cannot_override_worklist(tmp_path,
 def test_read_only_failed_tool_is_recorded_and_not_called_again(tmp_path):
     path = duplicate_columns(tmp_path)
     baseline = run_baseline_audit(path)
-    with (patch("healthcare_data_quality.agent_loop.query_local_model",
+    with (patch("healthcare_data_quality.agents.agent_loop.query_local_model",
                 return_value=json.dumps({"objective_id": "stop", "reason": "stop"})),
-          patch("healthcare_data_quality.agent_loop.execute_tool",
+          patch("healthcare_data_quality.agents.agent_loop.execute_tool",
                 side_effect=ValueError("injected synthetic failure")) as execution):
         result = run_investigation(
             path, max_steps=1, verified_contexts=verify_contexts(path),
@@ -70,9 +70,9 @@ def test_two_datasets_receive_distinct_read_only_steps(tmp_path):
     a = duplicate_columns(tmp_path, "a.csv")
     b = duplicate_columns(tmp_path, "b.csv")
     baselines = {"dataset_1": run_baseline_audit(a), "dataset_2": run_baseline_audit(b)}
-    with (patch("healthcare_data_quality.agent_loop.query_local_model",
+    with (patch("healthcare_data_quality.agents.agent_loop.query_local_model",
                 return_value=json.dumps({"objective_id": "stop", "reason": "stop"})),
-          patch("healthcare_data_quality.agent_loop.summarize_investigation",
+          patch("healthcare_data_quality.agents.agent_loop.summarize_investigation",
                 return_value={"findings": [], "unresolved_questions": [],
                               "recommended_next_step": "Review lineage"})):
         result = run_investigation(

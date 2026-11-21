@@ -4,6 +4,8 @@
 
 > **Read this section first.** This is a local research prototype, not a clinically validated cleaning system. Subsequent dated sections document earlier engineering states; where they disagree, treat this November 20 overview and the actual source code as authoritative.
 
+> **Reported regression status (2026-11-20):** The maintainer’s WSL run of `python -m pytest -q --tb=short` returned **458 passed**. This is a historical test result, not a new test performed while editing this README, and does not establish end-to-end Streamlit/Gemma integration, scientific validity, HIPAA compliance, or production readiness.
+
 ### Three logical agents, one Gemma inference server
 
 | Role | Responsibility | Execution authority |
@@ -13,6 +15,8 @@
 | **Agent C — Interactive cleaning** | Manage reviewer discussion, resolve explicitly requested edits, prepare source-verified Before → After proposals, and route selected batches through the approval gate. | Cannot approve its own edits; a named reviewer must authorize a verified batch. |
 
 All three roles use the **same locally hosted Gemma/vLLM model**; they are not three copies of the model. The application and server each default to a concurrency cap of three (`HDQ_LLM_MAX_ACTIVE`, `HDQ_MAX_NUM_SEQS`). Background concurrency is not a guarantee that an interactive request will never queue.
+
+**Serving update (2026-11-21):** Gemma 4 12B was benchmarked with vLLM compilation and CUDA Graphs on the RTX 3080 laptop. The three-request test confirmed concurrent execution and showed a promising reduction in batch wall time. See [Gemma 4 12B inference optimization](#gemma-4-12b-inference-optimization) for the tested flags, evidence, caveats, and reproduction commands.
 
 ### Reviewer-facing workflow
 
@@ -150,7 +154,7 @@ PYTHONPATH=src:scripts streamlit run app.py \
 # HDQ_LLM_MAX_ACTIVE defaults to 3
 ```
 
-To make both limits **explicit**, set `export HDQ_MAX_NUM_SEQS=3` in terminal A and `export HDQ_LLM_MAX_ACTIVE=3` in terminal B **before** launching. Environment variables take effect when each service starts; restart both services after changing their settings. The launcher preserves its minimum tested `HDQ_MAX_MODEL_LEN=12288` context requirement. To temporarily reduce concurrency because of GPU/KV-cache limits, explicitly set `1` or `2` on **both** services; the program will never silently reduce your selected concurrency.
+To make both limits **explicit**, set `export HDQ_MAX_NUM_SEQS=3` in terminal A and `export HDQ_LLM_MAX_ACTIVE=3` in terminal B **before** launching. Restart the relevant service after changing its environment. **Keep three concurrent sequences and at least 12,288 tokens of context for this project.** In the reviewed November 21 `scripts/serve_gemma4.sh`, `HDQ_MAX_NUM_SEQS` is validated/displayed but the final vLLM command hardcodes `--max-num-seqs 3`; setting the environment variable to `1` or `2` alone would therefore not alter vLLM concurrency. The client’s `HDQ_LLM_MAX_ACTIVE` is a separate admission limit. If memory is insufficient, diagnose the model/cache/VRAM capacity instead of silently reducing these requirements.
 
 **Check concurrency on the actual machine:**
 
@@ -160,6 +164,64 @@ PYTHONPATH=src:scripts python scripts/test_gemma_three_way_concurrency.py
 ```
 
 That test issues **three simultaneous synthetic requests** and reports observed client-side in-flight requests and available vLLM running metrics. Passing it shows the server handled those sample requests, not that three long 12,288-token jobs will always fit GPU memory. vLLM schedules/batches the same GPU; performance is workload- and KV-cache-dependent. Inspect vLLM logs if requests queue, preempt, time out, or fail from memory pressure. Never reduce context below 12,288 merely to fit more requests.
+
+### Gemma 4 12B inference optimization
+
+**Measured 2026-11-21 on an NVIDIA GeForce RTX 3080 Laptop GPU (16 GiB) using WSL2 and vLLM 0.33.0.** This is a hardware-specific development benchmark, not an established optimum for the intended Alienware **RTX 5080 Laptop GPU (16 GB)**. Rebenchmark on the RTX 5080 rather than transferring the timing or FP8 compatibility conclusions.
+
+The tested Gemma checkpoint was loaded through vLLM's `compressed-tensors` quantization path. The **one local model** serves all three logical agent roles. Preserve the application request cap `HDQ_LLM_MAX_ACTIVE=3`, server concurrency **`--max-num-seqs 3`**, and minimum context **`--max-model-len 12288`**.
+
+**Tested server flags** (the final portion of `scripts/serve_gemma4.sh`):
+
+```bash
+    --max-model-len "$MODEL_LEN" \
+    --gpu-memory-utilization 0.90 \
+    --max-num-seqs 3 \
+    --model-impl vllm \
+    --kv-cache-dtype bfloat16 \
+    --async-scheduling \
+    --language-model-only
+```
+
+**Key change: remove `--enforce-eager`.** This allows vLLM to use its compiler and CUDA Graph capture on compatible operations. The actual startup log confirmed `enforce_eager=False`, `CompilationMode.VLLM_COMPILE`, `CUDAGraphMode.FULL_AND_PIECEWISE`, and completed both full and piecewise graph captures. `--model-impl vllm` selects the implementation; it is not intrinsically a speed boost. BF16 KV cache was selected for RTX 3080 compatibility, not because BF16 is always fastest.
+
+**Why CUDA Graphs can improve Gemma throughput:** Autoregressive decoding runs many similar GPU operations for each new token. Under eager execution, the CPU repeatedly issues kernel launches. `torch.compile`/vLLM compilation can optimize compatible computation and fuse eligible kernels; CUDA Graphs capture compatible GPU work and replay the execution sequence with reduced CPU launch overhead. **FULL** captures larger supported paths, whereas **PIECEWISE** covers capturable regions when a whole path is unsuitable. Capturing execution does **not** cache model answers: token values are still newly computed from each prompt and its KV cache. Asynchronous scheduling can separately reduce scheduling gaps. The tradeoffs are startup compilation/capture time and some extra GPU memory use; gains are workload dependent.
+
+**Three-request synthetic benchmark** (`scripts/test_gemma_three_way_concurrency.py --prompt-words 2000 --max-tokens 512`; all three requests returned HTTP 200 and the sampled vLLM running-request peak reached **3**):
+
+| Configuration | Three-request wall time | Measurement notes |
+| --- | ---: | --- |
+| Eager + async scheduling | 29.79 seconds | One baseline run |
+| Eager, async scheduling disabled | 30.88 seconds | One run |
+| Compiled + CUDA Graphs + async scheduling | 17.74, 11.97, 11.29 seconds | Three consecutive runs; **median 11.97 seconds** |
+
+The **11.97-second median is approximately 2.49× faster**, or about **60% less wall time**, than the single 29.79-second eager baseline. **Do not claim a causal 2.49× speedup from CUDA Graphs alone:** the optimized runs were warmed up, response token counts differed, and we have not collected equivalent repeated warm eager-mode runs. The test prompts contained approximately **2,031 tokens per request**. Successful three-way concurrency at that size does **not** prove that three near-12,288-token contexts will fit or that all application outputs remain correct.
+
+**Reproduce and verify** (the model server should remain running in Terminal A; use a second WSL terminal):
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+
+# Run three simultaneous requests against the existing local vLLM server.
+python3 scripts/test_gemma_three_way_concurrency.py \
+  --prompt-words 2000 --max-tokens 512
+
+# Observe VRAM and hardware while the benchmark runs.
+nvidia-smi
+```
+
+To collect compiler/capture evidence, start the server in Terminal A with its logs saved, then inspect the log from another terminal:
+
+```bash
+bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_server.log
+# In a second terminal (after the server starts):
+grep -Ei 'enforce_eager|CompilationMode|CUDAGraphMode|Capturing CUDA graphs|Graph capturing finished' \
+  ~/gemma_server.log | tail -n 12
+```
+
+For a controlled A/B comparison, benchmark **both** eager and compiled configurations with the same GPU, checkpoint, precision, three-sequence limit, 12,288-token context, representative prompt/output settings, warm-up policy, and multiple repetitions. Inspect response completion status, generated-token counts, VRAM, KV-cache preemptions, timeouts, structured JSON validity, and actual A/B/C source-grounded edit proposals. Do not use synthetic completion time as a substitute for application correctness or long-context reliability.
+
+**Hardware and rollback notes:** On the RTX 3080 (compute capability 8.6), `--kv-cache-dtype fp8` failed during initialization because vLLM's selected Triton attention backend required SM89+ for native FP8; `--kv-cache-dtype bfloat16` started successfully. This does not determine FP8 support on the RTX 5080 or with another backend. There is no need to install an extra system-wide CUDA Toolkit or cuDNN merely to enable graph capture in the already-working vLLM environment. If graph compilation/capture fails or causes memory pressure, temporarily restore `--enforce-eager` as a diagnostic rollback, retaining the required **three concurrent sequences** and context.
 
 **UI behavior:** No new chat page is created. Continue using the existing individual finding cards and **Yes — prepare this action** / **No — discuss another action**. If C is busy, completed idle A/B roles may assist with other findings. Actual background investigation and recommendation tasks take precedence over borrowing those roles. Approval always remains a separate human action; no user data should be modified by the agent's response alone.
 
@@ -1109,7 +1171,7 @@ The API is configured in `src/healthcare_data_quality/llm_client.py`. If your se
 
 ### Start the existing local server
 
-Use your already configured vLLM serving procedure in **terminal A**. `scripts/serve_gemma4.sh` was present in a later reviewed source archive, although its exact model path and GPU settings must be verified against the live checkout. Review that script locally before running it.
+Use your already configured vLLM serving procedure in **terminal A**. `scripts/serve_gemma4.sh` was present in a later reviewed source archive, although its exact model path and GPU settings must be verified against the live checkout. Review that script locally before running it. For the measured November 21 vLLM/CUDA Graphs configuration and its benchmark caveats, see [Gemma 4 12B inference optimization](#gemma-4-12b-inference-optimization).
 
 ### Check endpoint accessibility
 

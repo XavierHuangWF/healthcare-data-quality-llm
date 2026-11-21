@@ -1,11 +1,52 @@
 """The evidence UI shows actual installed detection code on demand."""
 import inspect
+import importlib.util
+import sys
 from pathlib import Path
+from types import ModuleType
 
-from evidence_view import DETECTION_IMPLEMENTATIONS, deterministic_detection_code
-from test_supporting_evidence_alignment import _app, _csv, _render_spy
-from healthcare_data_quality.ingestion import inspect_headers
-from healthcare_data_quality.finding_presentation import header_findings
+
+from healthcare_data_quality.ui.evidence_view import DETECTION_IMPLEMENTATIONS, deterministic_detection_code
+
+# Keep this display test independent of an earlier, since-removed test helper.
+class _Context:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _app(monkeypatch):
+    monkeypatch.setitem(sys.modules, "streamlit", ModuleType("streamlit"))
+    path = Path(__file__).resolve().parents[1] / "app.py"
+    spec = importlib.util.spec_from_file_location("hdq_detection_evidence_app", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _csv(tmp_path):
+    path = tmp_path / "evidence.csv"
+    path.write_text("Taxon,ABC99,ABC99\nT1,2,2\nT2,3,3\n", encoding="utf-8")
+    return path
+
+
+def _render_spy(app, monkeypatch):
+    calls = []
+
+    class UI:
+        def __getattr__(self, name):
+            def call(*args, **kwargs):
+                calls.append((name, args))
+                return _Context() if name in {"expander", "container"} else None
+            return call
+
+    monkeypatch.setattr(app, "st", UI())
+    return calls
+
+from healthcare_data_quality.investigation.ingestion import inspect_headers
+from healthcare_data_quality.ui.finding_presentation import header_findings
 
 
 def test_every_qc_category_has_actual_project_source_not_placeholder():

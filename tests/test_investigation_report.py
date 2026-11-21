@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from healthcare_data_quality.investigation_report import (
+from healthcare_data_quality.investigation.investigation_report import (
     summarize_investigation,
 )
 
@@ -27,7 +27,7 @@ class EvidenceReferenceTests(unittest.TestCase):
         }
 
         with patch(
-            "healthcare_data_quality.investigation_report.query_local_model",
+            "healthcare_data_quality.investigation.investigation_report.query_local_model",
             return_value=json.dumps(report),
         ):
             with self.assertRaisesRegex(

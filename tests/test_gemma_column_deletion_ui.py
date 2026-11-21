@@ -13,7 +13,7 @@ class UI(StubUI):
     def text_input(self, *args, **kwargs):
         return "researcher"
     def form_submit_button(self, label, **kwargs):
-        return self.submitted and label == "Approve deletion of entire column"
+        return self.submitted and label == "Yes — Approve & Execute"
     def dataframe(self, *args, **kwargs):
         pass
 
@@ -35,16 +35,17 @@ def test_deletion_proposal_requires_click_and_stays_export_only(monkeypatch, tmp
                "evidence": [{"CSV row": 2, "Column": 2}]}
     st = UI()
     app = _app(monkeypatch, st)
-    monkeypatch.setattr("healthcare_data_quality.finding_cleaning.build_cleaning_findings",
+    monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.build_cleaning_findings",
                         lambda *args, **kwargs: [finding])
-    monkeypatch.setattr("cleaning_jobs.recommendation_manager", lambda: AgentB())
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: AgentB())
 
     def render():
         app.render_cleaning_workspace(
             [source], [SimpleNamespace(name="sample.csv")], {}, "a1", [])
 
     render()  # initializes session and Agent B; no changes
-    from healthcare_data_quality.finding_cleaning import validate_scoped_plan
+    st.session_state.cleaning_approved_reviewer = "researcher"
+    from healthcare_data_quality.cleaning.finding_cleaning import validate_scoped_plan
     st.session_state.cleaning_plans_by_finding[finding["id"]] = validate_scoped_plan(
         {"operation": "drop_column", "dataset_id": "dataset_1",
          "changes": [{"position": 2, "before": "A", "after": ""}]}, finding, source)
@@ -59,7 +60,7 @@ def test_deletion_proposal_requires_click_and_stays_export_only(monkeypatch, tmp
     assert st.session_state.cleaning_history[0]["operation"] == "drop_column"
     assert st.session_state.cleaning_staged_bytes_by_dataset == {}
     assert source.read_bytes() == original
-    from healthcare_data_quality.in_memory_cleaning import apply_approved_column_deletions, _records
+    from healthcare_data_quality.cleaning.in_memory_cleaning import apply_approved_column_deletions, _records
     final = apply_approved_column_deletions(
         original, original, st.session_state.cleaning_approved_columns_by_dataset["dataset_1"])
     assert _records(final) == [["taxon", "B"], ["r1", "9"], ["r2", "8"]]

@@ -4,11 +4,11 @@ import subprocess
 
 import pytest
 
-from healthcare_data_quality.r_diagnostics import (
+from healthcare_data_quality.r_runtime.r_diagnostics import (
     RSandboxFailure, classify_r_process_failure, diagnose_r_preview_failure,
     safe_r_stderr,
 )
-from healthcare_data_quality.r_sandbox import run_r_sandbox
+from healthcare_data_quality.r_runtime.r_sandbox import run_r_sandbox
 
 R_FN = 'clean_dataset <- function(df) { df }'
 IN = 'kind,csv_row,csv_column,value\ncell,2,3,0.2\n'
@@ -83,7 +83,7 @@ def test_preview_mismatch_is_treated_as_data_contract_failure():
 
 def test_ui_displays_diagnostic_with_retry(monkeypatch, tmp_path):
     from test_two_click_r_flow import setup_review, FINDING
-    import healthcare_data_quality.scoped_r_execution as scoped
+    import healthcare_data_quality.r_runtime.scoped_r_execution as scoped
     app, st, _, render = setup_review(monkeypatch, tmp_path)
     def failing(*args, **kwargs):
         raise RSandboxFailure('R_SANDBOX_PERMISSION',
@@ -100,8 +100,8 @@ def test_ui_displays_diagnostic_with_retry(monkeypatch, tmp_path):
 
 
 def test_selftest_distinguishes_environment_from_plan(monkeypatch):
-    from healthcare_data_quality import r_sandbox
-    from healthcare_data_quality.r_diagnostics import run_r_environment_self_test
+    from healthcare_data_quality.r_runtime import r_sandbox
+    from healthcare_data_quality.r_runtime.r_diagnostics import run_r_environment_self_test
     monkeypatch.setattr(r_sandbox, 'run_r_sandbox', lambda *args, **kwargs:
                         'kind,csv_row,csv_column,value\ncell,2,3,verified\n')
     status = run_r_environment_self_test()
@@ -110,8 +110,8 @@ def test_selftest_distinguishes_environment_from_plan(monkeypatch):
 
 
 def test_selftest_does_not_mask_r_failure(monkeypatch):
-    from healthcare_data_quality import r_sandbox
-    from healthcare_data_quality.r_diagnostics import run_r_environment_self_test
+    from healthcare_data_quality.r_runtime import r_sandbox
+    from healthcare_data_quality.r_runtime.r_diagnostics import run_r_environment_self_test
     def broken(*args, **kwargs):
         raise RSandboxFailure('R_SANDBOX_PERMISSION', 'Sandbox namespace blocked.',
                               'Enable permitted namespaces.')
