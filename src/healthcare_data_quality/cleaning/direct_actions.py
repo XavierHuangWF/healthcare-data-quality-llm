@@ -38,19 +38,70 @@ def _majority_style(rows: list[list[str]]) -> str | None:
     return ("prefixed" if full > unprefixed else "unprefixed" if unprefixed > full else None)
 
 
-def draft_format_correction(finding: dict, source: Path) -> dict | None:
-    """Draft exact original-cell replacements, or decline ambiguous cases.
+def taxonomy_convention_evidence(source: Path) -> dict:
+    """Report dataset conventions, never assert biological taxon validity."""
+    records = _source_rows(source)
+    source_values = [row[0] for row in records[1:]]
+    full = [item for item in source_values if len(item.split(';')) == 7]
+    unprefixed = sum(not any(piece.strip().casefold().startswith(PREFIXES)
+                             for piece in value.split(';')) for value in full)
+    prefixed = sum(all(piece.strip().casefold().startswith(PREFIXES[index])
+                       for index, piece in enumerate(value.split(';'))
+                       if piece.strip().upper() != 'NA')
+                   for value in full)
+    return {
+        'data_rows': len(source_values),
+        'semicolon_rows': sum('|' not in value and ';' in value for value in source_values),
+        'seven_rank_semicolon_rows': len(full),
+        'unprefixed_seven_rank_rows': unprefixed,
+        'prefixed_seven_rank_rows': prefixed,
+        'majority_style': _majority_style(records),
+    }
 
-    The source and finding evidence must agree exactly. Only delimiter fixes or
-    adding missing rank prefixes to a predominantly prefixed dataset qualify.
+
+def _standard_taxonomy_value(before: str, *, dominant: str) -> str | None:
+    """Change only known delimiters/rank prefixes, never scientific names.
+
+    Preserve strain annotations, NA placeholders and the exact token sequence.
+    Refuse an incorrect prefix at any position rather than "correcting" identity.
+    """
+    parts = [part.strip() for part in re.split(r'[;|]', before)]
+    if len(parts) != 7 or any(not item for item in parts):
+        return None
+    names = []
+    for index, part in enumerate(parts):
+        if part.upper() == 'NA':
+            names.append(part)
+        elif part.casefold().startswith(PREFIXES[index]):
+            names.append(part[len(PREFIXES[index]):].strip())
+        elif any(part.casefold().startswith(p) for p in PREFIXES) or re.match(r'^[a-z]{1,3}__', part, re.I):
+            # Unknown/misplaced rank prefixes are ambiguous, not a safe rename.
+            return None
+        else:
+            names.append(part)
+    if dominant == 'unprefixed':
+        return '; '.join(names)
+    if dominant == 'prefixed':
+        return '; '.join(token if token.upper() == 'NA' else PREFIXES[i] + token
+                         for i, token in enumerate(names))
+    return None
+
+
+def draft_format_correction(finding: dict, source: Path) -> dict | None:
+    """Offer the *complete* dataset-convention correction for an evidenced row.
+
+    A separator inconsistency may coexist with a naming inconsistency. Checking
+    only the first defect would leave an unnecessarily malformed taxonomy.
+    Read the whole CSV, preserve the biological tokens, and report both changes.
     """
     key = finding.get('check_key')
     if key not in {'inspect_taxonomy_structure', 'inspect_taxonomy_naming'}:
         return None
     evidence = finding.get('evidence') or []
     rows = _source_rows(source)
-    dominant = _majority_style(rows) if key == 'inspect_taxonomy_naming' else None
-    if key == 'inspect_taxonomy_naming' and dominant is None:
+    observed = taxonomy_convention_evidence(source)
+    dominant = observed['majority_style']
+    if dominant is None:
         return None
     changes = []
     for item in evidence:
@@ -60,39 +111,32 @@ def draft_format_correction(finding: dict, source: Path) -> dict | None:
         if type(row_id) is not int or not 2 <= row_id <= len(rows):
             return None
         before = rows[row_id - 1][0]
-        if key == 'inspect_taxonomy_structure':
-            if item.get('Problem') != 'Uses | instead of ;' or item.get('Original classification') != before:
-                return None
-            if '|' not in before:
-                return None
-            after = before.replace('|', ';')
-        else:
-            if item.get('Original classification') != before:
-                return None
-            # Mixed separators can be normalized in the same exact edit;
-            # the separate delimiter finding independently verifies row 7.
-            parts = [piece.strip() for piece in re.split(r'[;|]', before)]
-            if len(parts) != 7:
-                return None
-            corrected = []
-            for index, part in enumerate(parts):
-                if not part or part.upper() == 'NA':
-                    corrected.append(part)
-                elif part.casefold().startswith(PREFIXES[index]):
-                    corrected.append(part if dominant == 'prefixed' else part[len(PREFIXES[index]):])
-                elif any(part.casefold().startswith(prefix) for prefix in PREFIXES):
-                    # A wrong-rank prefix needs scientific review, not blind normalization.
-                    return None
-                else:
-                    corrected.append(PREFIXES[index] + part if dominant == 'prefixed' else part)
-            after = ';'.join(corrected)
-        if after == before:
-            continue
-        changes.append({'row': row_id, 'column': 1, 'before': before, 'after': after})
+        expected = item.get('Original classification') or item.get('Original classification (verbatim)')
+        if expected != before:
+            return None
+        if key == 'inspect_taxonomy_structure' and (
+                item.get('Problem') != 'Uses | instead of ;' or '|' not in before):
+            return None
+        after = _standard_taxonomy_value(before, dominant=dominant)
+        if after is None:
+            return None
+        # All named taxon ranks, including suffixes, must be byte-identical
+        # after removing only verified presentation punctuation.
+        if not same_taxonomy_identity(before, after):
+            return None
+        if after != before:
+            changes.append({'row': row_id, 'column': 1,
+                            'before': before, 'after': after})
     if not changes:
         return None
     return {
-        'reply': f'{len(changes)} taxonomy format correction(s) ready for review.',
+        'reply': ('Normalize the separators AND rank-prefix naming to match '
+                  'the observed dataset convention. Taxon names and identifiers '
+                  'are preserved; biological identity is not independently verified.'),
+        'reason': (f"{observed['semicolon_rows']}/{observed['data_rows']} rows use semicolons; "
+                   f"{observed['unprefixed_seven_rank_rows']} of the "
+                   f"{observed['seven_rank_semicolon_rows']} seven-rank semicolon rows "
+                   'use unprefixed naming. Do not infer biological truth from frequency.'),
         'operation': 'replace_cells', 'dataset_id': finding['dataset_id'],
         'changes': changes, 'clarification_options': [],
     }
@@ -242,3 +286,42 @@ def propose_explicit_taxonomy_padding(message: str, finding: dict,
         "operation": "replace_cells", "dataset_id": finding["dataset_id"],
         "changes": changes, "clarification_options": [],
     }
+
+
+_COLUMN_DELETE_INTENT = re.compile(
+    r"\b(?:delete|deleted|drop|remove)\s+(?:(?:the|these|entire|whole|csv)\s+)*columns?\s+",
+    re.I,
+)
+
+
+def propose_explicit_column_deletions(message: str, finding: dict, source: Path) -> dict | None:
+    """One verified proposal and ONE named approval for all named source columns.
+
+    A literal reviewer command such as 'delete columns 7 and 11' is not a
+    request to clear cells, and it requires no model clarification. Numbered
+    positions always refer to immutable ORIGINAL CSV columns.
+    """
+    if (not isinstance(message, str) or len(message) > 500
+            or '?' in message or re.search(r"\b(?:don't|do not|never|without|instead of)\b", message, re.I)):
+        return None
+    match = _COLUMN_DELETE_INTENT.search(message)
+    if not match:
+        return None
+    suffix = message[match.end():].strip().rstrip('.! ')
+    if not re.fullmatch(r"(?:\d+\s*(?:,|&|and|\+)\s*)*\d+", suffix, re.I):
+        return None
+    columns = [int(value) for value in re.findall(r"\d+", suffix)]
+    if not 1 <= len(columns) <= 16 or len(set(columns)) != len(columns):
+        raise ValueError("Select 1–16 different columns for deletion")
+    records = _source_rows(source)
+    if any(col < 2 or col > len(records[0]) for col in columns):
+        raise ValueError("Column positions must exist; column 1 is the taxonomy identifier")
+    if len(columns) >= len(records[0]):
+        raise ValueError("Do not delete every source column")
+    plans = [{"operation": "drop_column", "dataset_id": finding["dataset_id"],
+              "changes": [{"position": col, "before": records[0][col-1], "after": ""}]}
+             for col in columns]
+    return {"reply": f"Delete entire original CSV columns {', '.join(map(str, columns))}; review all changes below.",
+            "operation": "none", "dataset_id": "", "changes": [],
+            "operations": plans, "clarification_options": [],
+            "explicit_columns": frozenset(columns)}

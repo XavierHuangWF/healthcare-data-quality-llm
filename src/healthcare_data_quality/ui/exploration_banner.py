@@ -470,6 +470,9 @@ def render_recommendation_banner_html(snapshot: dict | None, *, idle: bool = Fal
     verified exploratory findings are appended to its recommendation queue.
     """
     counts = recommendation_progress_counts(None if idle else snapshot)
+    assisted = sum(1 for entry in ((snapshot or {}).get("entries") or {}).values()
+                   if isinstance(entry, dict) and entry.get("status") == "running"
+                   and entry.get("worker_role") == "agent_c_idle_assist")
     total, ready, running, failed, pending = (counts[k] for k in
                                                ("total", "ready", "running", "failed", "pending"))
     pct = 100 * ready / total if total else 0.0
@@ -482,6 +485,8 @@ def render_recommendation_banner_html(snapshot: dict | None, *, idle: bool = Fal
     elif running or pending:
         headline = "Agent B — preparing suggestions…"
         details = f"{ready} ready · {running} generating · {pending} queued · {failed} failed"
+        if assisted:
+            details += f" · Agent C assisting on {assisted}"
     elif failed:
         headline = "Agent B — finished with errors"
         details = f"{ready} ready · {failed} failed; review individual findings"
@@ -525,23 +530,32 @@ figure img{{width:105px;height:104px;object-fit:cover;object-position:50% 47%;bo
 
 
 def render_agent_c_banner_html(*, ready_findings: int = 0, total_findings: int = 0,
-                                active_conversations: int = 0, idle: bool = False) -> str:
-    """On-demand Agent C status, never a second Agent B progress meter.
+                                active_conversations: int = 0, idle: bool = False,
+                                assisting_findings: int = 0) -> str:
+    """Show interactive priority plus explicit idle-capacity assistance.
 
-    Available Agent B recommendations only unlock Agent C. They are NOT jobs
-    performed by Agent C, so the card must not expose their count as an Agent C
-    completion percentage. Actual in-flight Agent C requests alone set active.
+    Agent C's borrowed inference slot accelerates separate Agent B findings,
+    not reviewer approvals. Never claim those suggestions were user-reviewed.
     """
-    for value in (ready_findings, total_findings, active_conversations):
+    for value in (ready_findings, total_findings, active_conversations, assisting_findings):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError("Agent C counts must be nonnegative integers")
     if ready_findings > total_findings:
         raise ValueError("Ready findings cannot exceed total findings")
     available = not idle and ready_findings > 0
-    # Agent C is strictly on demand. It cannot be active merely because
-    # another background agent produced more recommendations.
-    active = available and active_conversations > 0
-    if not available:
+    # Interactive work takes precedence when the borrowed idle lane is free;
+    # once a model call starts it is non-preemptible.
+    active = (available and active_conversations > 0) or assisting_findings > 0
+    if assisting_findings and active_conversations:
+        # A borrowed in-flight inference can finish while a human chat queues.
+        headline = "Agent C — user interaction prioritized"
+        meter = f"{active_conversations} user request(s) · assisting inference finishing"
+        note = "The current inference cannot be interrupted; your chat runs next"
+    elif assisting_findings:
+        headline = "Agent C — assisting Agent B…"
+        meter = f"{assisting_findings} recommendation(s) in progress"
+        note = "Unused interactive capacity is reviewing another finding"
+    elif not available:
         headline = "Agent C — waiting for Agent B"
         meter = "Idle · No Agent C request running"
         note = "Agent C becomes available after the first recommendation is saved"
@@ -578,7 +592,7 @@ figure img{{width:105px;height:104px;object-fit:cover;object-position:center;bor
 </style></head><body>
 <section class="card{' is-active' if active else ''}" role="status" aria-label="Agent C discussion status">
 <div><div class="title">{escape(headline)}</div>
-<div class="sub">Interactive review · starts only after your selection</div>
+<div class="sub">{escape("Helping Agent B until a user request arrives" if assisting_findings else "Interactive review · starts only after your selection")}</div>
 <div class="meter">{escape(meter)}</div>
 <div class="rule" aria-hidden="true"></div>
 <div class="note">{escape(note)}</div></div><figure aria-hidden="true"><img src="{mascot}" alt=""/></figure>

@@ -87,7 +87,7 @@ def test_new_review_does_not_look_up_or_replay_old_decisions(monkeypatch, tmp_pa
     assert st.session_state.cleaning_discussion_mode_by_finding == {}
 
 
-def test_direct_agent_c_discussion_is_available_before_agent_b(monkeypatch, tmp_path):
+def test_direct_agent_c_discussion_locked_before_agent_b(monkeypatch, tmp_path):
     st = AuditUI()
     app = _app(monkeypatch, st)
     path = _source(tmp_path)
@@ -100,11 +100,11 @@ def test_direct_agent_c_discussion_is_available_before_agent_b(monkeypatch, tmp_
     monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: NoRecommendation())
     st.buttons_on.add(f"review_start_direct_agent_c_{finding['id']}")
     audit = {"cleaning_recommendation_run_id": "new-run"}
-    with pytest.raises(StopIteration, match="streamlit rerun"):
-        app.render_cleaning_workspace([path], [SimpleNamespace(name=path.name)],
-                                      audit, "same-csv-key", [])
-    assert st.session_state.cleaning_discussion_mode_by_finding[finding["id"]] == "alternative"
-    assert st.session_state.cleaning_review_statuses[finding["id"]] == "Alternative requested"
+    app.render_cleaning_workspace([path], [SimpleNamespace(name=path.name)],
+                                  audit, "same-csv-key", [])
+    assert st.session_state.cleaning_discussion_mode_by_finding == {}
+    assert st.session_state.cleaning_review_statuses == {}
+    assert st.expanders == []
     assert st.session_state.cleaning_staged_bytes_by_dataset == {}
 
 

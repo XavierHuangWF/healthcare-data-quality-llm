@@ -53,7 +53,8 @@ def test_exploratory_cache_is_private_and_can_restore_results(tmp_path, monkeypa
 def test_baseline_and_exploration_share_one_data_quality_tab(monkeypatch):
     _app(monkeypatch)
     source = (ROOT / "app.py").read_text(encoding="utf-8")
-    assert '["Data quality findings", "Clean data with Gemma", "Supporting evidence", "Manage skills & memory"]' in source
+    assert "_render_results_navigation(active_page, suggestions_ready)" in source
+    assert 'active_page == "findings"' in source
     assert 'render_finding_evidence(' in source
     assert 'render_cleaning_workspace(paths, uploaded, current, cache_key)' in source
     assert '"Exploratory discoveries", "Supporting evidence"' not in source

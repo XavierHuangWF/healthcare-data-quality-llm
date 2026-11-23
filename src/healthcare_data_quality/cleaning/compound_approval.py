@@ -129,14 +129,16 @@ def evaluate_compound(
     requested_rows: frozenset[int] | None = None,
     requested_columns: frozenset[int] | None = None,
     r_previews: dict[int, dict] | None = None,
+    allow_single: bool = False,
 ) -> dict:
     """Verify all actions; return a fully validated, still-uncommitted snapshot.
 
     `r_previews` is a previously tested R output cache. Even when supplied,
     every R output and plan is reverified against the immutable source.
     """
-    if not isinstance(plans, list) or not 2 <= len(plans) <= 16:
-        raise ValueError("A grouped review requires 2–16 operations")
+    if (not isinstance(plans, list) or
+            not (1 if allow_single else 2) <= len(plans) <= 16):
+        raise ValueError("A review requires 1–16 operations if single approval is enabled, otherwise 2–16")
     validate_compound_targets(plans)
     if not isinstance(reviewer, str) or not reviewer.strip() or len(reviewer) > 120:
         raise ValueError("Reviewer identifier is required")

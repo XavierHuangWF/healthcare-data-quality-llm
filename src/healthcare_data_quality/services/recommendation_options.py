@@ -7,10 +7,12 @@ validator still own the staging of any chosen operation.
 from __future__ import annotations
 
 import csv
+import json
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-OPERATIONS = {'replace_cells', 'drop_rows', 'drop_column', 'rename_headers'}
+OPERATIONS = {'replace_cells', 'drop_rows', 'drop_column', 'rename_headers', 'merge_rows'}
 _ROW_COL = re.compile(
     r'row\s+(\d+)\s*,?\s*column\s+(\d+)\s*:\s*[\'\"]([^\'\"]*)[\'\"]\s*(?:→|->|to)\s*[\'\"]([^\'\"]*)[\'\"]',
     re.IGNORECASE,
@@ -38,12 +40,6 @@ def _verified(operations: list[dict], rows: list[list[str]], finding: dict) -> l
             allowed_rows.update(int(num) for num in re.findall(r'(?<!\d)\d+(?!\d)', group))
         elif isinstance(group, (list, tuple)):
             allowed_rows.update(num for num in group if type(num) is int)
-    for e in evidence:
-        group = e.get('CSV rows') or e.get('csv_rows')
-        if isinstance(group, str):
-            allowed_rows.update(int(num) for num in re.findall(r'(?<!\d)\d+(?!\d)', group))
-        elif isinstance(group, (list, tuple)):
-            allowed_rows.update(num for num in group if type(num) is int)
     allowed_cells = {(e.get('CSV row'), e.get('Column')) for e in evidence}
     # Taxonomy-level evidence has no numeric "Column" field: its editable
     # source value is always C1. Bind it to the verbatim original label before
@@ -56,6 +52,19 @@ def _verified(operations: list[dict], rows: list[list[str]], finding: dict) -> l
             if (type(row) is int and 2 <= row <= len(rows)
                     and isinstance(original, str) and original == rows[row - 1][0]):
                 allowed_cells.add((row, 1))
+    # Duplicate taxa must bind BOTH row identities to the same immutable
+    # source label. Do not reuse an unrelated finding's row coordinates.
+    duplicate_groups: dict[int, str] = {}
+    if finding.get('check_key') == 'find_duplicate_taxa':
+        for e in evidence:
+            label = e.get('Taxon / feature')
+            positions = e.get('CSV rows')
+            if not isinstance(label, str) or not isinstance(positions, str):
+                continue
+            for value in re.findall(r'(?<!\d)\d+(?!\d)', positions):
+                pos = int(value)
+                if 2 <= pos <= len(rows) and rows[pos - 1][0] == label:
+                    duplicate_groups[pos] = label
     allowed_cols = {v for e in evidence for v in (e.get('Column'), e.get('Column A'), e.get('Column B'))}
     if finding.get('check_key') == 'gemma_check':
         allowed_cols.update(i for i, h in enumerate(rows[0], 1) if 'blank' in h.casefold())
@@ -73,7 +82,7 @@ def _verified(operations: list[dict], rows: list[list[str]], finding: dict) -> l
             row = change.get('row')
             col = change.get('column') if kind == 'replace_cells' else change.get('position')
             if type(col) is not int or not 1 <= col <= len(rows[0]):
-                if kind != 'drop_rows':
+                if kind not in {'drop_rows', 'merge_rows'}:
                     return None
             if kind == 'drop_rows':
                 if type(row) is not int or not 2 <= row <= len(rows):
@@ -82,6 +91,31 @@ def _verified(operations: list[dict], rows: list[list[str]], finding: dict) -> l
                     return None
                 coord, before, after = ('row', row), rows[row-1][0], 'Delete row'
                 bound.append({'row': row, 'before': before, 'after': ''})
+            elif kind == 'merge_rows':
+                other = change.get('source_row')
+                if (type(row) is not int or type(other) is not int
+                        or row == other or row not in duplicate_groups
+                        or other not in duplicate_groups
+                        or duplicate_groups[row] != duplicate_groups[other]):
+                    return None
+                # The backend separately validates every numeric input before
+                # allowing a named approval. Check here too so the Yes button
+                # never offers a merger of nonnumeric or nonfinite values.
+                for value in rows[row-1][1:] + rows[other-1][1:]:
+                    if value.strip().upper() in {'', 'NA'}:
+                        continue
+                    try:
+                        if not Decimal(value).is_finite():
+                            return None
+                    except InvalidOperation:
+                        return None
+                coord, before, after = ('merge', row, other), rows[row-1][0], 'sum_numeric'
+                if ('row', row) in seen or ('row', other) in seen:
+                    return None
+                bound.append({'row': row, 'source_row': other,
+                              'before': before, 'after': 'sum_numeric'})
+                seen.add(('row', row))
+                seen.add(('row', other))
             elif kind in {'rename_headers', 'drop_column'}:
                 if col not in allowed_cols:
                     return None
@@ -126,6 +160,10 @@ def _display(operations: list[dict]) -> list[dict]:
                 after = change['after']
             elif kind == 'drop_rows':
                 location, after = f"Row {change['row']}", 'Delete row'
+            elif kind == 'merge_rows':
+                location = f"Rows {change['row']} + {change['source_row']}"
+                after = (f"Keep row {change['row']}, sum numeric counts; "
+                         f"remove row {change['source_row']}")
             else:
                 location = f"Column {change['position']}"
                 after = 'Delete column' if kind == 'drop_column' else change['after']
@@ -197,6 +235,173 @@ def _taxonomy_na_padding(finding: dict, rows: list[list[str]], advice: str) -> l
     return changed
 
 
+def _source_verified_missing_rows(finding: dict, rows: list[list[str]]) -> list[int]:
+    """Derive exact physical CSV rows that contain an empty *count* cell.
+
+    Never guess from the eight-cell Gemma prompt sample, and never treat NA
+    inside a taxonomic label, a valid numeric zero, or a blank header as an
+    empty measurement. Every supplied evidence coordinate must match source;
+    the baseline issue count must agree with the full source scan.
+    """
+    if finding.get('check_key') != 'find_invalid_counts':
+        return []
+    if not re.search(r'\bmissing values\b', str(finding.get('title') or ''), re.I):
+        return []
+    evidence = finding.get('evidence') or []
+    if not isinstance(evidence, list) or not evidence:
+        return []
+    count = finding.get('total_evidence_records', len(evidence))
+    if type(count) is not int or count < len(evidence) or count <= 0:
+        return []
+    source_missing = {(r, c) for r, values in enumerate(rows[1:], 2)
+                      for c in range(2, len(rows[0]) + 1)
+                      if not values[c - 1].strip()}
+    if len(source_missing) != count:
+        return []
+    observed = set()
+    for item in evidence:
+        if not isinstance(item, dict):
+            return []
+        row, col = item.get('CSV row'), item.get('Column')
+        if type(row) is not int or type(col) is not int or (row, col) not in source_missing:
+            return []
+        if 'Original value' in item and str(item['Original value']) != rows[row - 1][col - 1]:
+            return []
+        if (row, col) in observed:
+            return []
+        observed.add((row, col))
+    if len(evidence) == count and observed != source_missing:
+        return []
+    return sorted({r for r, _ in source_missing})
+
+
+def _missing_row_choice(finding: dict, rows: list[list[str]]) -> dict | None:
+    row_ids = _source_verified_missing_rows(finding, rows)
+    if not row_ids or len(row_ids) > 3000 or len(row_ids) >= len(rows) - 1:
+        # Never offer a button that removes every data record; the executor
+        # independently prohibits the same destructive outcome.
+        return None
+    # Bind these exact source-derived row IDs to the current finding. Do not
+    # accept arbitrary model-supplied row IDs by widening the verifier.
+    operations = [{'operation': 'drop_rows', 'dataset_id': finding.get('dataset_id', ''),
+                   'changes': [{'row': r, 'before': rows[r - 1][0], 'after': ''}
+                               for r in row_ids]}]
+    return {
+        'label': f'Delete {len(row_ids)} rows containing empty cells',
+        'operations': operations,
+        'rows': _display(operations),
+        'impact': (f'Deletes all values in {len(row_ids)} entire CSV rows, not just '
+                   'the empty cells. Other measurements in those rows are lost.'),
+        'derived_from_source': True,
+    }
+
+
+def _memory_prefers_row_deletion(suggestion: dict) -> bool:
+    """Memory can rank an option but cannot supply its targets or approve it."""
+    assessment = suggestion.get('memory_assessment') or {}
+    # Gemma's rejection remains advisory, but must not be misrepresented as a
+    # reusable preferred rule. The source-verified option remains available.
+    if isinstance(assessment, dict) and assessment.get('decision') == 'rejected':
+        return False
+    if suggestion.get('approved_row_deletion_method_seen') is True:
+        return True
+    return any(isinstance(method, dict) and
+               'drop_rows' in (method.get('operation_types') or []) and
+               method.get('issue_relation') in {'same', 'related'}
+               for method in (suggestion.get('memory_context') or []))
+
+
+def _header_review_choices(finding: dict, rows: list[list[str]]) -> list[dict]:
+    """Source-grounded preserve/rename choices for the first unnamed column.
+
+    Do not invent a scientific label merely because a header is blank. The
+    rename option is offered only if the column *actually* contains mainly
+    seven-level taxonomy labels. Preserve is a valid human review decision.
+    """
+    if finding.get("check_key") != "inspect_headers":
+        return []
+    evidence = [e for e in (finding.get("evidence") or []) if isinstance(e, dict)]
+    blanks = [e.get("Column") for e in evidence
+              if type(e.get("Column")) is int and 1 <= e["Column"] <= len(rows[0])
+              and not rows[0][e["Column"] - 1].strip()]
+    if len(blanks) != 1:
+        return []
+    column = blanks[0]
+    if column != 1:
+        return [{"label": f"Keep column {column} header blank", "decision": "no_change",
+                 "operations": [], "rows": [{"Location": f"Column {column}",
+                                               "Before": "(blank)", "After": "(blank — unchanged)"}]}]
+    choices = [{"label": "Keep taxonomy header blank", "decision": "no_change",
+                "operations": [], "rows": [{"Location": "Column 1",
+                                              "Before": "(blank)", "After": "(blank — unchanged)"}]}]
+    taxonomy_like = sum(len(re.split(r"[;|]", r[0])) == 7 for r in rows[1:])
+    if taxonomy_like > (len(rows) - 1) / 2:
+        # A defensible descriptive name, not an inferred missing taxon value.
+        rename = _verified([{"operation": "rename_headers", "changes": [
+            {"position": 1, "before": "", "after": "Taxon / feature"}]}], rows, finding)
+        if rename:
+            choices.append({"label": "Name column 'Taxon / feature'", "operations": rename,
+                            "rows": _display(rename)})
+    return choices
+
+
+def _source_backed_merge(finding: dict, rows: list[list[str]],
+                         advice: str) -> dict | None:
+    """Make an explicitly recommended duplicate-row merge actionable.
+
+    This never extrapolates to other duplicate groups. A model's unrelated
+    taxonomy-padding instructions cannot become buttons in this finding.
+    """
+    if finding.get('check_key') != 'find_duplicate_taxa':
+        return None
+    if not (re.search(r'\bmerge\b', advice, re.I)
+            and re.search(r'\bsum\s+(?:numeric\s+)?counts?\b', advice, re.I)):
+        return None
+    match = re.search(r'\b(?:CSV\s*)?rows?\s*(\d+)\s*\+\s*(\d+)', advice, re.I)
+    if not match:
+        return None
+    row, other = map(int, match.groups())
+    if not (2 <= row <= len(rows) and 2 <= other <= len(rows)):
+        return None
+    checked = _verified([{'operation': 'merge_rows', 'changes': [{
+        'row': row, 'source_row': other, 'before': rows[row-1][0],
+        'after': 'sum_numeric',
+    }]}], rows, finding)
+    if not checked:
+        return None
+    return {'label': f'Merge rows {row} + {other} (sum counts)',
+            'operations': checked, 'rows': _display(checked)}
+
+
+def _matching_approved_memory_choice(finding: dict, source: Path,
+                                     rows: list[list[str]], suggestion: dict) -> dict | None:
+    """Promote a truly source-identical remembered edit, not raw memory text.
+
+    An unrelated older decision is context only. The present finding and
+    immutable source must BOTH match; the full existing host validator remains
+    the final authority after the reviewer clicks Yes.
+    """
+    assessment = suggestion.get('memory_assessment') or {}
+    if isinstance(assessment, dict) and assessment.get('decision') in {'rejected', 'not_applicable'}:
+        return None
+    try:
+        from healthcare_data_quality.jobs.cleaning_jobs import ranked_reviewed_solutions
+        matches = ranked_reviewed_solutions(finding, source, limit=4)
+    except (OSError, ValueError, TypeError):
+        return None
+    for match in matches:
+        if not match.get('source_match') or match.get('issue_relation') != 'same':
+            continue
+        record = match.get('record') or {}
+        operations = record.get('operations') or []
+        verified = _verified(operations, rows, finding)
+        if verified:
+            return {'label': 'Reuse source-verified approved method',
+                    'operations': verified, 'rows': _display(verified),
+                    'memory_note': 'Prior approved method on this source and issue; every current target independently reverified.'}
+    return None
+
+
 def source_backed_choices(finding: dict, source: Path | None,
                           suggestion: dict) -> list[dict]:
     """Select 1–3 model-proposed controls only when exact CSV proof is available.
@@ -210,6 +415,52 @@ def source_backed_choices(finding: dict, source: Path | None,
         rows = _rows(source)
     except (OSError, ValueError, UnicodeError, csv.Error):
         return []
+    # A negative-control Gemma check can be valid with NO deletion. Do not
+    # present a default-selected multiselect that silently assumes all control
+    # columns should be removed. Gemma assesses BOTH the preserve choice and
+    # an optional whole-column deletion before any Yes button is rendered.
+    if finding.get('check_key') == 'gemma_check':
+        controls = [i for i, header in enumerate(rows[0], 1)
+                    if i > 1 and 'blank' in header.casefold()]
+        if controls:
+            keep = {'label': 'Keep negative-control columns unchanged',
+                    'decision': 'no_change', 'operations': [],
+                    'rows': [{'Location': f'Columns {", ".join(map(str, controls))}',
+                              'Before': ', '.join(rows[0][i-1] for i in controls),
+                              'After': 'Keep original columns unchanged'}]}
+            all_ops = [{'operation': 'drop_column',
+                        'changes': [{'position': i, 'before': rows[0][i-1], 'after': ''}]}
+                       for i in controls[:12]]
+            deletions = _verified(all_ops, rows, finding)
+            if deletions and len(deletions) < len(rows[0]):
+                return [keep, {'label': 'Delete the displayed negative-control columns',
+                               'operations': deletions, 'rows': _display(deletions),
+                               'impact': ('Optional structural deletion; retained negative controls '
+                                          'can be important for contamination assessment.') }]
+            return [keep]
+    # A taxonomy-separator finding is also a naming-convention finding if the
+    # same row uses minority rank prefixes. Show the *combined* verified repair
+    # first, not an incomplete separator-only answer from the model.
+    if finding.get('check_key') == 'inspect_taxonomy_structure':
+        from healthcare_data_quality.cleaning.direct_actions import (
+            draft_format_correction, taxonomy_convention_evidence)
+        combined = draft_format_correction(finding, source)
+        if combined and combined.get('changes'):
+            checked = _verified([{'operation': 'replace_cells',
+                                  'changes': combined['changes']}], rows, finding)
+            if checked:
+                note = taxonomy_convention_evidence(source)
+                return [{'label': 'Standardize row 7 separators and naming',
+                         'operations': checked, 'rows': _display(checked),
+                         'provenance': 'Entire original CSV checked; ' + str(combined['reason']),
+                         'impact': ('Presentation change only: ranks and any SGB suffix preserved. '
+                                    'Biological identity is not independently certified.') }]
+    header_choices = _header_review_choices(finding, rows)
+    if header_choices:
+        # These are directly grounded in the WHOLE original CSV. A model
+        # should not override a reviewer-valid keep-blank choice with a
+        # speculative header replacement.
+        return header_choices
     output = []
     candidates = suggestion.get('choices') or []
     if not isinstance(candidates, list):
@@ -235,8 +486,68 @@ def source_backed_choices(finding: dict, source: Path | None,
         if grounded:
             output.append({'label': label, 'operations': grounded,
                            'rows': _display(grounded)})
+    missing_rows = _missing_row_choice(finding, rows)
+    if missing_rows:
+        # The recommendation may only list fill approaches despite a suitable
+        # prior deletion method. Add the exact source-derived alternative once.
+        already_present = any(
+            len(option.get('operations') or []) == 1 and
+            option['operations'][0].get('operation') == 'drop_rows' and
+            {c['row'] for c in option['operations'][0]['changes']} ==
+            {c['row'] for c in missing_rows['operations'][0]['changes']}
+            for option in output
+        )
+        if already_present:
+            for option in output:
+                operations = option.get('operations') or []
+                if (len(operations) == 1 and operations[0].get('operation') == 'drop_rows'
+                        and {c['row'] for c in operations[0]['changes']} ==
+                            {c['row'] for c in missing_rows['operations'][0]['changes']}):
+                    option['impact'] = missing_rows['impact']
+        else:
+            if _memory_prefers_row_deletion(suggestion):
+                missing_rows['memory_note'] = (
+                    'Relevant prior approved row-deletion method considered; '
+                    'current row targets independently verified.')
+                output = [missing_rows] + output[:2]
+            else:
+                output = output[:2] + [missing_rows]
+    # Memory must be visible in the OPTIONS, not merely in a prose assessment.
+    # Reserve one slot for the same verified original/source prior decision.
+    remembered = _matching_approved_memory_choice(finding, Path(source), rows, suggestion)
+    if remembered:
+        signature = json.dumps(remembered['operations'], sort_keys=True)
+        if not any(json.dumps(option.get('operations') or [], sort_keys=True) == signature
+                   for option in output):
+            output = [remembered, *output[:2]]
+        else:
+            for option in output:
+                if json.dumps(option.get('operations') or [], sort_keys=True) == signature:
+                    option['memory_note'] = remembered['memory_note']
+    output = output[:3]
     if output:
         return output
+
+    # A same-taxon row merger is supported by the application's validated
+    # row-operation path. Ground the two exact rows from THIS finding instead
+    # of showing unactionable prose plus unrelated Yes buttons.
+    advice = str(suggestion.get('suggestion') or '')
+    merge = _source_backed_merge(finding, rows, advice)
+    if merge:
+        return [merge]
+
+    # Prefer a complete source-exact normal-format correction to another LLM
+    # drafting loop when the finding's evidence agrees with the dominant
+    # observed source format. These are STILL suggestions, not approvals.
+    if finding.get('check_key') in {'inspect_taxonomy_naming', 'inspect_taxonomy_structure'}:
+        from healthcare_data_quality.cleaning.direct_actions import draft_format_correction
+        direct = draft_format_correction(finding, source)
+        if direct and direct.get('changes'):
+            normalized = _verified([{'operation': 'replace_cells',
+                                     'changes': direct['changes']}], rows, finding)
+            if normalized:
+                return [{'label': 'Use dataset-consistent taxonomy format',
+                         'operations': normalized, 'rows': _display(normalized)}]
 
     # Older cached recommendation prose: recover source-exact replacements.
     advice = str(suggestion.get('suggestion') or '')

@@ -1,44 +1,140 @@
 # Healthcare Data Quality LLM
 
-## Current implementation — November 20, 2026
+**Local-first, evidence-grounded, human-governed quality control and remediation for scientific and biomedical tabular data.**
 
-> **Read this section first.** This is a local research prototype, not a clinically validated cleaning system. Subsequent dated sections document earlier engineering states; where they disagree, treat this November 20 overview and the actual source code as authoritative.
+> **Current design and operating contract — 22 November 2026.** This section consolidates the latest review, scheduling, memory, user-interface, and export designs. The later **Historical engineering reference** records earlier CLI and research prototypes; its old UI and approval descriptions are not current requirements. This README revision is based on the supplied README and PyCharm/Streamlit screenshots, **not a source-code audit or a new end-to-end test**. Features should be regarded as implemented only after their corresponding integration tests and live model/UI tests pass. The application remains a research prototype, not a clinically validated system or a HIPAA compliance guarantee.
 
-> **Reported regression status (2026-11-20):** The maintainer’s WSL run of `python -m pytest -q --tb=short` returned **458 passed**. This is a historical test result, not a new test performed while editing this README, and does not establish end-to-end Streamlit/Gemma integration, scientific validity, HIPAA compliance, or production readiness.
+## 1. Architecture: evidence → model deliberation → authorization → verification
 
-### Three logical agents, one Gemma inference server
+The system uses **three asynchronous logical agents sharing one locally hosted Gemma model** through a vLLM-compatible inference endpoint. Deterministic Python services, not model text, control source facts, permissions, modifications, and final acceptance. A single model process does not imply three dedicated GPUs or guaranteed simultaneous completions.
 
-| Role | Responsibility | Execution authority |
+| Agent | Operational responsibility | Authority boundary |
 | --- | --- | --- |
-| **Agent A — Investigation** | Run deterministic QC and local Gemma exploratory checks; assemble source-grounded findings and evidence. | Read-only investigation; cannot authorize cleaning. |
-| **Agent B — Recommendations** | For each relevant finding or check, compare current evidence with previously approved methods and generated advisory skills; propose candidate cleaning actions. | Suggestions only. A queued or cached historical rule is **not** a freshly validated suggestion. |
-| **Agent C — Interactive cleaning** | Manage reviewer discussion, resolve explicitly requested edits, prepare source-verified Before → After proposals, and route selected batches through the approval gate. | Cannot approve its own edits; a named reviewer must authorize a verified batch. |
+| **A — Investigation** | Dataset profiling, deterministic QC, read-only exploratory hypotheses, evidence and coverage tracking | May inspect authorized data; cannot alter it |
+| **B — Recommendation synthesis** | Source-aware retrieval, alternative cleaning strategies, Gemma assessment/critique, actionable Before → After proposals | May recommend; cannot authorize execution |
+| **C — Interactive review** | Respond to reviewer instructions, incorporate dialogue context, formulate/refine competing proposals, resolve ambiguity, and record decisions | Executes only an explicitly selected, validated action; may assist B on a different finding when idle |
 
-All three roles use the **same locally hosted Gemma/vLLM model**; they are not three copies of the model. The application and server each default to a concurrency cap of three (`HDQ_LLM_MAX_ACTIVE`, `HDQ_MAX_NUM_SEQS`). Background concurrency is not a guarantee that an interactive request will never queue.
+**Trust boundary.** Source bytes and fingerprints, immutable original coordinates, evidence registry, reviewed intent, staged changes, exported output, and an append-only decision history are separate artifacts. Model suggestions and retrieved memory are *untrusted advisory inputs*. They cannot override scope, invent source values, silently mutate the original, or confer reviewer authorization. The default CLI investigation remains read-only; the reviewer-controlled Streamlit cleaning path is a distinct mode.
 
-**Serving update (2026-11-21):** Gemma 4 12B was benchmarked with vLLM compilation and CUDA Graphs on the RTX 3080 laptop. The three-request test confirmed concurrent execution and showed a promising reduction in batch wall time. See [Gemma 4 12B inference optimization](#gemma-4-12b-inference-optimization) for the tested flags, evidence, caveats, and reproduction commands.
+### 1.1 Multi-agent scheduling and workload balancing
 
-### Reviewer-facing workflow
+- **Concurrency:** `HDQ_LLM_MAX_ACTIVE=3` governs admitted model requests in the application; `HDQ_MAX_NUM_SEQS=3` is the intended vLLM scheduling limit. These are separate constraints. Use a single model endpoint, with bounded queues, deadlines, cancellation, and per-role telemetry.
+- **Finding-level ownership:** The scheduler should allocate work by `(source_hash, investigation_id, finding_id, revision)`. Agent B and an idle Agent C must **not synthesize the same finding/revision simultaneously**. A claim/lease, idempotency key, and stale-result rejection prevent duplicate cards, duplicate edits, or late writes. Any source or reviewer change invalidates the old revision.
+- **Work conservation:** Agent C gives **interactive reviewer requests preemptive priority**. When no interactive work is pending, its spare lane can assist B with a **different unclaimed finding**; an idle A lane may also assist if investigation work permits. B retains responsibility for proposal ownership and published readiness. Work stealing does not authorize execution or increase the three-request limit.
+- **Incremental results:** Publish each independently verified finding as soon as it is ready, with statuses `queued`, `model-reviewing`, `validating`, `ready`, `needs-retry`, `superseded`, or `resolved`. Failures must show an actionable reason and offer bounded retry; they must not silently disappear or repeatedly regenerate successful results.
+- **Progress visibility:** Show a small running/jogging indicator **before each waiting finding/check label**, plus the role, current phase, completed/total counts, and elapsed time where available. Keep progress polling isolated from editable Streamlit fragments to prevent flashing, focus loss, or scroll jumps. A running animation signals activity, **not verified success**.
 
-1. Upload CSV data. Original uploads are never overwritten. Run or restore a source-compatible investigation. Agent A identifies findings and checks; Agent B prepares recommendations in the background.
-2. For each finding/check, Agent B supplies the current evidence and relevant **previously approved methods** to Gemma for fresh applicability assessment. Saved solutions and generated skills are advisory context, never authorization. The app should count a recommendation as ready only when its current assessment exists.
-3. Where Gemma proposes 1–3 candidate actions, the application verifies every supported target against the **current original CSV** before rendering concise **Location | Before | After** choices. Invalid, ambiguous, or incomplete candidates must not receive an executable choice button. The UI may fall back to a discussion path.
-4. A selected choice advances to Agent C. **No — Discuss Another Idea** opens the Agent C chat and does not send an automatic request. An explicit reviewer instruction (for example, replace an identified cell or delete a named original CSV row) should be grounded directly in source data without demanding external scientific justification.
-5. For any supported, source-verified batch, the reviewer sees one exact Before → After review, enters a reviewer name if needed, and uses **Yes — Approve & Execute** once. This stages *all* approved operations atomically in memory. Conflicting, stale, invalid or unsupported edits remain blocked by deterministic validation; a reviewer preference does not override an integrity failure.
-6. **Download cleaned CSV** exports the currently validated staged changes to a new derived file, even if some findings are still pending. Original source files stay unchanged. Previously completed findings can be reopened for revision subject to conflict-safe rollback.
+### 1.2 Deliberative planning, reflection, and learning
 
-**Data-quality interpretation:** Empty count cells and literal taxonomy `NA` are distinct. Taxonomy level count must match the expected number, with `NA` allowed in any rank. No model may invent missing taxonomic identities or infer full-dataset totals from an evidence sample.
+Recommendation generation follows **retrieval-augmented case-based reasoning** and a **generate → critique → verify → present** pipeline:
 
-### Persistent review memory and learned skills
+1. **Ground:** Fetch original source evidence, complete affected scope, schema conventions, adjacent normal examples, past user decisions, and relevant generated skills. Explicitly distinguish source facts from context or inference.
+2. **Generate:** Ask Gemma for feasible alternatives, including compound row/column operations, replacements, rounding, missing-value handling, unchanged/ignore choices, and non-destructive visual annotations. One finding may legitimately have several valid strategies.
+3. **Reflect / self-critique:** Have Gemma assess consistency with the dataset's dominant pattern, reviewer intent, prior interactions, scientific plausibility, potential side effects, and overlap with other findings. The model should reason about indirect patterns (e.g., a user's earlier `0.2 → 2` and `0.5 → 5` decisions), but **must not infer an executable multiply-by-ten rule without current evidence and approval**.
+4. **Verify deterministically:** Validate typed operations, exact one-based original CSV positions, source `before` values, target coverage, no unapproved mutations, and interaction-specific scope. Reject unsupported, stale, contradictory, or ungrounded plans. Where model review is required, **do not show actionable buttons until both model assessment and deterministic validation complete**.
+5. **Learn from outcomes:** Record reviewer-approved, declined, no-change, superseded, and failed cases with provenance. Feed relevant error patterns and counterexamples back into later prompts and tests. This is **inference-time reflection and memory-based adaptation**, *not* autonomous model weight updates, automatic code repair, or evidence of self-improvement without evaluation.
 
-- `src/healthcare_data_quality/interaction_memory.py` records approved methods for retrieval by related finding/check. Cross-finding similarity influences what Gemma considers, **not** what can be executed.
-- `src/healthcare_data_quality/adaptive_skill_memory.py` records abstract outcomes (approved, declined, or reviewed without change). After at least **two approved edits within a finding family**, a best-effort background Gemma job may produce a versioned advisory method in `skills/generated/` as JSON and Markdown. Generated guidance is never executable Python or authority to edit data.
-- `memory/` and `skills/generated/` are **Git-ignored local state**. Keep these local records and any scientific/customer data outside commits. The source modules implementing memory and skills **should** be committed.
-- A learned rule must be reassessed against new source evidence, independently validated, and explicitly approved. Refused or reversed edits must not become auto-authorization.
+**Memory provenance:** Same-source/same-finding methods may be reused only after current evidence and scope revalidation. Cross-source, cross-finding, or generated `skills/` advice requires fresh Gemma applicability assessment and independent checks. Report *which* earlier decision influenced an option, how it was adapted, and why it remains applicable. Source data, reviewer logs, and local generated memories should remain outside Git.
 
-### Start the local services (WSL Ubuntu)
+## 2. Reviewer journey and human–AI interaction
 
-**Terminal A — Gemma/vLLM server:**
+1. **Intake:** Upload the dataset and collect the named **reviewer identifier before initiating investigation or cleaning**. Bind review state to the exact source fingerprint; never overwrite original uploads.
+2. **Investigate:** Agent A exposes evidence and checks; B/C synthesize independently scheduled, case-aware recommendations. The **Clean data with LM model** page remains visible and primary. **Manage skills & memory**, **Data quality findings**, and **Supporting evidence** are smaller secondary navigation controls on the right.
+3. **Reveal progressively:** A finding's title/count and waiting indicator appear immediately. Lock **only that finding's expandable review/actions** while its verified recommendation is pending; never lock the entire cleaning page. Auto-expand actionable findings as verified options arrive, without destabilizing the active review.
+4. **Present an actionable choice:** Every final action has an explicit verb, source scope, short rationale, and exact **Location | Before | After** (or an expandable complete bulk table). Use green for actionable choices, red for **No — Discuss Another Idea**. Never use ambiguous `Approve & Execute` text without stating the exact operation.
+5. **One-click informed authorization:** The **single click on a green, already source-verified option** is the reviewer's authorization **and** stages/executes the specified action on the derived working copy atomically. **Do not show a second “Yes — Approve & Execute” for the same choice.** A chat message, model recommendation, or scope-clarifying button is not authorization; if the complete Before → After is not yet available, first prepare it and only then expose the executable choice. Require distinct authorization again for any materially changed proposal.
+6. **Discuss without friction:** `No — Discuss Another Idea` opens the current finding's Agent C discussion and **focuses the message box immediately**, without sending a premature model request. Support Enter-to-send where configured. Subsequent options must incorporate the **entire conversation**, not only the latest sentence, and be checked against original data before rendering.
+7. **Complete accurately:** `Keep as is` / `Mark reviewed (no change)` is a valid terminal review decision, including an intentionally blank taxonomy header. `Mark reviewed — resolved by earlier approvals` is valid only after complete lineage reconciliation. Close/collapse **only** that resolved finding, keep its green header in place, and retain a reopenable audit view.
+8. **Release:** Enable the selected downloadable artifact only when its scope, authorization, data, styling, and audit invariants pass independent verification. If a *complete review package* is requested, block release until required review items are terminal and explain every blocker clearly.
+
+**Human-factors contract:** Minimize repetitive text entry. Maintain consistent single-purpose buttons across baseline QC findings and exploratory Gemma checks; prevent duplicate controls and repeated model messages. Keep navigation, focus, scroll position, and card identity stable across independent background updates. For large findings, summarize total affected items and offer the full verification table on demand.
+
+## 3. Cross-finding causality, reconciliation, and transaction semantics
+
+A finding may overlap with previously approved row deletions, column deletions, cell replacements, or annotations. **The original CSV's physical coordinates are the immutable reference frame**; mapping to surviving final coordinates is derived after applying authorized operations. The application must never silently reinterpret shifted row/column numbers as original positions.
+
+- **Scope resolution:** Compute candidate effects against the original source, current approved operation ledger, and the latest reviewer intent. A request such as `delete columns 7 and 11` is **one compound operation** on *both original columns*, not two competing partial choices. Row deletion and merging must likewise use source-verified identities and explicit aggregation semantics.
+- **Conflict analysis:** Detect overlapping or mutually exclusive actions before presentation and before commit. A deleted row/column **supersedes** earlier edits or highlights within it; these remain in history but must not reappear in the final dataset or be counted as surviving changes.
+- **No double application:** A previously executed cleaning method may resolve another finding without any new mutation. Show the earlier action ID and exact original → final evidence. If *all* targets are resolved, expose a **single close/mark-reviewed option**. If *some* survive, re-plan only the live remainder; never claim the entire finding has been fixed.
+- **Correct sequencing:** Later approvals must be checked against the staged state and dependency graph. Reopening/reversing an earlier approval requires conflict-aware rollback/replay or an explicitly blocked explanation with dependent action IDs.
+- **Transaction properties:** For a compound reviewer choice, validate the complete batch first, apply all-or-nothing to a derived copy, and record an idempotent event. A repeated UI click, delayed model response, or retry must not duplicate the operation. A failed validation must leave the staged dataset unchanged.
+
+**Illustrative failure:** If row 7 has already been deleted, Agent C must not claim the row was “standardized” solely because a stale proposal says so. The accurate outcome is “target removed by approved deletion,” with the deletion's audit record, and closure permitted only if the finding has no remaining unresolved scope.
+
+## 4. Verified export and reviewer-oriented provenance
+
+The primary deliverable is a **complete review package (`.zip`)** containing the **original CSV**, **cleaned CSV**, and **review workbook (`.xlsx`)**; deliver standalone CSV/XLSX only when that release mode is selected and validated. The workbook provides four reviewable sheets:
+
+| Sheet | Required evidence for a human reviewer |
+| --- | --- |
+| **Cleaned dataset** | Final surviving values, original order/labels where applicable, and approved red/bold/highlight annotations. **CSV cannot store font colors or fills**. |
+| **Audit trail** | Group by finding/check, not one unexplained flat operation list: reviewer, decision, timestamp, exact original row/column, before/after, operation scope, status, supersession/dependency and final location or deletion. |
+| **Interaction log** | Concise, chronological, attributable reviewer–Agent C dialogue and consequential proposed/approved actions; omit duplicated assistant boilerplate without losing decision context. |
+| **Verification** | Source and final SHA-256; schema and row/column counts; complete approved-operation inventory; **every original → approved → final outcome**, survivor mapping, suppressed annotations, independent comparison results, and any unresolved exceptions. |
+
+**Independent release gate:** Reconstruct the final CSV from the original bytes plus **only** accepted actions and compare it with the delivered CSV/XLSX. Check all surviving cells, header decisions (including intentionally blank), row/column remapping, visual flags on surviving locations, counts, approval scope, and review/interaction ledger completeness. Verify the XLSX is readable and that no unintended edits occurred; fail closed with a specific discrepancy if not. A SHA-256 and a “verified” label alone do **not** prove semantic or clinical correctness.
+
+**Scientific data policy:** In seven-rank taxonomy strings, `NA` counts as a rank and can appear in any position. Missing count cells are distinct from taxonomy `NA`. The model must not fabricate biological identities or generalize a sample into a whole-dataset count. Formatting changes (separators, prefixes) and taxonomic substitutions are different classes of operation, each requiring an explicit, inspectable outcome.
+
+## 5. Implementation map and regression strategy
+
+The following are **module responsibilities inferred from the supplied file tree and design notes**; file presence does not establish that every path is wired into the live application.
+
+| Concern | Relevant source modules / tests |
+| --- | --- |
+| Source-aware planning and review | `services/model_plan_review.py`, `services/recommendation_options.py`, `services/source_patterns.py`; `tests/test_cross_finding_gemma_review_gate_20261122.py` |
+| Reviewer choice semantics and UI | `ui/one_click_choice.py`, `ui/finding_choice_integrity.py`, `ui/clear_review_actions.py`, `ui/review_input_focus.py`, `ui/single_selection_flow.py`; `tests/test_one_click_all_finding_types_and_runners.py` |
+| Reconciliation and authorized changes | `cleaning/previous_approval_resolution.py`, `cleaning/proposal_conflicts.py`, `cleaning/review_reconciliation.py`, `cleaning/compound_approval.py`; `tests/test_prior_approval_resolution_review_20261123.py` |
+| Memory and failure feedback | `learning/model_failure_patterns.py`, `ui/recommendation_memory_trace.py`, `ui/recommendation_failure_recovery.py`; `tests/test_model_review_feedback_and_retry_20261122.py` |
+| Background readiness and scheduling | `jobs/cleaning_jobs.py`, `ui/finding_wait_gate.py`, `ui/running_indicator.py`, `ui/recommendation_wait.py`; `tests/test_agent_c_idle_assists_agent_b_20261123.py`, `tests/test_waiting_jogger_before_title_20261123.py` |
+| Export integrity and audit | `cleaning/final_export_integrity.py`, `cleaning/reviewer_audit_workbook.py`, `cleaning/review_zip_bundle.py`, `cleaning/one_click_visual_flag.py`; `tests/test_full_review_scope_audit_verification_20261122.py` |
+
+Full module paths above are relative to `src/healthcare_data_quality/`. Main Streamlit entry point: `app.py`. **All new imported modules and tests under `Unversioned Files` must be added to version control**, not just the modified files displayed above them.
+
+### 5.1 Acceptance and adversarial regression matrix
+
+A passing unit suite is necessary but insufficient. Exercise the following *across every finding/check category*, with both default recommendations and free-text Agent C requests:
+
+| Scenario | Required invariant |
+| --- | --- |
+| Same-finding B/C concurrency; delayed completions | At most one owner for each finding/revision; stale response discarded; no duplicate cards or operations |
+| Previously approved deletion vs. later formatting/replacement | Correct supersession; survivor-only proposals; accurate mark-reviewed closure |
+| Partial overlap across multiple findings | Only unresolved targets receive new proposals; no unintended extra edits |
+| Multi-target request (`delete 7 and 11`) | Atomic full batch, clear Before → After, one click, no silent narrowing or expanding |
+| Reviewer changes direction during discussion | Latest intent and complete prior context respected; stale buttons invalidated |
+| Keep header blank / no change | Terminal reviewed state; unchanged header preserved; export remains eligible |
+| Negative/fractional/missing counts; taxonomy/separator/prefix combinations | Action matches source conditions; unrelated cells unchanged; scientific assumptions not invented |
+| Visual flag followed by deletion | No orphaned style; audit records supersession; surviving styles in XLSX verified |
+| Gemma timeout, malformed JSON, model review rejection | Specific failure reason, bounded retry, no fabricated fallback approval; other findings unaffected |
+| UI rerender and download | No focus/scroll flash, no duplicate buttons; independent reconstructed output matches artifacts |
+
+Run from the repository root in the project environment:
+
+```bash
+# Confirm the intended source-tree import path and current branch.
+git branch --show-current
+PYTHONPATH=src:scripts python -m compileall -q app.py src/healthcare_data_quality
+
+# Use the complete suite: new tests must be collected, not just selected older tests.
+PYTHONPATH=src:scripts python -m pytest -q --tb=short
+
+# Focused cross-finding, concurrency, review, and export contracts.
+PYTHONPATH=src:scripts python -m pytest -q \
+  tests/test_cross_finding_gemma_review_gate_20261122.py \
+  tests/test_model_review_feedback_and_retry_20261122.py \
+  tests/test_prior_approval_resolution_review_20261123.py \
+  tests/test_agent_c_idle_assists_agent_b_20261123.py \
+  tests/test_full_review_scope_audit_verification_20261122.py \
+  --tb=short
+```
+
+**Do not publish a pass count until it is observed on the *current* code revision.** The maintainer previously reported **478 passing tests** before some of the newest patches; that count must not be presented as evidence for the latest changes. Also perform a live Streamlit/Gemma smoke test and replay a source CSV plus a non-confidential synthetic fixture. Test for import errors, hidden regressions, real output correctness, conflict handling, and UI responsiveness; do not treat LLM self-assessment as independent validation.
+
+## 6. Local development, security, and Git delivery
+
+### 6.1 Start the shared model and Streamlit application (existing WSL configuration)
+
+**Terminal A — model server (leave running):**
 
 ```bash
 cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
@@ -46,7 +142,7 @@ source /home/xavier/.venv/bin/activate
 bash scripts/serve_gemma4.sh
 ```
 
-**Terminal B — Streamlit client:**
+**Terminal B — Streamlit UI (open a separate terminal):**
 
 ```bash
 cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
@@ -56,116 +152,27 @@ PYTHONPATH=src:scripts streamlit run app.py \
   --browser.gatherUsageStats false
 ```
 
-Verify the server with `curl -fsS http://127.0.0.1:8000/v1/models`, then open `http://127.0.0.1:8501`. These paths reflect this developer machine and may differ elsewhere. A reachable API is not proof that local inference succeeds.
+Verify `curl -fsS http://127.0.0.1:8000/v1/models` and open `http://127.0.0.1:8501`. These are the developer's documented WSL paths, **not a universal or newly verified setup**. The Alienware RTX 5080 native-Windows deployment must use its own tested launcher; do not assume a WSL `.sh` vLLM launch works in PowerShell. Rebenchmark model throughput and memory on that device.
 
-### Git checkpoint for the current `backend` branch
+### 6.2 Commit on `backend` in PyCharm, then push
 
-PyCharm's **Commit** window shows *tracked modifications* and *Unversioned Files* separately. Before committing, review **all** unversioned entries: stage the newly introduced `.py` modules, tests, and deliberate package metadata needed by the running app, but **exclude** CSVs, uploaded patient/research data, model weights, caches, local run outputs, `.env` files, and generated decision logs or skills.
+1. Copy this updated document into the project's **root `README.md`**; verify that the Git branch indicator shows **`backend`**. Preserve uncommitted working files.
+2. In PyCharm's **Commit** tool window (`Alt+0`), select reviewed tracked changes **and** the required source/test files under **Unversioned Files**. Inspect every new `src/healthcare_data_quality/**.py` dependency and relevant `tests/test_*.py` file. Include `pytest.ini` if necessary for the tested import path.
+3. **Do not indiscriminately select all unversioned files.** Temporary `tools/apply_*.py` patch installers, `.bak` launchers, scratch ZIPs, local model/data/memory files, and secrets are normally excluded unless they are intentional, reviewed project deliverables. Inspect special cases such as `tools/assets/reviewer_audit_fallback.py` for actual runtime imports before deciding.
+4. Run the full tests above, review selected diffs and test files, and check `git status --short` / `git diff --check` in the terminal. Use a coherent commit message, e.g., `feat: reconcile multi-agent reviews and strengthen audit integrity`.
+5. Click **Commit and Push…**, review the destination (normally `origin/backend`) and outgoing file list, and confirm **Push**. Alternatively, click **Commit** and later use **Git → Push** (`Ctrl+Shift+K`). Never force-push to resolve a rejection; fetch/integrate remote changes after review.
+6. After push, confirm a clean intended working tree and the new commit in **Git → Log**. Only merge `backend` into `main` after successful Streamlit integration tests and source-level conflict review.
 
-From the WSL project root:
+**Public-repository review:** The historical appendix retains a maintainer email address and machine-specific Windows/WSL paths. Check that you intend to publish those details before pushing to a public remote.
 
-```bash
-git branch --show-current              # Expected: backend
-git status --short                       # Review tracked + untracked
-python -m compileall -q app.py cleaning_jobs.py cleaning_review.py \
-  src/healthcare_data_quality
-# Run your applicable focused tests before committing.
-# In PyCharm, select reviewed source files + README.md for staging.
-git diff --cached --check                # Or: git diff --check before staging
-git diff --cached --stat
-git commit -m "feat: integrate adaptive A/B/C cleaning, memory, and reviewer-controlled actions"
-git status --short
-```
-
-If staging only through PyCharm, use its **Commit** panel to check the files you intend to include and review the diff before pressing **Commit**. `git diff --cached` reports only staged changes; PyCharm may handle staging internally depending on its Git configuration. **Do not use `git add .` without first reviewing unversioned content.** Commit to `backend` first. Merge into `main` only after checking compatibility; do not force-push or switch branches with uncommitted changes.
-
-**Known test boundary:** Focused tests for earlier patches were run in the development workspace; complete live Streamlit + Gemma inference and the full tool sandbox have not been verified together. Do not treat the current prototype as clinically validated.
+**Privacy and reproducibility:** Keep healthcare/customer datasets, derived CSV/XLSX/ZIP packages, `memory/`, `skills/generated/`, `models/`, `.venv/`, caches, raw conversations, credentials, and local logs out of commits. Preserve prompt/model version, validation implementation version, source fingerprint, and reviewer decision lineage to support reproducibility. Local inference alone does not satisfy regulatory security requirements.
 
 ---
 
+## Historical benchmark: Gemma 4 12B inference optimization (21 November 2026)
 
-## Evidence-grounded A/B/C reviews and stable approvals (2026-11-19)
+> The measurements below are a **historical RTX 3080/WSL2 experiment** retained for reproducibility. They do not establish throughput or compatibility for the current RTX 5080 deployment, and launcher flags must be checked against the current script.
 
-**Current workflow:** One read-only source of truth supplies verified facts to each logical agent. The model proposes interpretations and structured action candidates; deterministic Python verifies all coordinates, counts, source identity, scope, and final output. The researcher approves **one reviewed proposal per request**. Historical notes farther down this README may describe earlier, investigation-only builds.
-
-### Evidence Registry — shared contract
-
-- `src/healthcare_data_quality/source_inventory.py` scans the **entire original CSV** (header is CSV Row 1) to count truly empty COUNT cells and distinct affected rows. Literal `NA` taxonomy levels are tracked separately and are not treated as empty count cells.
-- `src/healthcare_data_quality/evidence_registry.py` binds each QC finding or attributable Gemma check to `finding_id`, `dataset_id`, original-file SHA-256, verified finding positions, and complete source-wide row/cell counts. The registry is a deterministic read-only projection, not a model response or an edit authorization. Ragged/unreadable datasets remain visible for review; their unsupported counts are not labeled verified.
-- **Agent A** performs investigation and produces candidate evidence. When findings are assembled for review, the registry binds those findings to the original source. **Agent B** receives a bounded, source-verified registry summary with its recommendation prompt; a short evidence sample never becomes a source-wide total. **Agent C** receives the same source-verified facts, along with the selected finding and approved in-memory stage context.
-- Agent C's structured edit plans pass `validate_scoped_plan()` and, for grouped operations, `evaluate_compound()`. These gates verify source identity, exact `before` values, allowed physical positions, reviewer approval, and the final derived CSV. This applies to both QC findings and Gemma checks when a source dataset is selected. Gemma has **no authority** to authorize edits, fabricate additional affected rows, or declare a source-wide count from a sample.
-- The **default edit scope** is the selected finding. A user can explicitly request a wider dataset operation such as *delete all rows containing any empty count cell*; Python independently resolves the complete condition against the original CSV and requires final approval. A request explicitly limited to *this finding* stays within its verified finding positions. Empty cells and `NA` literals are distinct predicates.
-- For a repeated problem on another dataset, historical interaction memory is **a suggested rule, not data evidence**. Current source positions/values must be re-resolved and verified. Saving or loading an earlier investigation is not the same as staging approved changes.
-
-**Example — missing-value count matrix:** If 618 empty count cells occur in CSV Rows `2, 3, 5, 7, 15, 20`, the correct proposal is **Delete 6 rows**, not 618 rows or every row in the CSV. The result should show exact row IDs and the final row count, derived from current data. No example coordinates are portable to another dataset without new source validation.
-
-### Professional approval UI
-
-1. **One concise numbered review** per submitted request (including combined cell edits, column/row deletions, and row merges). Show exact source positions and `before → after`, or a brief summary plus expandable table for bulk edits.
-2. **Approve all** stages an entire validated group atomically; validation failure stages none. **Reject & discuss** clears only the unapproved proposal and leaves the finding open for new Agent C instructions. A suggestion, memory match, or chat message is never final approval.
-3. **Stable expansion and scroll:** The expander label remains constant when the approval status changes; the active finding stays open. Submission and approval use fragment-scoped reruns. The cleaning tab renders directly into its own Streamlit fragment rather than clearing an external tab container during review actions, avoiding a known remount/jump mechanism. Background model status uses its own independent polling fragment, not a timed rerun of the editable form.
-4. Browser-specific scroll preservation is not yet proven by an automated UI/browser test. If your Streamlit version still jumps, record its version and reproduce the exact approval click; do not workaround by periodically reloading the whole page.
-
-### Start and regression tests
-
-Run Gemma and Streamlit in separate WSL terminals, using the commands in the **three-agent concurrency** section below. The UI requires `PYTHONPATH=src:scripts` if the project is not installed as an editable Python package. These guardrails **do not** require running three separate model copies; the existing configured max concurrency remains 3.
-
-```bash
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-source /home/xavier/.venv/bin/activate
-PYTHONPATH=src:. python -m pytest -q \
-  tests/test_cleaning_fragment_scroll.py \
-  tests/test_cleaning_jobs.py \
-  tests/test_finding_scoped_cleaning.py
-```
-
-Additional registry-specific regression tests were run in the development workspace; source-only replacement ZIPs intentionally omit tests. The README's later historical implementation sections remain documentation of earlier work, **not** proof that all of those older descriptions still match the current client.
-
----
-
-## Current local three-agent concurrency (2026-11-18)
-
-**Default: three concurrent model request lanes, one shared locally loaded Gemma model.** Agent C handles the first active interactive cleaning request. When C is occupied and Agent A or B has finished its own background work, the idle agent can prepare a separate finding's cleaning plan. The finding remains under the existing reviewer validation, R-preview, and final approval workflow. If all three lanes are occupied, new requests wait; they never bypass authorization. The three agents are **logical roles/worker threads**, not three loaded model copies or independent GPUs.
-
-The following two independent caps are now **3 by default** (no `export` necessary):
-
-| Layer | Setting | Default | Meaning |
-|---|---|---:|---|
-| Streamlit/backend | `HDQ_LLM_MAX_ACTIVE` | `3` | Maximum in-flight model HTTP requests, with one lane for each A/B/C role |
-| Local Gemma/vLLM launcher | `HDQ_MAX_NUM_SEQS` | `3` | Maximum vLLM sequences that can be scheduled concurrently |
-
-**Launch both components from the project root in separate WSL terminals:**
-
-```bash
-# Terminal A — local Gemma/vLLM server
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-source /home/xavier/.venv/bin/activate
-bash scripts/serve_gemma4.sh  # HDQ_MAX_NUM_SEQS defaults to 3
-```
-
-```bash
-# Terminal B — Streamlit (with the same shared local API)
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-source /home/xavier/.venv/bin/activate
-PYTHONPATH=src:scripts streamlit run app.py \
-  --server.address 127.0.0.1 \
-  --server.port 8501 \
-  --browser.gatherUsageStats false
-# HDQ_LLM_MAX_ACTIVE defaults to 3
-```
-
-To make both limits **explicit**, set `export HDQ_MAX_NUM_SEQS=3` in terminal A and `export HDQ_LLM_MAX_ACTIVE=3` in terminal B **before** launching. Restart the relevant service after changing its environment. **Keep three concurrent sequences and at least 12,288 tokens of context for this project.** In the reviewed November 21 `scripts/serve_gemma4.sh`, `HDQ_MAX_NUM_SEQS` is validated/displayed but the final vLLM command hardcodes `--max-num-seqs 3`; setting the environment variable to `1` or `2` alone would therefore not alter vLLM concurrency. The client’s `HDQ_LLM_MAX_ACTIVE` is a separate admission limit. If memory is insufficient, diagnose the model/cache/VRAM capacity instead of silently reducing these requirements.
-
-**Check concurrency on the actual machine:**
-
-```bash
-# From a third terminal, while local Gemma is running:
-PYTHONPATH=src:scripts python scripts/test_gemma_three_way_concurrency.py
-```
-
-That test issues **three simultaneous synthetic requests** and reports observed client-side in-flight requests and available vLLM running metrics. Passing it shows the server handled those sample requests, not that three long 12,288-token jobs will always fit GPU memory. vLLM schedules/batches the same GPU; performance is workload- and KV-cache-dependent. Inspect vLLM logs if requests queue, preempt, time out, or fail from memory pressure. Never reduce context below 12,288 merely to fit more requests.
-
-### Gemma 4 12B inference optimization
 
 **Measured 2026-11-21 on an NVIDIA GeForce RTX 3080 Laptop GPU (16 GiB) using WSL2 and vLLM 0.33.0.** This is a hardware-specific development benchmark, not an established optimum for the intended Alienware **RTX 5080 Laptop GPU (16 GB)**. Rebenchmark on the RTX 5080 rather than transferring the timing or FP8 compatibility conclusions.
 
@@ -223,361 +230,13 @@ For a controlled A/B comparison, benchmark **both** eager and compiled configura
 
 **Hardware and rollback notes:** On the RTX 3080 (compute capability 8.6), `--kv-cache-dtype fp8` failed during initialization because vLLM's selected Triton attention backend required SM89+ for native FP8; `--kv-cache-dtype bfloat16` started successfully. This does not determine FP8 support on the RTX 5080 or with another backend. There is no need to install an extra system-wide CUDA Toolkit or cuDNN merely to enable graph capture in the already-working vLLM environment. If graph compilation/capture fails or causes memory pressure, temporarily restore `--enforce-eager` as a diagnostic rollback, retaining the required **three concurrent sequences** and context.
 
-**UI behavior:** No new chat page is created. Continue using the existing individual finding cards and **Yes — prepare this action** / **No — discuss another action**. If C is busy, completed idle A/B roles may assist with other findings. Actual background investigation and recommendation tasks take precedence over borrowing those roles. Approval always remains a separate human action; no user data should be modified by the agent's response alone.
-
-**Documentation note:** The sections below retain the detailed November 13 architecture/CLI notes for reference. Some historical statements about unimplemented UI features or branch status may predate the newer November 18 finding-level workflow; the concurrency behavior above describes the code in this patch.
-
 ---
 
+## Historical engineering reference (7–13 November 2026)
 
-> **Historical engineering snapshot (2026-11-13): custom agent harness; investigation-first client POC.** The backend contains a policy-constrained, locally hosted LLM agent harness: baseline QC, a deterministic investigation-objective ledger, registered tools with JSON Schema validation, bounded model selection and tool execution, evidence retention, scoped decision memory, and separate remediation authorization/verification mechanisms. The **default** `scripts/run_workflow.py` mode investigates without R execution or source-data modification; legacy exploratory and explicitly enabled remediation modes have different safety boundaries. The latest reported merge was `5b19e96` into `main`; `backend` and `main` remain independent branch tips. Focused UI presentation tests were reported **10 passed** during integration; this is not equivalent to a full end-to-end or production validation. See [Agent harness: current implementation and boundaries](#agent-harness-current-implementation-and-boundaries) and [End-to-end system design and workflow](#end-to-end-system-design-and-workflow).
+> **Archived engineering design, CLI examples, and roadmap.** These older passages intentionally preserve development provenance. Their descriptions of UI readiness, separate approval buttons, source paths, and agent concurrency can predate the 22 November contract above. **Do not use archived statements as current implementation claims.** The source tree and current tests take precedence.
 
-## Personal developer quick-start — commands I use most
-
-> **Personal developer notes (not secret).** These commands are my fast reference for launching and testing this project in **WSL Ubuntu** from the **single** PyCharm project folder. They are not the end-user setup instructions. **If this README is committed to a public GitHub repository, these notes will be public too; put secrets and truly private configuration in an ignored local file instead.** All model inference is local; the Streamlit page is a **local web UI**, not an Internet-hosted service. See the detailed sections below for prerequisites, permission safeguards, and troubleshooting.
-
-**Project root (WSL):** `/mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm`
-**Existing Python environment:** `/home/xavier/.venv`
-**Local model API:** `http://127.0.0.1:8000` · **Streamlit UI:** `http://127.0.0.1:8501`
-**Git branches:** `backend` = agent/kernel/CLI development; `main` = integrated UI + merged, reviewed backend. They have **separate commit histories**; merged code can exist on `main` while newer local backend changes remain unpushed. **Same folder, switch branches**; do not create another project directory.
-
-
-### Export my current backend source for ChatGPT review
-
-Run from the project root in the PyCharm WSL terminal.
-
-This packages the **current working files**, including uncommitted code changes, without connecting to GitHub.
-
-```bash
-git branch --show-current
-git status --short
-
-ARCHIVE="/mnt/c/Users/Xavier/Downloads/hdq-backend-source-$(date +%Y%m%d-%H%M%S).zip"
-
-git ls-files --cached --others --exclude-standard -- \
-  src scripts tests app.py README.md .gitignore \
-  | sort -u \
-  | zip -q "$ARCHIVE" -@
-
-python -m zipfile -t "$ARCHIVE"
-python -m zipfile -l "$ARCHIVE"
-
-echo "Source archive: $ARCHIVE"
-```
-
-Upload the resulting ZIP from Windows Downloads to ChatGPT.
-
-**Included:** Source code, scripts, tests, application, README, and Git ignore rules.
-
-**Excluded:** Dataset folders, local models, virtual environments, Git history, and ignored files.
-
-**Important:**
-- The `zip` utility must be installed in WSL.
-- Inspect the archive listing before uploading. Files within the included directories could still contain confidential information.
-- This exports the working tree, unlike `git archive HEAD`, which excludes uncommitted changes.
-- Never include confidential datasets, patient records, credentials, API keys, or private logs.
-- Do not commit or push merely to package code for review.
-
-
-### Terminal A — Start Gemma / vLLM first (keep running)
-
-```bash
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-source /home/xavier/.venv/bin/activate
-
-# Use my existing LOCAL model launcher, if present and configured:
-bash scripts/serve_gemma4.sh
-```
-
-> `scripts/serve_gemma4.sh` **is included in the 2026-11-09 source archive**. Confirm its local model path and vLLM configuration against the current WSL environment before starting it; do **not** substitute a hosted API. Keep this terminal running.
-
-**Check the server from another terminal:**
-
-```bash
-curl -fsS http://127.0.0.1:8000/v1/models
-```
-
-The model ID advertised by the server must agree with `src/healthcare_data_quality/llm_client.py` (reviewed configuration: `gemma4-12b`). A response here confirms the endpoint is reachable, not that inference is successful.
-
-### Terminal B — Start the offline CLI/kernel development workflow
-
-```bash
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-source /home/xavier/.venv/bin/activate
-
-git status --short         # Commit or stash changes BEFORE switching branches
-git switch backend        # Backend-only development/testing version
-
-# Make a small, known-good synthetic dataset + provenance.
-PYTHONPATH=src python scripts/create_poc_dataset.py
-
-# Run the CURRENT default read-only, no-R client rehearsal.
-# It prints progress and saves timestamped JSON/Markdown reports in data/reports/.
-PYTHONPATH=src:scripts python scripts/run_workflow.py \
-  --input data/synthetic/poc_duplicate_columns.csv
-
-# Check the newest generated audit/report under data/reports/.
-ls -lt data/reports/ | head
-```
-
-The default workflow uses the shared `src/healthcare_data_quality/` engine and prints progress on **stderr**; its audit JSON and Markdown QC report are written under the ignored `data/reports/` directory. A zero exit code or a saved report does **not** mean that every scientific question has been resolved.
-
-**Run another authorized dataset (default no-R investigation):**
-
-```bash
-PYTHONPATH=src:scripts python scripts/run_workflow.py \
-  --input data/my_nonconfidential_test.csv
-```
-
-**Legacy entry point:** `scripts/run_investigation.py` is still useful for historical exploratory experiments, but it is **not** the recommended default and does not provide the same no-R guarantee. Use only with a deliberate understanding of its execution policy. Never commit patient/research data, derived copies, or private decision-memory logs.
-
-
-### Run a customer's dataset — current and future workflows
-
-The backend is designed to accept unfamiliar scientific CSV datasets without requiring dataset-specific Python modifications.
-
-#### Current default workflow — implemented investigation-only mode
-
-Start the local Gemma/vLLM server in Terminal A. From the project root:
-
-```bash
-source /home/xavier/.venv/bin/activate
-DATASET="/mnt/c/Users/Xavier/Downloads/customer_data.csv"
-
-PYTHONPATH=src:scripts python scripts/run_workflow.py --input "$DATASET"
-```
-
-The default `run_workflow.py` mode:
-- Runs applicable deterministic baseline audits and plans bounded evidence objectives.
-- Uses the local LLM to choose **predefined** read-only objectives; Python determines the tool and validated arguments.
-- Excludes R-executing investigation tools and exits before remediation, authorization, or creation of cleaned datasets.
-- Writes a timestamped audit JSON and Markdown QC/recommendations report to `data/reports/`.
-- Keeps unresolved checks and scientific uncertainties visible; it does **not** certify comprehensive coverage or scientific correctness.
-- Accepts additional CSVs with repeated `--dataset` arguments, although complete cross-dataset reconciliation is not yet established.
-
-To inspect multiple files in one session:
-
-```bash
-PYTHONPATH=src:scripts python scripts/run_workflow.py \
-  --input "/path/to/count_matrix.csv" \
-  --dataset "/path/to/metadata.csv"
-```
-
-**Legacy review workflow:** `scripts/run_investigation.py` and `scripts/review_proposals.py` remain available for experiments. The older investigation entry point is **not** the strict no-R default. Human `Accept / Reject / Defer` review is not execution authorization.
-
-#### Explicit experimental remediation — narrow synthetic proof of concept
-
-Remediation is **not** enabled by `--interactive` alone. The current implementation requires **both** `--enable-remediation` and `--interactive` to enter the legacy review/R-draft/authorization path:
-
-```bash
-# Synthetic, known fixture only; do not use as a general customer-data cleaner.
-PYTHONPATH=src:scripts python scripts/run_workflow.py \
-  --input data/synthetic/poc_e2e_20261107.csv \
-  --interactive --enable-remediation
-```
-
-This gated path combines auditing, proposal review, R drafting, sandbox preview, separate execution authorization, supported deterministic remediation, and verification. An earlier synthetic end-to-end exercise covered one 80-record fixture; **it does not establish** scientific correctness, arbitrary-R safety, or generalized customer-data cleaning. Inspect the current source and dependencies before attempting this optional historical flow.
-
-The unified interactive workflow must:
-
-1. Ingest the customer's dataset and establish its fingerprint.
-2. Automatically execute all applicable baseline data-quality checks.
-3. Run LLM-directed investigations using the existing tool registry.
-4. Track investigation coverage and unresolved evidence gaps.
-5. Attempt further read-only investigation before requesting human input.
-6. Present specific issues, affected records/columns, evidence, uncertainty, and proposed corrections.
-7. Ask the customer for scientific clarification only when needed.
-8. Offer Accept / Reject / Defer for proposals requiring review.
-9. Request separate, explicit authorization before any data-changing operation.
-10. Execute only supported, validated, authorized transformations on a derived copy.
-11. Independently verify the result and preserve the original dataset.
-12. Record decisions, authorizations, executions, and verified outcomes in persistent memory.
-13. Deliver a cleaned dataset, investigation report, and audit trail when applicable.
-
-If an operation is unsupported, evidence is insufficient, or authorization is denied, the system must not execute the change.
-
-The customer should not need to manually run separate Python scripts for review, authorization, cleaning, or verification.
-
-
-### End-to-end synthetic validation — 2026-11-07
-
-The `backend` branch successfully completed one uninterrupted
-interactive CLI workflow using a documented synthetic CSV fixture.
-
-Historical exercise command as originally recorded (2026-11-07):
-
-```bash
-PYTHONPATH=src:scripts python scripts/run_workflow.py \
-  --input data/synthetic/poc_e2e_20261107.csv \
-  --interactive
-```
-
-**Important version change:** The current source requires `--enable-remediation --interactive` to enter this path; the historical command above would now run the default investigation-only path. The fixture must also exist locally. This record describes the historical test, not a guarantee of reproducibility on every revision.
-
-Historically validated stages:
-- Baseline auditing and LLM-directed investigation.
-- Evidence-grounded remediation proposal.
-- Human proposal acceptance.
-- Local Gemma R draft generation.
-- Bubblewrap-isolated R synthetic verification.
-- Separate human execution authorization.
-- Authorized duplicate-column removal on a derived copy.
-- Independent post-remediation verification.
-- Persistent verified-outcome recording.
-
-Observed results:
-- 80 of 80 records preserved.
-- Columns reduced from 4 to 3.
-- Duplicate column 4 removed; column 2 retained.
-- Original dataset unchanged.
-- Technical verification: passed.
-- Verified outcome recorded: true.
-- Semantic verification: not_established.
-
-Architecture:
-- Generated R code was executed only against isolated synthetic data.
-- Actual remediation used the supported deterministic cleaning executor.
-- This test does not establish safe arbitrary R execution.
-
-Limitations:
-- Validated on one synthetic duplicate-column fixture.
-- Does not establish scientific correctness on unfamiliar datasets.
-- General-purpose cleaning operations remain incomplete.
-- Additional failure-path and dataset-diversity testing is required.
-
-Next milestone (revised 2026-11-09):
-Complete the investigation-only CLI experience, bounded tool use, deterministic QC coverage,
-model-grounded recommendations, and client-facing audit reporting **before** extending
-R-code generation, sandbox execution, or the Streamlit integration. Preserve the shared
-backend architecture; do not duplicate the engine.
-
-
-#### Shared backend requirement
-
-The CLI and Streamlit UI should invoke the same workflow controller and backend functions. An actual integration test on `main` is necessary after each merge, especially when `app.py` or presentation modules differ between branches.
-
-- `backend` branch: implement and test the workflow using the terminal.
-- `main` branch: expose the tested workflow through Streamlit.
-
-Do not create separate cleaning, authorization, or memory engines for the two interfaces.
-
-#### Current limitations
-
-- The agent can stop at its configured investigation-step budget.
-- Comprehensive coverage of arbitrary datasets is not established.
-- General-purpose cleaning operations are not yet implemented.
-- Only the currently supported remediation operations may execute.
-- A successful investigation does not imply the dataset has been cleaned.
-
-Next milestone: expand and evaluate the **already implemented default no-R investigation-only path**, including objective coverage, taxonomy policy consistency, dataset diversity, and evidence precision. The experimental R/remediation path remains separately gated; it is not part of the standard client rehearsal.
-
-
-### Terminal B — Start the Streamlit UI instead
-
-```bash
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-source /home/xavier/.venv/bin/activate
-
-git status --short         # Save uncommitted backend changes first
-git switch main           # UI + latest MERGED backend version
-
-PYTHONPATH=src:scripts streamlit run app.py \
-  --server.address 127.0.0.1 \
-  --server.port 8501 \
-  --browser.gatherUsageStats false
-```
-
-**Open in Windows Chrome:** <http://127.0.0.1:8501>. Keep **terminal A (Gemma)** running; use **terminal B (Streamlit)** for the website. The page is local to this PC. Upload a nonconfidential CSV to start the current read-only audit, inspect proposals and evidence, and use the human-review form. **The full CLI execution-authorization/remediation workflow is not yet connected to the UI.** Press `Ctrl+C` to stop Streamlit; stop the model separately in terminal A.
-
-### Most frequent backend tests (no UI required)
-
-```bash
-# From project root, with the WSL virtual environment active:
-PYTHONPATH=src python -m py_compile \
-  src/healthcare_data_quality/agent_loop.py \
-  src/healthcare_data_quality/workflow.py \
-  scripts/run_investigation.py
-
-PYTHONPATH=src python tests/test_decision_memory.py
-PYTHONPATH=src python tests/test_remediation_validator.py
-PYTHONPATH=src python tests/test_apply_duplicate_removal.py
-
-git diff --check
-```
-
-Some tests may need local fixtures or prior setup. Read the test result; **a passing syntax check does not prove functional correctness**.
-
-### Recall the complete human-approved cleaning POC (CLI)
-
-**Do not skip gates or use a real dataset as the first test.** This supported POC concerns the synthetic duplicate-column pair at positions **2 (keep)** and **4 (drop)**. First run the investigation above and confirm it produced a matching **validated `data_change` proposal**; an `investigation` recommendation is not an executable proposal.
-
-```bash
-# 1. Preview: read-only.
-PYTHONPATH=src python scripts/preview_duplicate_removal.py \
-  data/synthetic/poc_duplicate_columns.csv 2 4
-
-# 2. Recommendation review: Accept / Reject / Defer (no data change).
-PYTHONPATH=src python scripts/review_proposals.py \
-  /tmp/hdq_investigation.json \
-  data/synthetic/poc_duplicate_columns.csv
-
-# 3. Separate authorization: paste the ACTUAL accepted Decision ID.
-PYTHONPATH=src python scripts/authorize_duplicate_removal.py \
-  data/synthetic/poc_duplicate_columns.csv \
-  data/derived/poc_cleaned.csv \
-  --keep-position 2 --drop-position 4 \
-  --decision-id YOUR_ACCEPTED_DECISION_ID
-
-# 4. Execute: paste the ACTUAL Authorization ID from step 3.
-PYTHONPATH=src python scripts/apply_duplicate_removal.py \
-  data/synthetic/poc_duplicate_columns.csv \
-  data/derived/poc_cleaned.csv \
-  --authorization-id YOUR_AUTHORIZATION_ID
-
-# 5. Independent post-cleaning verification.
-PYTHONPATH=src python scripts/verify_remediation.py \
-  data/synthetic/poc_duplicate_columns.csv \
-  data/derived/poc_cleaned.csv \
-  data/decision_memory/remediation_runs.jsonl \
-  --operation-id YOUR_OPERATION_ID \
-  --outcome-log data/decision_memory/remediation_outcomes.jsonl
-```
-
-Do not reuse approval IDs, manually fabricate evidence, or overwrite an existing derived output. If `poc_cleaned.csv` already exists, choose a fresh output filename **consistently in both authorization and execution**. See [Complete CLI POC: review, authorize, remediate, verify](#complete-cli-poc-review-authorize-remediate-verify) for full safety and interpretation details.
-
-### Quick Git commands — one folder, two development versions
-
-```bash
-git status --short
-
-# Already on backend: review changes before staging.
-git branch --show-current
-git status --short
-# Stage only reviewed source files and README.md, including required new modules.
-# Avoid blanket staging of unversioned runtime data.
-git diff --cached --check
-git diff --cached --stat
-git commit -m "feat: integrate adaptive A/B/C cleaning, memory, and reviewer-controlled actions"
-# Optional only when ready to publish:
-# git push origin backend
-
-# Update the UI version once backend checks pass:
-git switch main
-git merge backend
-# ... integrate/test Streamlit ...
-git push origin main
-```
-
-Before `git switch`, **commit or stash** unfinished work. `backend` and `main` contain independent Git versions in the **same directory**, not separate copies of the engine. A backend commit is **not** available in `main` until merged. See [Git workflow](#git-workflow-one-folder-two-branches).
-
----
-
-
-**Local-first, evidence-driven, human-governed data-quality investigation and remediation for healthcare and scientific research.**
-
-The project combines deterministic Python checks, a locally hosted LLM, a **policy-controlled agent harness**, evidence-backed reports, persistent human decision records, scoped execution authorization, independently verified narrow-scope remediation, and a Streamlit application. The intention is to help a researcher understand **what is wrong, how it was detected, what remains uncertain, and exactly what would change** before any data modification takes place.
-
-> **Development status — November 13, 2026:** This is an engineering prototype / proof of concept (POC), **not** a validated clinical product or a fully automated general-purpose cleaning service. Read-only investigation and the controlled duplicate-column removal path have been demonstrated. Broader cleaning operations, systematic audit coverage, arbitrary customer-data provenance, R-code generation, and complete end-to-end UI authorization are still under development. See [Current capabilities and limitations](#current-capabilities-and-limitations).
+**Local-first, evidence-driven, human-governed data-quality investigation and remediation for healthcare and scientific research.** Earlier project aims included deterministic QC, an agent harness, evidence-backed reports, R-sandbox prototypes, and source-preserving transformation experiments.
 
 ## Contents
 

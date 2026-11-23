@@ -11,6 +11,9 @@ class CapturingUI(StubUI):
         self.downloads.append((label, data, file_name, mime, kwargs.get("disabled", False)))
     def dataframe(self, *args, **kwargs):
         pass
+    def selectbox(self, _label, options, **kwargs):
+        # Verify the existing CSV-only contract when the reviewer selects CSV.
+        return next(item for item in options if str(item).startswith("CSV"))
 
 
 def _render(monkeypatch, tmp_path):
@@ -32,6 +35,7 @@ def test_final_download_not_present_until_all_findings_and_checks_reviewed(monke
     st, file, render = _render(monkeypatch, tmp_path)
     # A no-change review is sufficient to verify the export gate; forging an
     # approved edit without an approval ledger would correctly be rejected.
+    st.session_state.cleaning_approved_reviewer = 'Reviewer X'
     st.session_state.cleaning_review_statuses[_catalog()[0]['id']] = 'Reviewed — no change'
     render()
     assert len(st.downloads) >= 1 and all(item[4] and item[1] == b"" for item in st.downloads)

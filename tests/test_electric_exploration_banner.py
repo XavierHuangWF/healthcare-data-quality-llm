@@ -60,7 +60,8 @@ def test_asset_bundled_and_inline_no_external_network():
 def test_banner_replaces_old_status_not_findings_or_cleaning_tabs():
     app = (ROOT / "app.py").read_text()
     assert "investigation_html = render_exploration_banner_html(live)" in app
-    assert "[\"Data quality findings\", \"Clean data with Gemma\", \"Supporting evidence\", \"Manage skills & memory\"]" in app
+    assert "Clean data with LM model" in app
+    assert "_render_results_navigation(active_page, suggestions_ready)" in app
     assert "Gemma is still exploring; no verified exploratory check is available yet." not in app
 
 

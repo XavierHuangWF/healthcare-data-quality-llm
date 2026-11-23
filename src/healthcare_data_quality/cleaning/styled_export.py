@@ -142,6 +142,11 @@ def build_styled_excel_download(
     for row_num, csv_row in enumerate(final_rows, 1):
         for col_num, text in enumerate(csv_row, 1):
             cell = sheet.cell(row_num, col_num, _excel_cell_value(text, col_num))
+            # Data originated in a CSV and is never executable content.
+            # openpyxl interprets a leading '=' string as an Excel formula by
+            # default; force the literal original value instead of running it.
+            if isinstance(text, str) and text.startswith("="):
+                cell.data_type = "s"
             if row_num == 1:
                 cell.font = Font(bold=True)
                 cell.fill = PatternFill(fill_type="solid", fgColor="E8EDF4")

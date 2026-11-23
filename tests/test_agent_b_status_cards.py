@@ -81,7 +81,7 @@ def test_two_background_cards_are_mounted_and_agent_c_is_inline():
     assert 'render_agent_b_banner_html(' not in idle
     assert 'key="hdq_close_investigation"' in live
     assert 'key="hdq_close_recommendations"' in live
-    assert 'Agent C — Interactive cleaning' in app
+    assert 'Clean data with LM model' in app
     assert 'ready_ids = {' in app
     assert '.st-key-hdq_recommendation_status_card' in sticky_banner_css()
     assert 'Agent B — waiting for QC findings' in render_recommendation_banner_html(None, idle=True)

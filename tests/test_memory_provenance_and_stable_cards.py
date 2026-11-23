@@ -103,4 +103,5 @@ def test_agent_b_background_completion_does_not_force_full_page_rerun():
     app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
     portion = app_source.split("def _render_live_agent_b_finding(", 1)[1].split("def _is_blank_control_check(", 1)[0]
     assert "st.rerun()" not in portion.replace("# Do NOT st.rerun()", "")
-    assert "_expand_ready_finding_without_rerun(fid)" in portion
+    assert "_expand_ready_finding_without_rerun(fid)" not in portion
+    assert 'st.fragment(run_every="3s")(_refresh_parent_for_new_agent_b_choices)' in app_source

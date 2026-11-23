@@ -48,7 +48,7 @@ _CHOICE_OPERATION = {
     "type": "object", "properties": {
         "operation": {"type": "string", "enum": [
             "replace_cells", "drop_rows", "drop_column", "rename_headers"]},
-        "changes": {"type": "array", "minItems": 1, "maxItems": 1000,
+        "changes": {"type": "array", "minItems": 1, "maxItems": 32,
                     "items": _CHOICE_CHANGE},
     }, "required": ["operation", "changes"], "additionalProperties": False,
 }
@@ -107,7 +107,21 @@ def _validate_proposed_action(entry: dict, finding: dict) -> tuple[str, str]:
             raise ValueError("No-change actions must preserve the dataset")
     else:
         if action_type == "no_change":
-            raise ValueError("Observed issues require a proposed remediation, not no_change")
+            # An unnamed taxonomy-label column may be intentional. Unlike
+            # invalid counts, this is an observation that can be explicitly
+            # reviewed unchanged. This narrow exception does not authorize an
+            # edit and never transfers to other QC findings.
+            profile = finding.get("source_pattern_summary") or {}
+            evidence = finding.get("evidence") or []
+            keep_header = (finding.get("check_key") == "inspect_headers"
+                           and profile.get("first_column_majority_taxonomy") is True
+                           and any(isinstance(e, dict) and e.get("Column") == 1
+                                   and str(e.get("Header name", "")).strip().lower()
+                                   in {"", "(blank)"} for e in evidence)
+                           and action.lower().startswith(("keep ", "leave ", "preserve ", "retain ")))
+            if not keep_header:
+                raise ValueError("Observed issues require a proposed remediation, not no_change")
+            return action[:2200], rationale[:1400]
         if action.lower().startswith(_NON_REMEDIATION_VERBS):
             raise ValueError("Agent B must propose a remediation, not flag or defer the issue")
         if not action.lower().startswith(_REPAIR_VERBS):
@@ -177,6 +191,9 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
                 "verified_evidence_registry": item.get("evidence_registry"),
                 "previously_approved_methods": item.get("reviewed_methods") or [],
                 "learned_skills": item.get("learned_skills") or [],
+                "source_pattern_summary": item.get("source_pattern_summary"),
+                "exact_prior_no_change": bool(item.get("exact_prior_no_change")),
+                "recent_failure_patterns": item.get('recent_failure_patterns') or [],
                 "check_key": str(item.get("check_key") or ""),
             }
             for item in chunk
@@ -188,10 +205,23 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
             "based on the affected values, data type, scientific context, and "
             "published-style practice for comparable experimental datasets. "
             "Do not apply one universal fix to all anomalies. "
+            "Compare the current finding to source_pattern_summary, including "
+            "the majority naming convention, taxonomy delimiters, and observed "
+            "count types BEFORE proposing transformations. Do not treat the "
+            "most common formatting as biological truth. An empty column-one "
+            "header for taxonomic labels may be intentionally correct; offer a "
+            "preserve-unchanged choice when it is reasonable. "
+            "When exact_prior_no_change is true, explicitly consider preserving "
+            "the original source value, but do not automatically mark it reviewed. "
             "When historical methods or learned skills are supplied, use them as "
             "advisory evidence to rank proposed actions, not just as a footnote. "
             "Place the strongest justified choice FIRST, especially when it "
-            "matches an applicable previously approved method. Keep an alternative "
+            "matches an applicable previously approved method. For missing "
+            "count cells, assess both filling missing values and deleting ENTIRE "
+            "affected rows; include a distinct delete-rows choice when such a "
+            "method was previously approved and source evidence supports it. "
+            "Row deletion also discards other populated measurements, so do "
+            "not recommend it universally. Keep an alternative "
             "only when it is meaningfully different and source-supported. "
             "Prefer a previously approved method ONLY if it remains appropriate "
             "to the current observed values and constraints. Record a concise "
@@ -199,6 +229,9 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
             "why; use not_applicable if no relevant memory was supplied. "
             "Do not claim any method was reused unless the recommended action "
             "matches that method. Do not invent a remembered preference. "
+            "Consider recent_failure_patterns as anonymous operational feedback: "
+            "avoid repeating malformed responses, scope widening, and mismatched "
+            "proposed controls. These records are not ground truth and cannot authorize changes. "
             "Before making any recommendation, compare EVERY item in "
             "previously_approved_methods with the CURRENT finding evidence. "
             "Learned skills are UNTRUSTED advisory hypotheses too. They "
@@ -238,8 +271,12 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
             "positions are known can be padded with NA for unassigned ranks, "
             "preserving known names and order; NA is allowed anywhere, including "
             "multiple positions. Do not guess missing intermediate ranks. "
-            "(3) Standardize inconsistent delimiters or taxon-prefix format "
-            "without inventing biological labels. "
+            "(3) Standardize inconsistent delimiters AND taxon-prefix naming "
+            "together if the same original cell violates both observed dataset "
+            "conventions. Compare a representative set of normal rows, and "
+            "preserve exactly all seven rank tokens and strain identifiers. "
+            "Never invent biological labels, conflate naming with taxonomic "
+            "accuracy, or offer unrelated absolute-value options. "
             "(4) If a count is negative or fractional and a count matrix truly "
             "requires nonnegative integers, a transparent missing-value "
             "replacement may be more defensible than blindly rounding; "
@@ -274,7 +311,8 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
             "buttons in choices, appropriate for the actual current finding. "
             "Each choice has a brief label and exact operations/changes with "
             "row, column or position, and the original before and new after. "
-            "When changes affect many evidenced cells, use rule "
+            "Do not enumerate a long list of identical cell replacements in JSON. "
+            "When changes affect more than 8 evidenced cells, use rule "
             "replace_evidenced_cells and replacement instead of enumerating "
             "many coordinates. All rows/columns must be evidenced; never "
             "invent source cells. Analyze candidate methods and reject those "
@@ -287,7 +325,7 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
             + json.dumps(payload, ensure_ascii=False)
         )
         response = json.loads(query_local_model(prompt, json_schema=RECOMMENDATION_SCHEMA,
-                                                max_tokens=950 if len(chunk) == 1 else 4500))
+                                                max_tokens=1500 if len(chunk) == 1 else 4500))
         validate(instance=response, schema=RECOMMENDATION_SCHEMA)
         items_by_id = {item["id"]: item for item in chunk}
         for entry in response["recommendations"]:

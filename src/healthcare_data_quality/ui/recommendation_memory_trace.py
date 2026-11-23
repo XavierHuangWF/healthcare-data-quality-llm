@@ -16,6 +16,11 @@ def memory_trace(suggestion: dict) -> dict[str, object]:
                 "details": ["Start a new investigation to record exactly which saved methods and skills Gemma consulted."]}
     methods = max(0, int(suggestion.get("method_candidates_considered") or 0))
     skills = max(0, int(suggestion.get("skill_candidates_considered") or 0))
+    # A prior decision to KEEP source values unchanged is a useful preference
+    # for the exact same dataset/finding. It is not an approval of a new edit.
+    if suggestion.get("exact_prior_no_change") is True:
+        return {"summary": "Memory: this exact finding was previously kept unchanged",
+                "details": ["Previous reviewer choice was consulted; you still decide whether to keep or change it."]}
     if not methods and not skills:
         return {"summary": "Memory: no relevant approved methods or learned skills used",
                 "details": []}

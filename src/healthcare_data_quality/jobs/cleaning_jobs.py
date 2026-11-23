@@ -3,9 +3,12 @@
 The worker NEVER calls Streamlit, executes cleaning, reads entire datasets,
 changes user decisions, or runs generated Python. Each recommendation is saved
 atomically to a private local directory and can survive Streamlit reruns.
-Only one background model request is issued at a time.
+One primary recommendation worker runs continuously. When Agent C is idle,
+an optional second worker borrows its request lane for independent findings.
+All claims are atomic; a finding is never processed by both workers.
 """
 
+import csv
 import hashlib
 import json
 import os
@@ -15,9 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from healthcare_data_quality.ui.cleaning_review import recommend_single_finding
-from healthcare_data_quality.services.llm_client import model_request_priority
+from healthcare_data_quality.services.llm_client import (
+    model_request_priority, _max_active_requests, interactive_model_request_pending,
+)
 
-_JOB_SCHEMA = 3
+_JOB_SCHEMA = 4
 _DEFAULT_CACHE_DIR = (Path.home() / ".local" / "share" /
                       "healthcare-data-quality-llm" / "cleaning-recommendations")
 
@@ -286,7 +291,11 @@ def _prompt_finding(item: dict, runtime: dict | None = None) -> dict:
             "reviewed_methods": list((runtime or {}).get("reviewed_methods") or []),
             "learned_skills": list((runtime or {}).get("learned_skills") or []),
             "total_evidence_records": item.get("affected_record_count", 0),
-            "evidence_is_a_sample": True}
+            "evidence_is_a_sample": True,
+            "source_pattern_summary": (runtime or {}).get("source_pattern_summary"),
+            "exact_prior_no_change": bool((runtime or {}).get("exact_prior_no_change")),
+            "recent_failure_patterns": list((runtime or {}).get('recent_failure_patterns') or []),
+            }
 
 
 def job_fingerprint(context_key: str, catalog: list[dict], versions: dict | None = None, *,
@@ -321,13 +330,29 @@ def _learned_skills_for_finding(finding: dict) -> list[dict]:
 
 
 class CleaningRecommendationJobs:
-    def __init__(self, directory: Path | None = None, *, recommender=None):
+    def __init__(self, directory: Path | None = None, *, recommender=None,
+                 choice_assessor=None, assist_enabled: bool | None = None):
         self.directory = Path(directory) if directory is not None else _DEFAULT_CACHE_DIR
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._workers: dict[str, threading.Thread] = {}
+        self._assist_workers: dict[str, threading.Thread] = {}
+        # Production default: use otherwise idle Agent C inference capacity.
+        # Injected fake recommenders retain historical sequential test behavior
+        # unless the test explicitly opts into assistance.
+        self._assist_enabled = (recommender is None if assist_enabled is None
+                                else bool(assist_enabled))
         self._runtime_context: dict[str, dict[str, dict]] = {}
         self._recommender = recommender or recommend_single_finding
+        # Injected fake recommendation workers in tests are not allowed to
+        # contact a real GPU endpoint. Production always assesses options.
+        if choice_assessor is not None:
+            self._choice_assessor = choice_assessor
+        elif recommender is None:
+            from healthcare_data_quality.services.model_plan_review import assess_review_option
+            self._choice_assessor = assess_review_option
+        else:
+            self._choice_assessor = None
 
     def _path(self, key: str) -> Path:
         if len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
@@ -356,6 +381,32 @@ class CleaningRecommendationJobs:
         finally:
             partial.unlink(missing_ok=True)
 
+    def _can_assist(self) -> bool:
+        return (self._assist_enabled and
+                os.environ.get("HDQ_AGENT_C_ASSIST_B", "1").lower()
+                not in {"0", "false", "off", "no"} and
+                _max_active_requests() == 3)
+
+    def _maybe_launch_assist(self, key: str, state: dict) -> None:
+        """Borrow C's lane only when extra distinct findings are waiting.
+
+        This is called under self._lock. The worker itself re-checks chat
+        activity before each claim. Neither worker can duplicate a claim.
+        """
+        if not self._can_assist() or interactive_model_request_pending():
+            return
+        if self._assist_workers.get(key) and self._assist_workers[key].is_alive():
+            return
+        pending = sum(e.get("status") == "pending" for e in state["entries"].values())
+        running = sum(e.get("status") == "running" for e in state["entries"].values())
+        if pending < 2 and not (pending and running):
+            return
+        helper = threading.Thread(
+            target=self._run, args=(key,), kwargs={"assist": True},
+            name="hdq-agent-c-idle-assist-" + key[:8], daemon=True)
+        self._assist_workers[key] = helper
+        helper.start()
+
     def start(self, context_key: str, catalog: list[dict], *, versions: dict | None = None,
               retry_failed: bool = False, run_id: str | None = None,
               review_memory: dict[str, dict] | None = None,
@@ -381,6 +432,11 @@ class CleaningRecommendationJobs:
             for item in catalog:
                 context[str(item["id"])] = {
                     "evidence": list(item.get("evidence") or [])[:8],
+                    # Full evidence is held only in this process so memory
+                    # identity can match all original affected cells. The
+                    # persistent job manifest remains _minimal_finding() and
+                    # never serializes these potentially sensitive values.
+                    "finding_for_memory": deepcopy(item),
                     "evidence_registry": item.get("evidence_registry"),
                     "reviewed_methods": list((reviewed_methods or {}).get(str(item["id"])) or []),
                     "learned_skills": _learned_skills_for_finding(item),
@@ -429,7 +485,9 @@ class CleaningRecommendationJobs:
                 # For the once-only Agent B workflow, an interrupted request
                 # cannot be safely replayed without possibly generating twice.
                 # Older non-run-specific queues retain their resumable behavior.
-                running = bool(self._workers.get(key) and self._workers[key].is_alive())
+                running = bool(
+                    (self._workers.get(key) and self._workers[key].is_alive()) or
+                    (self._assist_workers.get(key) and self._assist_workers[key].is_alive()))
                 if not running:
                     for entry in state["entries"].values():
                         if entry["status"] == "running":
@@ -438,10 +496,11 @@ class CleaningRecommendationJobs:
                                 entry["error"] = "Interrupted; once-only Agent B request will not rerun"
                             else:
                                 entry["status"] = "pending"
-            if retry_failed and run_id is None:
+            if retry_failed:
                 for entry in state["entries"].values():
-                    if entry["status"] == "failed":
+                    if entry["status"] == "failed" and int(entry.get("manual_retries", 0)) < 1:
                         entry["status"] = "pending"
+                        entry["manual_retries"] = int(entry.get("manual_retries", 0)) + 1
                         entry.pop("error", None)
             self._save(state)
             if any(entry["status"] == "pending" for entry in state["entries"].values()):
@@ -450,6 +509,7 @@ class CleaningRecommendationJobs:
                                               name="hdq-recommendations-" + key[:8], daemon=True)
                     self._workers[key] = worker
                     worker.start()
+                self._maybe_launch_assist(key, state)
         return key
 
     def snapshot(self, key: str) -> dict | None:
@@ -457,17 +517,30 @@ class CleaningRecommendationJobs:
             result = self._load(key)
             return deepcopy(result) if result else None
 
-    def _run(self, key: str) -> None:
+    def _run(self, key: str, *, assist: bool = False) -> None:
         try:
-            self._run_queue(key)
+            self._run_queue(key, assist=assist)
         finally:
             # If an exploration appended a new item exactly as the last worker
             # exited, guarantee the pending item eventually runs.
             with self._lock:
-                if self._workers.get(key) is threading.current_thread():
+                if assist:
+                    if self._assist_workers.get(key) is threading.current_thread():
+                        self._assist_workers.pop(key, None)
+                    current = self._load(key)
+                    primary_active = (self._workers.get(key) and
+                                      self._workers[key].is_alive())
+                    if (not primary_active and current and
+                            not any(e["status"] in {"pending", "running"}
+                                    for e in current["entries"].values())):
+                        self._runtime_context.pop(key, None)
+                elif self._workers.get(key) is threading.current_thread():
                     self._workers.pop(key, None)
                     state = self._load(key)
-                    if not state or not any(e["status"] == "pending" for e in state["entries"].values()):
+                    if (not state or (not any(e["status"] in {"pending", "running"}
+                                           for e in state["entries"].values())
+                                      and not (self._assist_workers.get(key) and
+                                               self._assist_workers[key].is_alive()))):
                         self._runtime_context.pop(key, None)
                     if (state and not state.get("cancel_requested") and
                             any(e["status"] == "pending" for e in state["entries"].values())):
@@ -476,8 +549,12 @@ class CleaningRecommendationJobs:
                         self._workers[key] = worker
                         worker.start()
 
-    def _run_queue(self, key: str) -> None:
+    def _run_queue(self, key: str, *, assist: bool = False) -> None:
         while True:
+            # Never begin another borrowed-lane request while a human chat is
+            # queued/active. Already running inference cannot be preempted.
+            if assist and interactive_model_request_pending():
+                return
             with self._lock:
                 state = self._load(key)
                 if not state or state.get("cancel_requested"):
@@ -487,12 +564,17 @@ class CleaningRecommendationJobs:
                 if next_item is None:
                     return
                 fid = next_item["id"]
-                state["entries"][fid] = {"status": "running", "updated_at": _now()}
+                prior_retry_count = int(state["entries"][fid].get("manual_retries", 0))
+                state["entries"][fid] = {
+                    "status": "running", "updated_at": _now(),
+                    "manual_retries": prior_retry_count,
+                    "worker_role": "agent_c_idle_assist" if assist else "agent_b",
+                }
                 self._save(state)
             try:
                 # The background prompt is short. An interactive request already
                 # waiting gets priority before the NEXT background inference.
-                with model_request_priority("recommendation"):
+                with model_request_priority("idle_assist" if assist else "recommendation"):
                     with self._lock:
                         runtime = self._runtime_context.get(key, {}).get(fid)
                     # Re-read approved methods and skills immediately before
@@ -501,34 +583,113 @@ class CleaningRecommendationJobs:
                     # suggestions already delivered to the user.
                     current = dict(runtime or {})
                     source_path = current.get("source_path")
+                    full_finding = current.get("finding_for_memory") or next_item
                     if source_path is not None:
                         try:
                             current["reviewed_methods"] = reviewed_method_context(
-                                next_item, Path(source_path), limit=16)
+                                full_finding, Path(source_path), limit=16)
                         except (OSError, ValueError, TypeError):
                             # Memory is best-effort; never invent a preference.
                             pass
                     current["learned_skills"] = _learned_skills_for_finding(next_item)
-                    recommendation = self._recommender(_prompt_finding(next_item, current))
-                if not isinstance(recommendation, dict) or not str(recommendation.get("suggestion", "")).strip():
-                    raise ValueError("Empty Gemma recommendation")
+                    from healthcare_data_quality.learning.model_failure_patterns import recent_failure_hints
+                    current['recent_failure_patterns'] = recent_failure_hints(full_finding)
+                    if source_path is not None:
+                        # Compute aggregate source-wide patterns before inference;
+                        # never persist raw data or file paths in the job JSON.
+                        try:
+                            from healthcare_data_quality.services.source_patterns import summarize_source_patterns
+                            current["source_pattern_summary"] = summarize_source_patterns(Path(source_path))
+                        except (OSError, ValueError, csv.Error, UnicodeError):
+                            current["source_pattern_summary"] = None
+                        # A past no-change review is a preference for the exact
+                        # SAME source+finding, not a transferable cleaning rule.
+                        try:
+                            preference = preferred_reviewed_solution(full_finding, Path(source_path))
+                            record = preference.get("record", {}) if preference else {}
+                            current["exact_prior_no_change"] = bool(
+                                preference and preference["match"] == "exact" and
+                                record.get("decision") == "reviewed_no_change")
+                        except (OSError, ValueError, TypeError):
+                            current["exact_prior_no_change"] = False
+                    # A malformed/temporarily interrupted local inference gets
+                    # one automatic retry without resetting any other finding.
+                    for attempt in range(2):
+                        try:
+                            recommendation = self._recommender(_prompt_finding(next_item, current))
+                            if not isinstance(recommendation, dict) or not str(recommendation.get("suggestion", "")).strip():
+                                raise ValueError("Empty Gemma recommendation")
+                            break
+                        except (RuntimeError, ValueError, TimeoutError, OSError):
+                            if attempt:
+                                raise
+                    reviewed_options = []
+                    source_path = current.get('source_path')
+                    if source_path is not None:
+                        from healthcare_data_quality.services.recommendation_options import source_backed_choices
+                        full = current.get('finding_for_memory') or next_item
+                        candidates = source_backed_choices(full, Path(source_path), {
+                            **recommendation,
+                            'memory_context': current.get('reviewed_methods') or [],
+                            'approved_row_deletion_method_seen': any(
+                                isinstance(m, dict) and 'drop_rows' in (m.get('operation_types') or [])
+                                for m in current.get('reviewed_methods') or []),
+                        })
+                        if self._choice_assessor is not None:
+                            for candidate in candidates[:3]:
+                                # A transient inference failure should not
+                                # strand this one finding. The second attempt
+                                # reviews the identical source-bound candidate;
+                                # never auto-expand its target scope.
+                                for assessment_attempt in range(2):
+                                    try:
+                                        assessment = self._choice_assessor(
+                                            full, Path(source_path), candidate,
+                                            methods=current.get('reviewed_methods'),
+                                            skills=current.get('learned_skills'))
+                                        if not isinstance(assessment, dict) or 'can_offer' not in assessment:
+                                            raise ValueError('Gemma option appraisal omitted its decision')
+                                        reviewed_options.append(assessment)
+                                        break
+                                    except (RuntimeError, ValueError, TimeoutError, OSError, ConnectionError):
+                                        if assessment_attempt:
+                                            raise
                 item = {"status": "ready", "updated_at": _now(),
+                        "assisted_by_agent_c": bool(assist),
                         "suggestion": str(recommendation["suggestion"])[:2200],
                         "decision_needed": str(recommendation.get("decision_needed", ""))[:1400],
                         "memory_assessed": bool(current.get("reviewed_methods") or current.get("learned_skills")),
                         "method_candidates_considered": len(current.get("reviewed_methods") or []),
                         "skill_candidates_considered": len(current.get("learned_skills") or []),
                         "memory_assessment": recommendation.get("memory_assessment") or {},
+                        "approved_row_deletion_method_seen": any(
+                            isinstance(m, dict) and 'drop_rows' in (m.get('operation_types') or [])
+                            and m.get('issue_relation') in {'same', 'related'}
+                            for m in (current.get('reviewed_methods') or [])
+                        ),
                         "memory_context": [
                             {"operation_types": [str(t)[:30] for t in (m.get("operation_types") or [])[:5]],
                              "issue_relation": str(m.get("issue_relation") or "")[:24],
                              "same_original_csv": bool(m.get("same_original_csv"))}
                             for m in (current.get("reviewed_methods") or [])[:3]
                             if isinstance(m, dict)],
-                        "choices": list(recommendation.get("choices") or [])[:3]}
+                        "choices": list(recommendation.get("choices") or [])[:3],
+                        "gemma_option_reviews": reviewed_options,
+                        # Bounded, aggregate-only trace of actual source
+                        # patterns and prior exact-source no-change preference.
+                        "source_pattern_summary": current.get("source_pattern_summary"),
+                        "exact_prior_no_change": bool(current.get("exact_prior_no_change"))}
             except Exception as exc:  # Preserve remaining queue even if an individual LLM call fails.
+                try:
+                    from healthcare_data_quality.learning.model_failure_patterns import record_failure
+                    record_failure((runtime or {}).get('finding_for_memory') or next_item,
+                                   'recommendation', exc)
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass  # Diagnostics must never break another worker.
                 item = {"status": "failed", "updated_at": _now(),
+                        "assisted_by_agent_c": bool(assist),
                         "error": f"{type(exc).__name__}: {str(exc)[:400]}"}
+            item["manual_retries"] = prior_retry_count
             with self._lock:
                 state = self._load(key)
                 if not state:

@@ -13,7 +13,7 @@ class UI(StubUI):
     def text_input(self, *args, **kwargs):
         return "researcher"
     def form_submit_button(self, label, **kwargs):
-        return self.submitted and label == "Yes — Approve & Execute"
+        return self.submitted and label.startswith("Yes — Delete column 2")
     def dataframe(self, *args, **kwargs):
         pass
 

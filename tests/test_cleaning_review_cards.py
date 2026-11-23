@@ -180,10 +180,8 @@ def test_all_findings_and_gemma_checks_visible_without_selection(monkeypatch, tm
     monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args: (set(), set()))
     app.render_cleaning_workspace([file], [SimpleNamespace(name="one.csv")], {}, "audit-A", [])
-    assert len(st.expanders) == 3
-    assert "Finding 1 · Fractional counts" in st.expanders[0]
-    assert "Finding 2 · Missing counts" in st.expanders[1]
-    assert "Gemma check 1 · Checked controls: no issue" in st.expanders[2]
+    # Review headings are visible as locked wait rows, not expandable panels.
+    assert len(st.expanders) == 0
     assert st.session_state.cleaning_plans_by_finding == {}
 
 
@@ -196,6 +194,14 @@ def test_one_finding_no_action_does_not_affect_other_cards(monkeypatch, tmp_path
                         lambda *args, **kwargs: _catalog())
     monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args: (set(), set()))
+    st.session_state.hdq_registered_reviewer = "ReviewerABC"
+    # Only the ready finding can be marked reviewed; queued cards are locked.
+    class ReadyAgentB:
+        def snapshot(self, key):
+            return {"entries": {"dataset_1:qc:2": {
+                "status": "ready", "suggestion": "Review evidence"}}}
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager",
+                        lambda: ReadyAgentB())
     st.buttons_on.add("review_no_action_dataset_1:qc:2")
     import pytest
     with pytest.raises(StopIteration, match="rerun"):
@@ -206,14 +212,12 @@ def test_one_finding_no_action_does_not_affect_other_cards(monkeypatch, tmp_path
     assert st.session_state.cleaning_history == []
 
 
-def test_accepting_source_backed_suggestion_prepares_exact_review_not_execution(monkeypatch, tmp_path):
-    """Agent B's green selection prepares validated values, not a silent edit."""
+def test_accepting_source_backed_suggestion_executes_with_one_click(monkeypatch, tmp_path):
+    """The first Yes is the only named approval of the visible exact change."""
     import pytest
-    from healthcare_data_quality.cleaning.finding_cleaning import validate_scoped_plan
-
     file = tmp_path / "one.csv"
     file.write_text("Taxon,Count\na,0.2\n", encoding="utf-8")
-    before = file.read_bytes()
+    original = file.read_bytes()
     monkeypatch.setenv("HDQ_APPROVED_STAGE_DIR", str(tmp_path / "checkpoint"))
     st = StubUI()
     app = _app(monkeypatch, st)
@@ -238,13 +242,23 @@ def test_accepting_source_backed_suggestion_prepares_exact_review_not_execution(
     uploaded = [SimpleNamespace(name="one.csv")]
     app.render_cleaning_workspace([file], uploaded, {}, "audit-C", [])
     assert any(item[0] == "table" for item in st.comments)
+    st.session_state.cleaning_approved_reviewer = 'Reviewer X'
+    executed = []
+    def commit_once(state, selected_finding, path, choice):
+        executed.append(choice['operations'])
+        state.cleaning_review_statuses[selected_finding['id']] = 'Applied and verified'
+        state.cleaning_history.append({'finding_id': selected_finding['id']})
+        return {'warning': None}
+    monkeypatch.setattr('healthcare_data_quality.ui.one_click_choice.execute_verified_choice',
+                        commit_once)
     st.buttons_on.add(f"review_yes_{finding['id']}_0_option_0")
     with pytest.raises(StopIteration, match="rerun"):
         app.render_cleaning_workspace([file], uploaded, {}, "audit-C", [])
-    assert file.read_bytes() == before
-    assert st.session_state.cleaning_history == []
-    assert st.session_state.cleaning_discussion_mode_by_finding[finding['id']] == "accepted"
-    assert st.session_state.cleaning_plans_by_finding[finding['id']]['changes'][0]['after'] == "0"
+    assert len(executed) == 1
+    assert file.read_bytes() == original
+    assert st.session_state.cleaning_history == [{'finding_id': finding['id']}]
+    assert st.session_state.cleaning_review_statuses[finding['id']] == 'Applied and verified'
+    assert st.session_state.cleaning_plans_by_finding == {}
 
 
 def test_existing_open_session_migrates_to_new_card_states(monkeypatch, tmp_path):
@@ -264,6 +278,6 @@ def test_existing_open_session_migrates_to_new_card_states(monkeypatch, tmp_path
     assert st.session_state.cleaning_plans_by_finding == {}
     assert st.session_state.cleaning_recommendations == {}
     assert st.session_state.cleaning_history[0]["finding_id"] == "old"
-    assert len(st.expanders) == 3  # one card per finding/check, no duplicate audit panel
+    assert len(st.expanders) == 0  # queued cards are visible but cannot expand
     assert st.session_state.cleaning_working_paths == {}
     assert st.session_state.cleaning_staged_bytes_by_dataset["dataset_1"] == file.read_bytes()

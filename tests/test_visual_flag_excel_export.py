@@ -135,9 +135,12 @@ def test_final_review_has_single_download_button_with_excel_default():
     chunk = "\n".join(source_lines[fn.lineno - 1:fn.end_lineno])
     anchor = chunk.index('    # One export control.')
     tail = chunk[anchor:]
-    assert tail.count('st.download_button(') == 2  # disabled/enabled alternatives, never both
-    assert '"Excel (.xlsx) — preserves highlights", "CSV (.csv) — data only"' in tail
+    assert tail.count('st.download_button(') == 2  # one final dataset, one reviewer audit
+    assert '"Complete review package (.zip) — original, cleaned, Excel and audit"' in tail
+    assert '"Excel (.xlsx) — data and review audit"' in tail
+    assert '"CSV (.csv) — cleaned values only"' in tail
     assert 'want_excel = str(file_format).startswith("Excel")' in tail
+    assert 'embed_audit_sheets(' in tail
 
 
 def test_download_reports_flags_deleted_during_cleaning():

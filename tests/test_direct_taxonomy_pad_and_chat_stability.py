@@ -67,5 +67,9 @@ def test_background_ready_recommendation_never_forces_full_app_rerun():
     code = (PROJECT / 'app.py').read_text()
     renderer = code.split('def _render_live_agent_b_finding(', 1)[1].split('def _is_blank_control_check(', 1)[0]
     assert 'if not discussion_active:\n            st.rerun()' not in renderer
-    assert '_expand_ready_finding_without_rerun(fid)' in renderer
-    assert 'run_every=None if fid in ready_ids else "3s"' in code
+    assert '_expand_ready_finding_without_rerun(fid)' not in renderer
+    # Do not swap a live 3-second fragment to a new un-timed fragment when
+    # Agent B becomes ready: both instances can leave a No button mounted.
+    assert 'run_every=None if fid in ready_ids else "3s"' not in code
+    assert 'st.fragment(run_every="3s")(_render_live_agent_b_finding)' not in code
+    assert 'st.fragment(run_every="3s")(_refresh_parent_for_new_agent_b_choices)' in code

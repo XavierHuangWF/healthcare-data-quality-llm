@@ -43,6 +43,13 @@ def test_cleaning_review_button_does_not_force_full_app_rerun(monkeypatch, tmp_p
         raise StopIteration("rerun")
 
     st.rerun = scoped_rerun
+    st.session_state.hdq_registered_reviewer = "ReviewerABC"
+    # This action is available only when the matching recommendation is ready.
+    class ReadyAgentB:
+        def snapshot(self, key):
+            return {"entries": {"dataset_1:qc:1": {"status": "ready", "suggestion": "Review counts"}}}
+    monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager",
+                        lambda: ReadyAgentB())
     st.buttons_on.add("review_no_action_dataset_1:qc:1")
     with pytest.raises(StopIteration, match="rerun"):
         app.render_cleaning_workspace([file], [SimpleNamespace(name="one.csv")],

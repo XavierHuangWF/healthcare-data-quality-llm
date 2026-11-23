@@ -2,7 +2,8 @@
 
 Three logical agents share one loaded Gemma instance. With
 HDQ_LLM_MAX_ACTIVE=3, Agent A investigation, Agent B recommendation and
-Agent C interaction each have one independent HTTP request lane.
+Agent C interaction each have one independent HTTP request lane. When Agent C
+is idle, one recommendation worker may borrow its lane for another finding.
 This is an application-side limit, not a guarantee of vLLM/GPU concurrency.
 In-flight calls cannot be preempted. All model calls stay local.
 """
@@ -40,8 +41,10 @@ class _RequestGate:
     Capacity=3: one lane each for A, B, and C; all can overlap.
 
     "background" remains an alias for "investigation" to support older callers.
-    A role's lane is never stolen by another role at capacity=2/3. This is a
-    *local process* gate; other clients of vLLM are not managed by it.
+    At capacity=3 an optional idle-assist job can borrow Agent C's lane
+    while no interactive request is active or waiting. A new chat takes
+    priority at the next request boundary, but cannot preempt an in-flight
+    inference. This is a *local process* gate; other vLLM clients are not managed.
     """
 
     def __init__(self):
@@ -49,18 +52,32 @@ class _RequestGate:
         self._active = 0
         self._active_by_role = {"investigation": 0, "recommendation": 0, "interactive": 0}
         self._waiting_interactive = 0
+        self._active_idle_assist = 0
 
     @staticmethod
     def _role(priority: str) -> str:
         if priority == "background":
             return "investigation"
-        if priority not in {"investigation", "recommendation", "interactive"}:
+        if priority not in {"investigation", "recommendation", "interactive", "idle_assist"}:
             raise ValueError(f"Unknown model request priority: {priority}")
         return priority
+
+    def interaction_busy(self) -> bool:
+        """True while a user model request is active or waiting.
+
+        A cheap scheduling hint, not an authorization check. Admission still
+        checks the interactive reservation atomically under the condition.
+        """
+        with self._condition:
+            return bool(self._waiting_interactive or self._active_by_role["interactive"])
 
     def _can_admit(self, role: str, capacity: int) -> bool:
         if self._active >= capacity:
             return False
+        if role == "idle_assist":
+            return (capacity == 3 and not self._waiting_interactive
+                    and self._active_by_role["interactive"] == 0
+                    and self._active_idle_assist == 0)
         if capacity == 1:
             return role == "interactive" or self._waiting_interactive == 0
         if capacity == 2:
@@ -69,10 +86,10 @@ class _RequestGate:
             return (self._active_by_role["investigation"] +
                     self._active_by_role["recommendation"] == 0 and
                     self._waiting_interactive == 0)
-        # 3 active requests maximum: reserve an independent lane per role.
-        # The waiting-interactive check is not needed here, because Agent C's
-        # lane cannot be occupied by A or B.
-        return self._active_by_role[role] == 0
+        # 3 active requests maximum: keep A/B separate. C gets the third
+        # slot unless one already-running idle-assist inference borrowed it.
+        return (self._active_by_role[role] == 0
+                and (role != "interactive" or self._active_idle_assist == 0))
 
     @contextmanager
     def admit(self, priority: str):
@@ -85,7 +102,10 @@ class _RequestGate:
                 while not self._can_admit(role, capacity):
                     self._condition.wait()
                 self._active += 1
-                self._active_by_role[role] += 1
+                if role == "idle_assist":
+                    self._active_idle_assist += 1
+                else:
+                    self._active_by_role[role] += 1
             finally:
                 if role == "interactive":
                     self._waiting_interactive -= 1
@@ -94,16 +114,24 @@ class _RequestGate:
         finally:
             with self._condition:
                 self._active -= 1
-                self._active_by_role[role] -= 1
+                if role == "idle_assist":
+                    self._active_idle_assist -= 1
+                else:
+                    self._active_by_role[role] -= 1
                 self._condition.notify_all()
 
 
 _GATE = _RequestGate()
 
 
+def interactive_model_request_pending() -> bool:
+    """Allow background scheduling to avoid borrowing the user's model lane."""
+    return _GATE.interaction_busy()
+
+
 @contextmanager
 def model_request_priority(priority: str):
-    if priority not in {"background", "investigation", "recommendation", "interactive"}:
+    if priority not in {"background", "investigation", "recommendation", "interactive", "idle_assist"}:
         raise ValueError("Unknown model request priority")
     token = _REQUEST_PRIORITY.set(priority)
     try:

@@ -99,7 +99,7 @@ def concise_agent_c_reply(reply: str, limit: int = 250) -> str:
     return text
 
 
-_HEADER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_. -]{0,79}$")
+_HEADER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_./ -]{0,79}$")
 
 
 def agent_c_clarification_options(reply: str, options: object = None) -> list[str]:
@@ -878,6 +878,19 @@ verified registry is present, say the extent is unknown; do not guess.
 Default to the selected finding only. Source-wide changes are eligible for
 DRAFTING only when explicitly requested by the human; host code verifies
 scope and computes exact targets. Never transfer actions between findings.
+When the selected finding concerns taxonomy separators or naming, use the
+VERIFIED taxonomy convention and exact original comparator rows supplied in
+selected_finding before suggesting anything. Examine separator AND rank-prefix
+style together: changing only | to ; can leave a nonconforming prefixed label.
+Offer the COMPLETE presentation-only correction when all source rank tokens
+and suffixes can be preserved exactly. Never invent or silently remove strain
+identifiers, claim the biological identity is correct, or ask the reviewer to
+supply taxonomy text already recoverable from the dataset. Do not offer
+absolute-count, negative-count, or unrelated cell-value clarification choices
+for taxonomy-format findings. If the biological taxon identity itself is
+uncertain, state that no external nomenclature verification was performed;
+do not treat majority naming as biological proof. Do not silently substitute
+an unrelated finding's suggestion, memory, or clarification.
 Be concise: answer in at most two short sentences unless returning structured
 operations. As a separate rule, never treat NA taxonomy ranks as invalid. No preambles, scientific justifications or repeated permissions.
 
