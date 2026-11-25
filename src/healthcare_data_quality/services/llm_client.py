@@ -23,9 +23,12 @@ from healthcare_data_quality.services.model_connectivity import (
     model_connection_snapshot,
 )
 
-MODEL_URL = "http://127.0.0.1:8000/v1/chat/completions"
+# MODEL_URL = "http://127.0.0.1:8000/v1/chat/completions"
+MODEL_URL = "http://192.168.5.81:8000/v1/chat/completions"
+
 MODEL_NAME = "gemma4-12b"
-HEALTH_URL = "http://127.0.0.1:8000/health"
+# HEALTH_URL = "http://127.0.0.1:8000/health"
+HEALTH_URL = "http://192.168.5.81:8000/health"
 
 _REQUEST_PRIORITY = ContextVar("hdq_llm_request_priority", default="interactive")
 _AUTO_RECONNECT = ContextVar("hdq_llm_auto_reconnect", default=False)

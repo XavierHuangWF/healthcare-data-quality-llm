@@ -4,6 +4,919 @@
 
 > **Current operating contract — 24 November 2026.** Updated against the supplied README, the `194131` source snapshot, and the subsequent ordered-review/context/export, verified-options unlock, and memory-first recommendation patches. This section supersedes earlier UI, approval, scheduling, and export requirements. The historical benchmark and engineering reference remain for provenance. The rules below describe the intended cumulative patched application; targeted regression results from earlier patches do not establish full integration or live browser/GPU validation. This remains a research prototype, not a clinically validated system or a HIPAA compliance guarantee.
 
+## 0. Developer terminal commands and actions — start here
+
+> **Deployment update — 25 November 2026.** The current development topology is split across two computers on the same trusted home LAN. Use the Alienware for Gemma inference and the ASUS for the Streamlit application. The local-only workflow remains an alternative. The earlier operating contract and archived experiments are retained below; they do not override this deployment guide. Local endpoint checks succeeded on the Alienware; the ASUS-to-Alienware connection and complete remote UI workflow must still be verified from the ASUS. No new application tests or RTX 5080 benchmarks were run for this documentation update.
+
+**Jump to:** [Daily startup](#daily-startup--alienware-gemma--asus-ui) · [One-time networking](#one-time-network-setup-and-recovery) · [Single-computer fallback](#single-computer-fallback--asus-local-gemma) · [Tests](#current-regression-commands) · [Commit and push](#62-commit-on-backend-in-pycharm-then-push) · [Historical commands](#archived-terminal-workflows--november-713-2026) · [Architecture](#1-architecture-evidence--memory--model-assessment--authorization--verification).
+
+### Daily startup — Alienware Gemma + ASUS UI
+
+| Component | Current development configuration |
+| --- | --- |
+| Alienware (inference server) | RTX 5080 Laptop GPU, 16 GB VRAM; Windows Wi-Fi IP `192.168.5.81` |
+| Alienware WSL | Ubuntu 24.04; observed WSL IPv4 `172.29.214.86` (can change) |
+| ASUS (application host) | Windows Wi-Fi IP `192.168.4.54`; Streamlit and Python application in WSL |
+| LAN | `192.168.4.0/22`, mask `255.255.252.0`; trusted home Wi-Fi |
+| Model API | `http://192.168.5.81:8000`; OpenAI-compatible HTTP |
+| Streamlit browser URL | `http://127.0.0.1:8501` on ASUS only |
+| Model ID | `gemma4-12b` |
+| Concurrency | Three application request slots; up to three vLLM-scheduled sequences shared by all clients |
+
+The ASUS retains the UI, logical agent orchestration (A/B/C), evidence, skills, memory, reviewer permissions, sandbox, data processing and export. The Alienware runs model inference only; prompts and generated responses traverse the LAN. No SSH, hosted LLM API or router port forwarding is required.
+
+**Terminal A — Alienware Ubuntu/WSL: start Gemma and leave running.**
+
+```bash
+source ~/venvs/healthcare-vllm/bin/activate
+export VLLM_USE_FLASHINFER_SAMPLER=0
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+vllm serve ~/gemma-server/models/gemma-4-12b \
+  --served-model-name gemma4-12b \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --max-model-len 12288 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 3 \
+  --model-impl vllm \
+  --kv-cache-dtype bfloat16 \
+  --no-async-scheduling \
+  --language-model-only
+```
+
+This is the Alienware WSL deployment configuration, not the older ASUS CUDA Graph benchmark profile. The model was already downloaded into `~/gemma-server/models/gemma-4-12b`; the FlashInfer sampler override addresses the observed startup failure involving missing `nvcc`. Do not install additional CUDA components or rerun model downloads just to start the working service. Preserve three sequences and the 12,288-token context. `0.0.0.0` binds the API on the WSL interfaces; restrict Windows ingress as described below. Do not expose port 8000 on the internet.
+
+**Terminal B — ASUS PyCharm Ubuntu/WSL: verify connectivity.**
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+source /home/xavier/.venv/bin/activate
+curl -i --max-time 10 http://192.168.5.81:8000/health
+curl -fsS --max-time 10 http://192.168.5.81:8000/v1/models
+```
+
+Require HTTP 200 and the advertised model ID `gemma4-12b` before launching the UI. Optionally test actual generation with a non-sensitive prompt:
+
+```bash
+curl -fsS --max-time 120 http://192.168.5.81:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4-12b","messages":[{"role":"user","content":"Reply with OK only."}],"max_tokens":32,"temperature":0}'
+```
+
+**One-time ASUS PyCharm action — change the model API address (not the UI address).**
+
+Open `src/healthcare_data_quality/services/llm_client.py`. Replace the two existing endpoint constants with:
+
+```python
+MODEL_URL = "http://192.168.5.81:8000/v1/chat/completions"
+HEALTH_URL = "http://192.168.5.81:8000/health"
+```
+
+Keep `MODEL_NAME = "gemma4-12b"`. The previously inspected tokenizer path derives its URL from `MODEL_URL`; verify this in the current checkout. Search for any remaining hardcoded inference endpoints, including the standalone benchmarks, before running them against the remote model. Do not replace the Streamlit loopback address or indiscriminately modify historical tests, examples or security bindings.
+
+```bash
+# ASUS WSL: inspect remaining inference endpoint references.
+grep -Rn --include='*.py' '127.0.0.1:8000' src scripts app.py
+```
+
+**Terminal B — ASUS PyCharm Ubuntu/WSL: start Streamlit.**
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+source /home/xavier/.venv/bin/activate
+export HDQ_LLM_MAX_ACTIVE=3
+PYTHONPATH=src:scripts streamlit run app.py \
+  --server.address 127.0.0.1 --server.port 8501 \
+  --browser.gatherUsageStats false
+```
+
+Open <http://127.0.0.1:8501> on the ASUS. Do not start the ASUS Gemma server for this two-computer workflow. To stop the UI, press `Ctrl+C` in Terminal B; to stop Gemma, press `Ctrl+C` in Terminal A on the Alienware. Save or export current review work before shutting down.
+
+### One-time network setup and recovery
+
+**Terminal C — Alienware Windows Administrator PowerShell.** These commands are for Windows, not Ubuntu. Run the checks first; do not recreate working rules unnecessarily.
+
+```powershell
+Get-NetConnectionProfile
+ipconfig
+wsl -d Ubuntu-24.04 -- hostname -I
+wsl -d Ubuntu-24.04 -- ss -lntp | Select-String ':8000'
+netsh interface portproxy show all
+```
+
+The diagnosed failure was a **Public network profile with a Private-only firewall rule**. The Gemma API and Windows port proxy responded locally. On this trusted home network only, set the Wi-Fi profile to Private if needed (the previously observed interface index was 13; verify it before using the command):
+
+```powershell
+Set-NetConnectionProfile -InterfaceIndex 13 -NetworkCategory Private
+Get-NetConnectionProfile
+```
+
+If the port proxy is absent, configure the Windows LAN address to forward TCP port 8000 to the WSL IP. The addresses below are the observed values, not guaranteed permanent addresses.
+
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=192.168.5.81 listenport=8000 connectaddress=172.29.214.86 connectport=8000
+netsh interface portproxy show all
+```
+
+If the WSL IP has changed after shutdown/restart, replace the old proxy destination with the newly observed WSL IPv4 address. If the Windows LAN IP changes, update the listening address, firewall local address, and ASUS model endpoint too. Reserve LAN IPs in the router where available.
+
+```powershell
+# Example: remove the old entry before recreating it with current addresses.
+netsh interface portproxy delete v4tov4 listenaddress=192.168.5.81 listenport=8000
+# Re-run the add command above using the current WSL IPv4 address.
+```
+
+Create the narrowly scoped inbound rule only if it does not already exist:
+
+```powershell
+Get-NetFirewallRule -DisplayName "Gemma API"
+# Only if the rule is absent:
+New-NetFirewallRule -DisplayName "Gemma API" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000 -LocalAddress 192.168.5.81 -RemoteAddress 192.168.4.54 -Profile Private
+
+# Verify the permitted addresses and rule state.
+Get-NetFirewallRule -DisplayName "Gemma API" | Get-NetFirewallAddressFilter
+Get-NetFirewallRule -DisplayName "Gemma API" | Format-List DisplayName,Enabled,Profile,Direction,Action
+```
+
+**Add another authorized computer:** find its active IPv4 address with `ipconfig` on that computer. The example below adds `192.168.4.75`; replace it with the actual address. The command replaces the entire remote address list, so retain all intended existing clients.
+
+```powershell
+Set-NetFirewallRule -DisplayName "Gemma API" -RemoteAddress 192.168.4.54,192.168.4.75
+Get-NetFirewallRule -DisplayName "Gemma API" | Get-NetFirewallAddressFilter
+```
+
+**Troubleshoot in order:** check that Gemma listens on `0.0.0.0:8000`; check the WSL address and port proxy; check the firewall profile and address filter; then test from the ASUS. Do not disable the firewall.
+
+```powershell
+# Alienware Windows PowerShell: check each local layer.
+curl.exe -i --max-time 5 http://172.29.214.86:8000/health
+curl.exe -i --max-time 5 http://192.168.5.81:8000/health
+netsh interface portproxy show all
+Get-NetConnectionProfile
+```
+
+```powershell
+# ASUS Windows PowerShell: test remote TCP and HTTP access.
+Test-NetConnection 192.168.5.81 -Port 8000
+curl.exe -i --max-time 10 http://192.168.5.81:8000/health
+curl.exe --max-time 10 http://192.168.5.81:8000/v1/models
+```
+
+**Security:** The Private profile is not device authentication; the explicit remote-IP allowlist is the narrower control. These settings assume no broader inbound rules, external forwarding or other exposure. The development HTTP API is unencrypted and has no configured API authentication. Use non-sensitive synthetic fixtures only. A real biomedical-data deployment requires approved encryption, authentication, access control, isolation, data-governance review and independent validation. Do not relax Bubblewrap's no-network policy for generated code: only the trusted application-side model client needs the LAN endpoint.
+
+### Single-computer fallback — ASUS local Gemma
+
+If returning to local inference, restore the loopback constants in `services/llm_client.py`:
+
+```python
+MODEL_URL = "http://127.0.0.1:8000/v1/chat/completions"
+HEALTH_URL = "http://127.0.0.1:8000/health"
+```
+
+**Terminal A — ASUS WSL: start local Gemma (leave running).**
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+source /home/xavier/.venv/bin/activate
+bash scripts/serve_gemma4.sh
+```
+
+**Terminal B — ASUS WSL: verify local model and start Streamlit.**
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+source /home/xavier/.venv/bin/activate
+curl -fsS http://127.0.0.1:8000/v1/models
+export HDQ_LLM_MAX_ACTIVE=3
+PYTHONPATH=src:scripts streamlit run app.py \
+  --server.address 127.0.0.1 --server.port 8501 \
+  --browser.gatherUsageStats false
+```
+
+Open <http://127.0.0.1:8501>. The existing local launcher and GPU environment are separate from the Alienware installation; use the appropriate machine's environment. Do not publish the machine-specific IP change to a public repository unintentionally. A future configurable endpoint (environment variable with loopback default) would be preferable to a committed personal LAN address, but is not assumed to exist in the current client.
+
+### Current regression commands
+
+**Terminal B or a separate ASUS WSL terminal — repository root, project environment active.**
+
+Run from the repository root in the project environment:
+
+```bash
+# Confirm the intended source-tree import path and current branch.
+git branch --show-current
+PYTHONPATH=src:scripts python -m compileall -q app.py src/healthcare_data_quality
+
+# Use the complete suite: new tests must be collected, not just selected older tests.
+PYTHONPATH=src:scripts python -m pytest -q --tb=short
+
+# Focused latest-patch contracts (after applying the cumulative patches).
+PYTHONPATH=src:scripts python -m pytest -q \
+  tests/test_approval_frequency_ranking_20261124.py \
+  tests/test_automatic_final_actions_20261124.py \
+  tests/test_ordered_review_and_final_model_20261124.py \
+  tests/test_exact_publication_gate_20261124.py \
+  tests/test_memory_first_recommendations_20261124.py \
+  tests/test_responsive_review_workers_20261124.py \
+  tests/test_readable_approval_origin_20261124.py \
+  --tb=short
+```
+
+### 6.2 Commit on `backend` in PyCharm, then push
+
+1. Copy this updated document into the project's **root `README.md`**; verify that the Git branch indicator shows **`backend`**. Preserve uncommitted working files.
+2. In PyCharm's **Commit** tool window (`Alt+0`), select reviewed tracked changes **and** the required source/test files under **Unversioned Files**. Inspect every new `src/healthcare_data_quality/**.py` dependency and relevant `tests/test_*.py` file. Include `pytest.ini` if necessary for the tested import path.
+3. **Do not indiscriminately select all unversioned files.** Temporary `tools/apply_*.py` patch installers, `.bak` launchers, scratch ZIPs, local model/data/memory files, and secrets are normally excluded unless they are intentional, reviewed project deliverables. Inspect special cases such as `tools/assets/reviewer_audit_fallback.py` for actual runtime imports before deciding.
+4. Run the full tests in [Current regression commands](#current-regression-commands), review selected diffs and test files, and check `git status --short` / `git diff --check` in the terminal. Use a coherent commit message, e.g., `feat: reconcile multi-agent reviews and strengthen audit integrity`.
+5. Click **Commit and Push…**, review the destination (normally `origin/backend`) and outgoing file list, and confirm **Push**. Alternatively, click **Commit** and later use **Git → Push** (`Ctrl+Shift+K`). Never force-push to resolve a rejection; fetch/integrate remote changes after review.
+6. After push, confirm a clean intended working tree and the new commit in **Git → Log**. Only merge `backend` into `main` after successful Streamlit integration tests and source-level conflict review.
+
+**Public-repository review:** The historical appendix retains a maintainer email address and machine-specific Windows/WSL paths. Check that you intend to publish those details before pushing to a public remote.
+
+**Privacy and reproducibility:** Keep healthcare/customer datasets, derived CSV/XLSX/ZIP packages, `memory/`, `skills/generated/`, `models/`, `.venv/`, caches, raw conversations, credentials, and local logs out of commits. Preserve prompt/model version, validation implementation version, source fingerprint, and reviewer decision lineage to support reproducibility. Local inference alone does not satisfy regulatory security requirements. To retain the generated-skills directory marker while excluding local learned content, use `skills/generated/*` and `!skills/generated/.gitkeep` in `.gitignore`. Review all new runtime imports and regression tests before committing; do not commit learned reviewer records.
+
+---
+
+## Historical benchmark: Gemma 4 12B inference optimization (21 November 2026)
+
+> The measurements below are a **historical RTX 3080/WSL2 experiment** retained for reproducibility. They do not establish throughput or compatibility for the current RTX 5080 deployment, and launcher flags must be checked against the current script.
+
+
+**Measured 2026-11-21 on an NVIDIA GeForce RTX 3080 Laptop GPU (16 GiB) using WSL2 and vLLM 0.33.0.** This is a hardware-specific development benchmark, not an established optimum for the intended Alienware **RTX 5080 Laptop GPU (16 GB)**. Rebenchmark on the RTX 5080 rather than transferring the timing or FP8 compatibility conclusions.
+
+The tested Gemma checkpoint was loaded through vLLM's `compressed-tensors` quantization path. The **one local model** serves all three logical agent roles. Preserve the application request cap `HDQ_LLM_MAX_ACTIVE=3`, server concurrency **`--max-num-seqs 3`**, and minimum context **`--max-model-len 12288`**.
+
+**Tested server flags** (the final portion of `scripts/serve_gemma4.sh`):
+
+```bash
+    --max-model-len "$MODEL_LEN" \
+    --gpu-memory-utilization 0.90 \
+    --max-num-seqs 3 \
+    --model-impl vllm \
+    --kv-cache-dtype bfloat16 \
+    --async-scheduling \
+    --language-model-only
+```
+
+**Key change: remove `--enforce-eager`.** This allows vLLM to use its compiler and CUDA Graph capture on compatible operations. The actual startup log confirmed `enforce_eager=False`, `CompilationMode.VLLM_COMPILE`, `CUDAGraphMode.FULL_AND_PIECEWISE`, and completed both full and piecewise graph captures. `--model-impl vllm` selects the implementation; it is not intrinsically a speed boost. BF16 KV cache was selected for RTX 3080 compatibility, not because BF16 is always fastest.
+
+**Why CUDA Graphs can improve Gemma throughput:** Autoregressive decoding runs many similar GPU operations for each new token. Under eager execution, the CPU repeatedly issues kernel launches. `torch.compile`/vLLM compilation can optimize compatible computation and fuse eligible kernels; CUDA Graphs capture compatible GPU work and replay the execution sequence with reduced CPU launch overhead. **FULL** captures larger supported paths, whereas **PIECEWISE** covers capturable regions when a whole path is unsuitable. Capturing execution does **not** cache model answers: token values are still newly computed from each prompt and its KV cache. Asynchronous scheduling can separately reduce scheduling gaps. The tradeoffs are startup compilation/capture time and some extra GPU memory use; gains are workload dependent.
+
+**Three-request synthetic benchmark** (`scripts/test_gemma_three_way_concurrency.py --prompt-words 2000 --max-tokens 512`; all three requests returned HTTP 200 and the sampled vLLM running-request peak reached **3**):
+
+| Configuration | Three-request wall time | Measurement notes |
+| --- | ---: | --- |
+| Eager + async scheduling | 29.79 seconds | One baseline run |
+| Eager, async scheduling disabled | 30.88 seconds | One run |
+| Compiled + CUDA Graphs + async scheduling | 17.74, 11.97, 11.29 seconds | Three consecutive runs; **median 11.97 seconds** |
+
+The **11.97-second median is approximately 2.49× faster**, or about **60% less wall time**, than the single 29.79-second eager baseline. **Do not claim a causal 2.49× speedup from CUDA Graphs alone:** the optimized runs were warmed up, response token counts differed, and we have not collected equivalent repeated warm eager-mode runs. The test prompts contained approximately **2,031 tokens per request**. Successful three-way concurrency at that size does **not** prove that three near-12,288-token contexts will fit or that all application outputs remain correct.
+
+**Reproduce and verify** (the model server should remain running in Terminal A; use a second WSL terminal):
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+
+# Run three simultaneous requests against the existing local vLLM server.
+python3 scripts/test_gemma_three_way_concurrency.py \
+  --prompt-words 2000 --max-tokens 512
+
+# Observe VRAM and hardware while the benchmark runs.
+nvidia-smi
+```
+
+To collect compiler/capture evidence, start the server in Terminal A with its logs saved, then inspect the log from another terminal:
+
+```bash
+bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_server.log
+# In a second terminal (after the server starts):
+grep -Ei 'enforce_eager|CompilationMode|CUDAGraphMode|Capturing CUDA graphs|Graph capturing finished' \
+  ~/gemma_server.log | tail -n 12
+```
+
+### Recovering from a vLLM engine crash
+
+`EngineDeadError` indicates that the vLLM engine exited, not that Streamlit itself caused the GPU failure. Keep the earlier engine-core traceback: the API shutdown traceback is usually secondary. The application waits for a confirmed engine outage to clear via the local `/health` endpoint before retrying a pending **read-only** inference request; it never replays a cleaning approval. Restart the model server manually while the Streamlit process remains running if you need to retain in-memory review state. The current UI performs bounded automatic recommendation recovery; persistent failures remain blocked rather than exposing routine reassessment buttons.
+
+Capture a complete local server log (logs may contain source-derived diagnostic details; review before sharing):
+
+```bash
+bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_server.log
+```
+
+If the engine crashes again, inspect the first engine-core exception above the `EngineDeadError` shutdown message. Optional diagnostic switches leave the normal three-sequence, 12,288-token, compiled/async profile unchanged:
+
+```bash
+# Isolate CUDA Graph/compiled execution; preserve three sequences.
+HDQ_ENFORCE_EAGER=1 bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_eager.log
+# Separately isolate asynchronous scheduling (default CUDA Graph profile).
+HDQ_ASYNC_SCHEDULING=0 bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_sync.log
+```
+
+`HDQ_GPU_MEMORY_UTILIZATION` can override the default `0.90` if the original traceback identifies GPU memory pressure. Lowering it may also leave insufficient KV cache to start the model; it is not a universal crash fix. Do not lower context or sequence limits by default. These switches are diagnostic options, not proof that CUDA graphs, scheduling, or memory caused the failure.
+
+For a controlled A/B comparison, benchmark **both** eager and compiled configurations with the same GPU, checkpoint, precision, three-sequence limit, 12,288-token context, representative prompt/output settings, warm-up policy, and multiple repetitions. Inspect response completion status, generated-token counts, VRAM, KV-cache preemptions, timeouts, structured JSON validity, and actual A/B/C source-grounded edit proposals. Do not use synthetic completion time as a substitute for application correctness or long-context reliability.
+
+**Hardware and rollback notes:** On the RTX 3080 (compute capability 8.6), `--kv-cache-dtype fp8` failed during initialization because vLLM's selected Triton attention backend required SM89+ for native FP8; `--kv-cache-dtype bfloat16` started successfully. This does not determine FP8 support on the RTX 5080 or with another backend. There is no need to install an extra system-wide CUDA Toolkit or cuDNN merely to enable graph capture in the already-working vLLM environment. If graph compilation/capture fails or causes memory pressure, temporarily restore `--enforce-eager` as a diagnostic rollback, retaining the required **three concurrent sequences** and context.
+
+---
+
+## Archived terminal workflows — November 7–13, 2026
+
+> Historical instructions moved here for convenient access and provenance. They contain legacy source paths, localhost endpoints, CLI approval gates and old UI limitations. These are not the current two-computer startup instructions or current review contract. Before running old commands, verify the current branch, source paths, endpoint settings and supported flags; use synthetic data and do not bypass authorization. The historical engineering reference follows the current architecture below.
+
+### Prerequisites and installation
+
+#### Recommended development environment
+
+- Windows with **WSL2 / Ubuntu** or an equivalent Linux installation.
+- Python **3.12** in a virtual environment (the development environment demonstrated with WSL used Python 3.12; verify package compatibility if using another version).
+- NVIDIA GPU and compatible driver/CUDA environment for the selected **local vLLM** model server; actual model requirements depend on the model/quantization.
+- A running local OpenAI-compatible chat-completions endpoint.
+- Git; GitHub CLI (`gh`) is optional for local development but convenient for publishing branches.
+- `jsonschema` for tool argument validation; `streamlit` and `pandas` for the UI. Other local inference dependencies are part of your separately managed model-server environment.
+
+> The reviewed source snapshot does **not** include a pinned `requirements.txt` or `pyproject.toml`; therefore the command below installs the identified direct application dependencies but is **not** a complete reproducible lockfile. Create and pin one before wider distribution.
+
+#### 1. Open the correct project directory
+
+In WSL:
+
+```bash
+cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
+pwd
+git branch --show-current
+```
+
+Replace the path with your own clone path on another computer. All subsequent relative paths assume the **repository root** is the current directory.
+
+#### 2. Activate the project environment
+
+If your existing virtual environment is already configured, activate it rather than creating another:
+
+```bash
+source /home/xavier/.venv/bin/activate
+python --version
+```
+
+For a new, isolated environment, an alternative is:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+Install the identified Python application dependencies if they are absent:
+
+```bash
+python -m pip install jsonschema pandas streamlit
+```
+
+For a production-quality setup, dependency versions and GPU-model dependencies need to be locked and tested. `python -m pip install -e .` is **not** documented because no verified packaging manifest exists in the reviewed snapshot.
+
+#### 3. Run from the repository root with the source path configured
+
+The project uses the `src/` layout. For individual commands, prefix with:
+
+```bash
+PYTHONPATH=src python ...
+```
+
+Or export it for the current shell session:
+
+```bash
+export PYTHONPATH="$PWD/src"
+```
+
+This ensures imports such as `healthcare_data_quality.agent_loop` resolve correctly.
+
+### Start and verify the local LLM
+
+All model-assisted operations require the **separately running** local model service. The reviewed backend client configuration is:
+
+| Setting | Value in inspected `llm_client.py` |
+| --- | --- |
+| Chat-completions URL | `http://127.0.0.1:8000/v1/chat/completions` |
+| Model identifier | `gemma4-12b` |
+| Inference protocol | OpenAI-compatible HTTP JSON |
+| Sampling temperature | `0` |
+| Default `query_local_model(..., max_tokens=...)` | `4096` generated tokens; callers may override (for example, small structured decisions) |
+| HTTP timeout per request | `600` seconds |
+
+The API is configured in `src/healthcare_data_quality/llm_client.py`. If your server publishes a different model identifier, **make the client and server names consistent**. The code expects the returned message to end with `finish_reason == "stop"`; an incomplete generation causes an error.
+
+#### Start the existing local server
+
+Use your already configured vLLM serving procedure in **terminal A**. `scripts/serve_gemma4.sh` was present in a later reviewed source archive, although its exact model path and GPU settings must be verified against the live checkout. Review that script locally before running it. For the measured November 21 vLLM/CUDA Graphs configuration and its benchmark caveats, see [Gemma 4 12B inference optimization](#historical-benchmark-gemma-4-12b-inference-optimization-21-november-2026).
+
+#### Check endpoint accessibility
+
+In **terminal B**:
+
+```bash
+curl -fsS http://127.0.0.1:8000/v1/models
+```
+
+Confirm that the model service is reachable and that its configured model ID matches the client. A successful `/v1/models` response confirms endpoint reachability, **not** that every structured-output generation will work.
+
+If the endpoint is unavailable, do not troubleshoot the agent first—start or repair the local model server.
+
+#### Offline requirement
+
+Model inference is designed to use loopback networking only. Initial installation/model downloads may require Internet access; **normal inference must not depend on an external LLM API**. Do not expose the local LLM service publicly by changing its binding address without appropriate security controls.
+
+### Quick start: exploratory investigation in the terminal
+
+> **Historical entry-point note:** the earlier `scripts/run_investigation.py` examples below document legacy exploratory behavior. For the latest demonstrated investigation-only CLI, prefer `PYTHONPATH=src:scripts python scripts/run_workflow.py --input /path/to/dataset.csv --interactive` (without `--enable-remediation`). See the system-design section for its current limitations.
+
+This is the preferred path for developing and testing the backend kernel.
+
+#### 1. Generate an entirely synthetic test dataset
+
+```bash
+PYTHONPATH=src python scripts/create_poc_dataset.py
+```
+
+The generator creates:
+
+- `data/synthetic/poc_duplicate_columns.csv`: 80 synthetic records and 4 columns.
+- `data/synthetic/poc_duplicate_columns.provenance.json`: synthetic lineage evidence bound to the CSV SHA-256 hash.
+- A duplicate `Score` column pair at **1-based positions 2 and 4**.
+
+The companion provenance document records that both columns were generated from the same underlying synthetic score variable. This is **not** a template for making unsupported claims about real research data.
+
+**Important:** Regenerating the fixture may change data files or fingerprints if the generator changes. Existing approvals are tied to specific source content. Do not reuse an authorization against a changed dataset.
+
+#### 2. Inspect CSV structure without the LLM
+
+```bash
+PYTHONPATH=src python src/healthcare_data_quality/ingestion.py \
+  data/synthetic/poc_duplicate_columns.csv
+```
+
+This inspects column headers, row widths, blank header positions, and repeated header names; it does **not** remove columns or require inference.
+
+Optional deeper profiling:
+
+```bash
+PYTHONPATH=src python src/healthcare_data_quality/dataset_profiler.py \
+  data/synthetic/poc_duplicate_columns.csv
+```
+
+#### 3. Run the legacy exploratory investigation (not the default strict no-R mode)
+
+Start the local LLM first, then:
+
+```bash
+PYTHONPATH=src python scripts/run_investigation.py \
+  data/synthetic/poc_duplicate_columns.csv \
+  > /tmp/hdq_investigation.json
+```
+
+The CLI emits agent progress to **stderr** (visible in the terminal), preserving machine-readable JSON on **stdout** (redirected to the file). Depending on the model's decisions you may see progress resembling:
+
+```text
+[Agent] Profiling dataset structure...
+[Agent] Dataset profiling completed.
+[Agent] Step 1/4: Gemma is selecting the next investigation tool...
+[Agent] Step 1/4: Running compare_columns...
+[Agent] Step 1/4: compare_columns completed; observations recorded.
+...
+[Agent] Investigation ended: model_stopped
+```
+
+Tool names, action order, and termination status vary. Common stop statuses include `model_stopped`, `max_steps_reached`, `no_new_action`, and `tools_exhausted`. **`max_steps_reached` is not evidence of a comprehensive audit.**
+
+#### 4. Validate the output JSON
+
+```bash
+python -m json.tool /tmp/hdq_investigation.json > /dev/null \
+  && echo "INVESTIGATION JSON: PASS"
+```
+
+Inspect the full artifact:
+
+```bash
+python -m json.tool /tmp/hdq_investigation.json | less
+```
+
+The investigation artifact normally contains `status`, `history`, `report`, `ingestion`, and `remediation.proposals`. Each tool-history item records the tool, arguments, reason, and observations.
+
+To inspect only the proposals:
+
+```bash
+python -c 'import json; d=json.load(open("/tmp/hdq_investigation.json")); print(json.dumps(d.get("remediation", {}).get("proposals", []), indent=2))'
+```
+
+> A valid JSON file is **not** proof that every claim, proposed operation, or dataset-quality category has been validated. Use the validator status and underlying tool evidence.
+
+### Complete CLI POC: review, authorize, remediate, verify
+
+This section documents the existing safe, *narrow* executable path. Use the **synthetic test fixture** and only proceed if the agent produced a qualifying `data_change` proposal with the exact expected operation and target. An `investigation` proposal cannot be substituted for a data-change approval.
+
+#### Stage 0 — Confirm prerequisites and choose output paths
+
+The source must be the exact dataset used for investigation and review. Use a **new output filename** because the remediation code refuses to overwrite an existing output.
+
+```text
+SOURCE  = data/synthetic/poc_duplicate_columns.csv
+OUTPUT  = data/derived/poc_cleaned.csv
+KEEP    = 2
+REMOVE  = 4
+```
+
+Inspect the generated proposal for:
+
+- `action_kind: "data_change"`;
+- `operation.kind: "drop_duplicate_column"`;
+- `operation.keep_position: 2` and `operation.drop_position: 4`;
+- matching `target_ref.positions: [2, 4]`;
+- verified facts and `validation.status: "needs_human_review"`;
+- `execution_authorized: false` (normal before separate approval).
+
+The current deterministic validator authorizes this **proposal type for review** only when the tool history supports both identical columns and matching **synthetic-fixture** lineage. A real customer dataset with no recognized provenance may correctly receive an investigation recommendation rather than an executable change proposal. **Do not forge lineage files or hand-edit result JSON to bypass validation.**
+
+#### Stage 1 — Preview the candidate operation (no change)
+
+```bash
+PYTHONPATH=src python scripts/preview_duplicate_removal.py \
+  data/synthetic/poc_duplicate_columns.csv 2 4
+```
+
+The preview checks exact row-wise equality and identical column names. It explicitly records that semantic equivalence is **not independently verified**, and that execution remains unauthorized.
+
+#### Stage 2 — Human proposal review (first approval gate)
+
+```bash
+PYTHONPATH=src python scripts/review_proposals.py \
+  /tmp/hdq_investigation.json \
+  data/synthetic/poc_duplicate_columns.csv
+```
+
+The reviewer supplies an ID and reviews each validated proposal:
+
+- `A` = **accepted**: agree with the recommendation; **does not authorize cleaning**.
+- `R` = **rejected**: decline the recommendation.
+- `D` = **deferred**: more evidence or consideration is required.
+- `S` = skip, `Q` = quit.
+
+The reviewer may add a rationale without entering confidential subject information. The script detects previous reviews for the same dataset and proposal. Re-reviewing appends a **new** decision record; earlier history remains intact.
+
+If a qualifying `data_change` proposal is accepted, copy the printed **Decision ID** for the next stage. If the model produced only an investigation recommendation, stop here; do not attempt to authorize a deletion.
+
+Review records are written to:
+
+```text
+data/decision_memory/decisions.jsonl
+```
+
+#### Stage 3 — Separate, explicit authorization (second approval gate)
+
+Run with the **actual accepted Decision ID** displayed by the previous command; replace the placeholder, never the dataset/operation details:
+
+```bash
+PYTHONPATH=src python scripts/authorize_duplicate_removal.py \
+  data/synthetic/poc_duplicate_columns.csv \
+  data/derived/poc_cleaned.csv \
+  --keep-position 2 \
+  --drop-position 4 \
+  --decision-id YOUR_ACCEPTED_DECISION_ID
+```
+
+The program verifies the original source fingerprint, accepted current review, exact column pair, supported evidence, output path, and that the review was not superseded. It then prompts for:
+
+1. Reviewer ID.
+2. Supporting scientific documentation reference; for the synthetic fixture, inspect `data/synthetic/poc_duplicate_columns.provenance.json` first.
+3. The **exact** phrase `AUTHORIZE DROP 4 TO COPY`.
+
+On success, it prints an **Authorization ID** and **Operation ID** and records authorization in:
+
+```text
+data/decision_memory/operation_authorizations.jsonl
+```
+
+**No data is modified at authorization time.** Missing evidence, incorrect confirmation, or an outdated review must result in refusal/deferment.
+
+#### Stage 4 — Execute only the authorized operation on a copy
+
+Replace the placeholder with the actual Authorization ID:
+
+```bash
+PYTHONPATH=src python scripts/apply_duplicate_removal.py \
+  data/synthetic/poc_duplicate_columns.csv \
+  data/derived/poc_cleaned.csv \
+  --authorization-id YOUR_AUTHORIZATION_ID
+```
+
+The execution script checks that:
+
+- The authorization exists exactly once and matches the source hash, output path, operation, and positions.
+- The latest qualifying human review still authorizes the proposal; a later revocation/superseding review blocks the change.
+- The authorization/operation has not already been used (replay protection).
+- The compared columns still have identical headers and row-wise values.
+- The source cannot be overwritten, and the requested output does not already exist.
+- The derived CSV has the expected rows/cells; the source hash remains unchanged.
+
+A successful synthetic example has **80 data rows, 4 source columns, and 3 derived columns**. The script records its execution in:
+
+```text
+data/decision_memory/remediation_runs.jsonl
+```
+
+A technical cell-preservation check is **not** independent validation of scientific semantics. Follow organizational data-governance rules before any real-world deletion decision.
+
+#### Stage 5 — Independently verify the derived dataset
+
+Replace `YOUR_OPERATION_ID` with the **actual Operation ID** recorded at authorization/execution; it is not the Authorization ID.
+
+```bash
+PYTHONPATH=src python scripts/verify_remediation.py \
+  data/synthetic/poc_duplicate_columns.csv \
+  data/derived/poc_cleaned.csv \
+  data/decision_memory/remediation_runs.jsonl \
+  --operation-id YOUR_OPERATION_ID \
+  --outcome-log data/decision_memory/remediation_outcomes.jsonl
+```
+
+Verification compares source/output fingerprints to the execution audit and checks every retained CSV cell against the expected transformation. The result should report:
+
+```text
+POST-REMEDIATION VERIFICATION: PASS
+```
+
+The verified-outcome log records technical success, retained-value preservation, and `semantic_verification: "not_established"`. It explicitly records `autonomous_execution_eligible: false`.
+
+If verification fails, **do not distribute the derived output**. Inspect the failure, source/output hashes, and associated audit record; do not modify logs manually to create a passing outcome.
+
+#### Stage 6 — View the resulting artifacts
+
+| Artifact | Meaning | Source of authority |
+| --- | --- | --- |
+| `/tmp/hdq_investigation.json` | Investigation history, evidence-indexed report, proposals | Agent output + validator |
+| `decisions.jsonl` | Human recommendation reviews | Human review records |
+| `operation_authorizations.jsonl` | Explicit, scoped execution permissions | Human authorization records |
+| `data/derived/poc_cleaned.csv` | The newly generated result | Authorized transformation |
+| `remediation_runs.jsonl` | Actual operation/audit event | Execution process |
+| `remediation_outcomes.jsonl` | Independently verified technical outcome | Verification process |
+
+All `data/decision_memory/*.jsonl` records are **append-only application history**, not configuration files to edit manually.
+
+### Operate the Streamlit application
+
+**UI development lives on the `main` branch.** Keep the project clean, then switch to `main` before running or editing the latest interface:
+
+```bash
+git status --short
+git switch main
+```
+
+If you have uncommitted backend work, commit/stash it before switching. Do not use `git switch -f` or discard working changes.
+
+#### 1. Start the model service
+
+Start the local Gemma/vLLM server in terminal A and confirm `/v1/models` responds as described above.
+
+#### 2. Start Streamlit in terminal B
+
+```bash
+PYTHONPATH=src:scripts streamlit run app.py \
+  --server.address 127.0.0.1 \
+  --server.port 8501 \
+  --browser.gatherUsageStats false
+```
+
+Open:
+
+```text
+http://127.0.0.1:8501
+```
+
+The `127.0.0.1` binding is deliberate: it limits the application to local access rather than making the research-data interface accessible from another network device.
+
+#### 3. Upload a dataset
+
+The reviewed UI supports a **CSV file** and currently rejects files larger than **20 MiB**. A local preview shows column names, sample rows, row count, column count, and structural issues. This is a POC ingestion constraint, not an enterprise file-size guarantee.
+
+The application also runs a read-only LLM investigation, presents findings and proposed actions, and exposes a human review form. The newer UI has an elapsed-time spinner, but true category-by-category progress/completeness and complete permission-to-execution controls are not yet finished.
+
+#### 4. Read the current results correctly
+
+- **Structural quality findings:** Deterministic checks. A green message means no checked *header/row-width* problem was found; it does **not** certify overall dataset quality.
+- **AI Data Quality Audit:** The agent's investigation output; status may include `model_stopped` or `max_steps_reached`.
+- **Evidence-backed findings:** LLM report claims attached to actual tool evidence references.
+- **Unresolved questions:** Issues requiring more evidence, documentation, or user clarification; they are **not** necessarily data defects.
+- **Proposed actions:** Suggested investigation or data changes, with validation and uncertainty.
+- **Human review:** Record `accepted`, `rejected`, or `deferred`; this is **not** execution authorization.
+- **Previous decisions / outcomes:** Recalled history associated with the exact dataset. A previously seen dataset may have records; a new dataset may not.
+- **Detailed investigation evidence:** Tool-by-tool observations available for technical review.
+
+#### 5. What is not yet available end to end in the UI
+
+The current UI does not replace the complete terminal sequence in [Complete CLI POC](#complete-cli-poc-review-authorize-remediate-verify). In particular, the operator should **not** assume that pressing **Accept** removes any column or changes data. The UI still needs properly wired operation-specific authorization, derived-copy creation, independent verification, and downloadable audit artifacts.
+
+#### 6. Shut down cleanly
+
+Press `Ctrl+C` in the Streamlit terminal. Stop the vLLM server separately using its own startup process. Stopping the UI does not imply that model weights, review histories, or derived files are deleted.
+
+### Tests and validation
+
+#### Syntax checks (offline, no model required)
+
+```bash
+PYTHONPATH=src python -m py_compile \
+  src/healthcare_data_quality/agent_loop.py \
+  src/healthcare_data_quality/decision_memory.py \
+  src/healthcare_data_quality/remediation_validator.py \
+  scripts/run_investigation.py \
+  scripts/authorize_duplicate_removal.py \
+  scripts/apply_duplicate_removal.py \
+  scripts/verify_remediation.py
+```
+
+If working on `main`, also compile `app.py` and `workflow.py`:
+
+```bash
+PYTHONPATH=src python -m py_compile \
+  app.py src/healthcare_data_quality/workflow.py
+```
+
+#### Recent focused integration checks (reported 2026-11-13)
+
+During the `backend` → `main` integration, the project reported **10 passed** for the findings-presentation test suite after correcting an outdated species-error assertion and a singular/plural separator message. The following source checks also completed without reported errors. These results cover the inspected working tree at that time, **not** every test or the live LLM/Streamlit browser execution.
+
+```bash
+PYTHONPATH=src:scripts python -m pytest -q tests/test_finding_presentation.py
+python -m compileall -q app.py src/healthcare_data_quality scripts
+git diff --cached --check
+```
+
+For future changes, execute tests **on the branch and exact commit being documented** and record the command and result. For sandbox-related tests, the operating system must provide the required Bubblewrap/R dependencies; syntax compilation and isolated UI tests are insufficient to validate them.
+
+#### Targeted automated tests
+
+Run these **portable synthetic/mocked tests** from the repository root:
+
+```bash
+PYTHONPATH=src python tests/test_decision_memory.py
+PYTHONPATH=src python -m unittest tests/test_investigation_report.py
+PYTHONPATH=src python tests/test_apply_duplicate_removal.py
+```
+
+The last test exercises synthetic review, separate authorization, unsafe-output rejection, replay/revocation protections, derived-copy preservation, independent verification, and verified-outcome memory. These tests were exercised against the reviewed snapshot without a running model server.
+
+**Fixture-dependent test:** The reviewed version of `tests/test_remediation_validator.py` references a separately supplied local dataset under `data/` (not part of the public source archive). It will fail with `FileNotFoundError` in a clean checkout. Only run it when you have the specifically authorized local fixture, or first refactor the test to generate synthetic inputs:
+
+```bash
+# Run only if the test's required authorized local fixture exists:
+PYTHONPATH=src python tests/test_remediation_validator.py
+```
+
+Do **not** commit a confidential fixture merely to make a test pass. Converting remaining fixture-dependent tests to generated synthetic data is a reproducibility priority. The script-style tests and unittest-style tests use different entry patterns; do not assume all tests are automatically discovered in the same way. The **live investigation** does require the model server.
+
+#### Live functional smoke test (current default no-R controller)
+
+Start local Gemma/vLLM first, then:
+
+```bash
+PYTHONPATH=src python scripts/create_poc_dataset.py
+PYTHONPATH=src:scripts python scripts/run_workflow.py \
+  --input data/synthetic/poc_duplicate_columns.csv
+ls -lt data/reports/ | head
+```
+
+The historical `run_investigation.py` smoke test can still be used for legacy experiments, **not** as a no-R safety validation.
+
+For a full functional assessment, review the history, validator statuses, and expected evidence—not only a successful exit code. Record exact command, source commit, model name, observations, and outcome outside the confidential-data repository.
+
+#### Before committing code
+
+```bash
+git status --short
+git diff --check
+git diff --cached --check
+```
+
+If editing source files on Windows/WSL, use **LF line endings** to avoid CRLF-related Git whitespace warnings. `sed -i 's/\r$//' path/to/file.py` can normalize a known affected text file, but first review what will change.
+
+### Git workflow: one folder, two branches
+
+The project intentionally uses **one working directory** with two Git versions:
+
+| Branch | Purpose | Files it contains |
+| --- | --- | --- |
+| `backend` | Develop and validate the core offline Python kernel and CLI | Complete repository history; primarily change `src/`, relevant `scripts/`, tests, and shared documentation |
+| `main` | Develop the customer-facing Streamlit UI, using tested backend updates | Complete integrated application, including the backend; primarily change `app.py` and UI/integration assets |
+
+**Git branches are repository versions, not an API/client boundary.** `main` includes the backend code it needs. Do not split the code into unrelated engines or duplicate the cleaning checks in Streamlit.
+
+#### Normal backend development cycle
+
+```bash
+# Start with a clean working tree
+git status --short
+
+git switch backend
+# Edit src/, scripts/, tests/ and run appropriate CLI tests
+
+git add src/ scripts/ tests/ README.md
+git diff --cached --check
+git diff --cached --stat
+git commit -m "feat: describe tested backend change"
+git push origin backend
+```
+
+`git add` is illustrative: stage only the files actually changed and reviewed. Do **not** stage private datasets or runtime JSONL files. If no README changes were made, omit it.
+
+#### Bring tested backend changes into the Streamlit version
+
+```bash
+# Commit or stash all unfinished backend edits first
+git status --short
+git switch main
+git merge backend
+
+# Test integration and make UI changes here
+PYTHONPATH=src python -m py_compile app.py
+
+git push origin main
+```
+
+If `main` has independent commits, Git may create a merge commit or report conflicts. Review conflicts manually, especially imports and function signatures; never overwrite UI changes reflexively. **Do not develop separate implementations of the same backend rule on both branches.**
+
+#### Switching safely in one folder
+
+Always check `git status --short` before switching. Commit a coherent checkpoint or use `git stash push -m "wip: reason"` for unfinished changes. Do not use `git switch --force`, `git reset --hard`, or `git worktree add` merely to alternate between the two requested versions.
+
+#### README maintenance
+
+This README is shared documentation. Update it on `backend` for backend behavior and merge into `main`, then add UI-specific instructions on `main` when the interface changes. The two branches may temporarily describe slightly different code revisions; confirm the current branch when following version-dependent commands.
+
+### Troubleshooting
+
+#### `ModuleNotFoundError: No module named 'healthcare_data_quality'`
+
+Run from the repository root with `PYTHONPATH=src`, or export `PYTHONPATH="$PWD/src"`. Verify the correct virtual environment is active.
+
+#### `Connection refused` / local model errors / no response
+
+Verify the server process, `http://127.0.0.1:8000/v1/models`, `MODEL_URL`, and `MODEL_NAME`. A 180-second request timeout can result from slow inference or a stalled model; do not mistake the spinner for a guarantee of forward progress.
+
+#### `vLLM HTTP 400` / model context length exceeded
+
+The client rehearsal exceeded Gemma's configured 12,288-token context when producing remediation proposals. Restrict retrieved history to a relevance-selected, token-budgeted subset, summarize duplicated instruction text, cap tool-evidence excerpts, and reserve output tokens. Preserve **all evidence IDs and verifiable source records** in the persisted audit; prompt truncation must not erase evidence or create a false coverage claim. Increasing `--max-model-len` is not the first remedy on a 16 GB GPU.
+
+#### `investigate_with_r` repeatedly selected with invalid tool arguments
+
+The live agent selected `investigate_with_r` twice with invalid arguments, then ended at `no_new_action`. Treat this as a **failed investigation branch** and an unresolved coverage gap, not completed analysis. The newer default `run_workflow.py` investigation-only mode excludes this tool; further regression testing is still required for tool schemas and actionable validation feedback.
+
+#### `Incomplete generation` or JSON parsing errors
+
+The client requires a complete response with `finish_reason == "stop"`. Investigate token budget, server logs, structured-output support, and model identifier compatibility before modifying downstream validation.
+
+#### Audit says `max_steps_reached`
+
+This is the current budget, **not** a completed audit of all applicable categories. Raising `max_steps` alone is not a coverage policy. The planned controller must explicitly report category applicability, attempts, completion, evidence gaps, and unsupported checks.
+
+#### A `provenance` result says `not_available`
+
+The current provenance tool looks for a companion file matching `<dataset-stem>.provenance.json` and validates a restricted synthetic-POC format. Absence is **not** proof that the scientific dataset lacks provenance, only that this tool did not find usable evidence in its supported format.
+
+#### Agent proposes investigation instead of deletion
+
+This is often correct. Missing lineage, insufficient semantic evidence, incorrect target references, or unsupported operation types should block execution. Do not change the proposal JSON manually to force `data_change`.
+
+#### Review accepted, but cleaning did not run
+
+Expected behavior. A recommendation review is not execution authorization. Complete the separate authorization CLI with the exact current accepted decision ID and supporting documentation, then execute using the resulting Authorization ID.
+
+#### `Review decision has been superseded`
+
+A newer decision for the same dataset/proposal exists. Reevaluate and obtain authorization from the **latest** qualified review. Do not reuse the older ID.
+
+#### `Authorization already used`, existing output, or output-path mismatch
+
+These are intentional safety checks. Do not replay an authorization, redirect an output, or overwrite an existing derived file. Create a new validated operation and obtain fresh scoped permission if another run is truly required.
+
+#### Streamlit spinner shows elapsed time but not tool activity
+
+The elapsed-time indicator is useful but does not prove the model is progressing. Backend CLI progress callbacks exist; full live UI activity-event propagation and coverage-state reporting are still being refined. Treat a long period without backend events as something to diagnose through the terminal/model logs, not evidence of successful analysis.
+
+#### WSL logs `gio: http://127.0.0.1:8501: Operation not supported`
+
+Streamlit's attempt to open a browser automatically may fail in WSL. If the server announces the local URL, open `http://127.0.0.1:8501` manually in Windows Chrome. This message alone does not indicate that the web application failed.
+
+#### Git says `trailing whitespace` or displays `^M`
+
+A source file may have CRLF line endings. Normalize only the intended text files to LF, re-stage them, and rerun `git diff --cached --check`. Do not apply bulk rewrites to confidential datasets or generated artifacts.
+
+#### GitHub authentication fails on password prompt
+
+GitHub HTTPS Git operations require token-based authentication. When appropriate, use `gh auth login`, then `gh auth setup-git`; never paste GitHub credentials into source, README, or screenshots. GitHub authentication is separate from the Linux password used by `sudo`.
+
+---
+
 ## 1. Architecture: evidence → memory → model assessment → authorization → verification
 
 The system uses **three asynchronous logical agents sharing one locally hosted Gemma model** through a vLLM-compatible endpoint. Python owns authoritative source facts, permissions, transformations and final integrity checks. Gemma provides advisory reasoning, assessment and interactive planning. One model server does not imply three dedicated GPUs or guaranteed simultaneous completions.
@@ -137,150 +1050,13 @@ Exercise these invariants for every applicable finding/check type and both defau
 | Context overflow / engine crash | Bounded retry or truthful blocked state; no loss of source or approval history |
 | Export mismatch / Gemma rejection / approval change | Download blocked until exact replay, model review and artifact verification pass for current state |
 
-Run from the repository root in the project environment:
-
-```bash
-# Confirm the intended source-tree import path and current branch.
-git branch --show-current
-PYTHONPATH=src:scripts python -m compileall -q app.py src/healthcare_data_quality
-
-# Use the complete suite: new tests must be collected, not just selected older tests.
-PYTHONPATH=src:scripts python -m pytest -q --tb=short
-
-# Focused latest-patch contracts (after applying the cumulative patches).
-PYTHONPATH=src:scripts python -m pytest -q \
-  tests/test_approval_frequency_ranking_20261124.py \
-  tests/test_automatic_final_actions_20261124.py \
-  tests/test_ordered_review_and_final_model_20261124.py \
-  tests/test_exact_publication_gate_20261124.py \
-  tests/test_memory_first_recommendations_20261124.py \
-  tests/test_responsive_review_workers_20261124.py \
-  tests/test_readable_approval_origin_20261124.py \
-  --tb=short
-```
+Run the full suite and focused contracts using [Current regression commands](#current-regression-commands).
 
 **Validation status (24 November):** The latest memory-first patch was reported to pass 60 targeted tests with six previously reproduced failures. The immediately preceding verified-options publication patch reported 61 passing tests and one pre-existing failure in its selected suite. These are separate historical test selections, not additive or a current full-suite result. This README update does not rerun them. The complete cumulative suite, live Streamlit interaction, vLLM/Gemma inference, actual latency and GPU memory behavior remain to be validated. Do not claim full regression clearance or guaranteed white-screen elimination. Run the full suite and a live end-to-end review/export using a non-confidential fixture before merging into `main`.
 
 ## 6. Local development, security, and Git delivery
 
-### 6.1 Start the shared model and Streamlit application (existing WSL configuration)
-
-**Terminal A — model server (leave running):**
-
-```bash
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-source /home/xavier/.venv/bin/activate
-bash scripts/serve_gemma4.sh
-```
-
-**Terminal B — Streamlit UI (open a separate terminal):**
-
-```bash
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-source /home/xavier/.venv/bin/activate
-PYTHONPATH=src:scripts streamlit run app.py \
-  --server.address 127.0.0.1 --server.port 8501 \
-  --browser.gatherUsageStats false
-```
-
-Verify `curl -fsS http://127.0.0.1:8000/v1/models` and open `http://127.0.0.1:8501`. These are the developer's documented WSL paths, **not a universal or newly verified setup**. The Alienware RTX 5080 native-Windows deployment must use its own tested launcher; do not assume a WSL `.sh` vLLM launch works in PowerShell. Rebenchmark model throughput and memory on that device.
-
-### 6.2 Commit on `backend` in PyCharm, then push
-
-1. Copy this updated document into the project's **root `README.md`**; verify that the Git branch indicator shows **`backend`**. Preserve uncommitted working files.
-2. In PyCharm's **Commit** tool window (`Alt+0`), select reviewed tracked changes **and** the required source/test files under **Unversioned Files**. Inspect every new `src/healthcare_data_quality/**.py` dependency and relevant `tests/test_*.py` file. Include `pytest.ini` if necessary for the tested import path.
-3. **Do not indiscriminately select all unversioned files.** Temporary `tools/apply_*.py` patch installers, `.bak` launchers, scratch ZIPs, local model/data/memory files, and secrets are normally excluded unless they are intentional, reviewed project deliverables. Inspect special cases such as `tools/assets/reviewer_audit_fallback.py` for actual runtime imports before deciding.
-4. Run the full tests above, review selected diffs and test files, and check `git status --short` / `git diff --check` in the terminal. Use a coherent commit message, e.g., `feat: reconcile multi-agent reviews and strengthen audit integrity`.
-5. Click **Commit and Push…**, review the destination (normally `origin/backend`) and outgoing file list, and confirm **Push**. Alternatively, click **Commit** and later use **Git → Push** (`Ctrl+Shift+K`). Never force-push to resolve a rejection; fetch/integrate remote changes after review.
-6. After push, confirm a clean intended working tree and the new commit in **Git → Log**. Only merge `backend` into `main` after successful Streamlit integration tests and source-level conflict review.
-
-**Public-repository review:** The historical appendix retains a maintainer email address and machine-specific Windows/WSL paths. Check that you intend to publish those details before pushing to a public remote.
-
-**Privacy and reproducibility:** Keep healthcare/customer datasets, derived CSV/XLSX/ZIP packages, `memory/`, `skills/generated/`, `models/`, `.venv/`, caches, raw conversations, credentials, and local logs out of commits. Preserve prompt/model version, validation implementation version, source fingerprint, and reviewer decision lineage to support reproducibility. Local inference alone does not satisfy regulatory security requirements. To retain the generated-skills directory marker while excluding local learned content, use `skills/generated/*` and `!skills/generated/.gitkeep` in `.gitignore`. Review all new runtime imports and regression tests before committing; do not commit learned reviewer records.
-
----
-
-## Historical benchmark: Gemma 4 12B inference optimization (21 November 2026)
-
-> The measurements below are a **historical RTX 3080/WSL2 experiment** retained for reproducibility. They do not establish throughput or compatibility for the current RTX 5080 deployment, and launcher flags must be checked against the current script.
-
-
-**Measured 2026-11-21 on an NVIDIA GeForce RTX 3080 Laptop GPU (16 GiB) using WSL2 and vLLM 0.33.0.** This is a hardware-specific development benchmark, not an established optimum for the intended Alienware **RTX 5080 Laptop GPU (16 GB)**. Rebenchmark on the RTX 5080 rather than transferring the timing or FP8 compatibility conclusions.
-
-The tested Gemma checkpoint was loaded through vLLM's `compressed-tensors` quantization path. The **one local model** serves all three logical agent roles. Preserve the application request cap `HDQ_LLM_MAX_ACTIVE=3`, server concurrency **`--max-num-seqs 3`**, and minimum context **`--max-model-len 12288`**.
-
-**Tested server flags** (the final portion of `scripts/serve_gemma4.sh`):
-
-```bash
-    --max-model-len "$MODEL_LEN" \
-    --gpu-memory-utilization 0.90 \
-    --max-num-seqs 3 \
-    --model-impl vllm \
-    --kv-cache-dtype bfloat16 \
-    --async-scheduling \
-    --language-model-only
-```
-
-**Key change: remove `--enforce-eager`.** This allows vLLM to use its compiler and CUDA Graph capture on compatible operations. The actual startup log confirmed `enforce_eager=False`, `CompilationMode.VLLM_COMPILE`, `CUDAGraphMode.FULL_AND_PIECEWISE`, and completed both full and piecewise graph captures. `--model-impl vllm` selects the implementation; it is not intrinsically a speed boost. BF16 KV cache was selected for RTX 3080 compatibility, not because BF16 is always fastest.
-
-**Why CUDA Graphs can improve Gemma throughput:** Autoregressive decoding runs many similar GPU operations for each new token. Under eager execution, the CPU repeatedly issues kernel launches. `torch.compile`/vLLM compilation can optimize compatible computation and fuse eligible kernels; CUDA Graphs capture compatible GPU work and replay the execution sequence with reduced CPU launch overhead. **FULL** captures larger supported paths, whereas **PIECEWISE** covers capturable regions when a whole path is unsuitable. Capturing execution does **not** cache model answers: token values are still newly computed from each prompt and its KV cache. Asynchronous scheduling can separately reduce scheduling gaps. The tradeoffs are startup compilation/capture time and some extra GPU memory use; gains are workload dependent.
-
-**Three-request synthetic benchmark** (`scripts/test_gemma_three_way_concurrency.py --prompt-words 2000 --max-tokens 512`; all three requests returned HTTP 200 and the sampled vLLM running-request peak reached **3**):
-
-| Configuration | Three-request wall time | Measurement notes |
-| --- | ---: | --- |
-| Eager + async scheduling | 29.79 seconds | One baseline run |
-| Eager, async scheduling disabled | 30.88 seconds | One run |
-| Compiled + CUDA Graphs + async scheduling | 17.74, 11.97, 11.29 seconds | Three consecutive runs; **median 11.97 seconds** |
-
-The **11.97-second median is approximately 2.49× faster**, or about **60% less wall time**, than the single 29.79-second eager baseline. **Do not claim a causal 2.49× speedup from CUDA Graphs alone:** the optimized runs were warmed up, response token counts differed, and we have not collected equivalent repeated warm eager-mode runs. The test prompts contained approximately **2,031 tokens per request**. Successful three-way concurrency at that size does **not** prove that three near-12,288-token contexts will fit or that all application outputs remain correct.
-
-**Reproduce and verify** (the model server should remain running in Terminal A; use a second WSL terminal):
-
-```bash
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-
-# Run three simultaneous requests against the existing local vLLM server.
-python3 scripts/test_gemma_three_way_concurrency.py \
-  --prompt-words 2000 --max-tokens 512
-
-# Observe VRAM and hardware while the benchmark runs.
-nvidia-smi
-```
-
-To collect compiler/capture evidence, start the server in Terminal A with its logs saved, then inspect the log from another terminal:
-
-```bash
-bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_server.log
-# In a second terminal (after the server starts):
-grep -Ei 'enforce_eager|CompilationMode|CUDAGraphMode|Capturing CUDA graphs|Graph capturing finished' \
-  ~/gemma_server.log | tail -n 12
-```
-
-### Recovering from a vLLM engine crash
-
-`EngineDeadError` indicates that the vLLM engine exited, not that Streamlit itself caused the GPU failure. Keep the earlier engine-core traceback: the API shutdown traceback is usually secondary. The application waits for a confirmed engine outage to clear via the local `/health` endpoint before retrying a pending **read-only** inference request; it never replays a cleaning approval. Restart the model server manually while the Streamlit process remains running if you need to retain in-memory review state. The current UI performs bounded automatic recommendation recovery; persistent failures remain blocked rather than exposing routine reassessment buttons.
-
-Capture a complete local server log (logs may contain source-derived diagnostic details; review before sharing):
-
-```bash
-bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_server.log
-```
-
-If the engine crashes again, inspect the first engine-core exception above the `EngineDeadError` shutdown message. Optional diagnostic switches leave the normal three-sequence, 12,288-token, compiled/async profile unchanged:
-
-```bash
-# Isolate CUDA Graph/compiled execution; preserve three sequences.
-HDQ_ENFORCE_EAGER=1 bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_eager.log
-# Separately isolate asynchronous scheduling (default CUDA Graph profile).
-HDQ_ASYNC_SCHEDULING=0 bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_sync.log
-```
-
-`HDQ_GPU_MEMORY_UTILIZATION` can override the default `0.90` if the original traceback identifies GPU memory pressure. Lowering it may also leave insufficient KV cache to start the model; it is not a universal crash fix. Do not lower context or sequence limits by default. These switches are diagnostic options, not proof that CUDA graphs, scheduling, or memory caused the failure.
-
-For a controlled A/B comparison, benchmark **both** eager and compiled configurations with the same GPU, checkpoint, precision, three-sequence limit, 12,288-token context, representative prompt/output settings, warm-up policy, and multiple repetitions. Inspect response completion status, generated-token counts, VRAM, KV-cache preemptions, timeouts, structured JSON validity, and actual A/B/C source-grounded edit proposals. Do not use synthetic completion time as a substitute for application correctness or long-context reliability.
-
-**Hardware and rollback notes:** On the RTX 3080 (compute capability 8.6), `--kv-cache-dtype fp8` failed during initialization because vLLM's selected Triton attention backend required SM89+ for native FP8; `--kv-cache-dtype bfloat16` started successfully. This does not determine FP8 support on the RTX 5080 or with another backend. There is no need to install an extra system-wide CUDA Toolkit or cuDNN merely to enable graph capture in the already-working vLLM environment. If graph compilation/capture fails or causes memory pressure, temporarily restore `--enforce-eager` as a diagnostic rollback, retaining the required **three concurrent sequences** and context.
+See the front-loaded [developer terminal commands and actions](#0-developer-terminal-commands-and-actions--start-here) for the current split-machine deployment, local fallback, network security, tests and Git workflow.
 
 ---
 
@@ -343,7 +1119,7 @@ The project's five original objectives remain:
 7. Write a new derived dataset without overwriting the original; independently verify retained values and write an audit record.
 8. Preserve decision and outcome history to inform future investigations without silently granting future permissions.
 
-Steps 2, 4, 6, and 7 are **only partially connected in the current UI**; use the CLI instructions below for the working authorization/remediation POC.
+Steps 2, 4, 6, and 7 are **only partially connected in the current UI**; see the archived [CLI instructions](#complete-cli-poc-review-authorize-remediate-verify) at the front for the historical authorization/remediation POC.
 
 ## Core design principles
 
@@ -799,400 +1575,6 @@ healthcare-data-quality-llm/
 
 The local model files, Python virtual environment, caches, uploaded research data, and output histories are operational assets—not code to publish.
 
-## Prerequisites and installation
-
-### Recommended development environment
-
-- Windows with **WSL2 / Ubuntu** or an equivalent Linux installation.
-- Python **3.12** in a virtual environment (the development environment demonstrated with WSL used Python 3.12; verify package compatibility if using another version).
-- NVIDIA GPU and compatible driver/CUDA environment for the selected **local vLLM** model server; actual model requirements depend on the model/quantization.
-- A running local OpenAI-compatible chat-completions endpoint.
-- Git; GitHub CLI (`gh`) is optional for local development but convenient for publishing branches.
-- `jsonschema` for tool argument validation; `streamlit` and `pandas` for the UI. Other local inference dependencies are part of your separately managed model-server environment.
-
-> The reviewed source snapshot does **not** include a pinned `requirements.txt` or `pyproject.toml`; therefore the command below installs the identified direct application dependencies but is **not** a complete reproducible lockfile. Create and pin one before wider distribution.
-
-### 1. Open the correct project directory
-
-In WSL:
-
-```bash
-cd /mnt/c/Users/Xavier/PycharmProjects/healthcare-data-quality-llm
-pwd
-git branch --show-current
-```
-
-Replace the path with your own clone path on another computer. All subsequent relative paths assume the **repository root** is the current directory.
-
-### 2. Activate the project environment
-
-If your existing virtual environment is already configured, activate it rather than creating another:
-
-```bash
-source /home/xavier/.venv/bin/activate
-python --version
-```
-
-For a new, isolated environment, an alternative is:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-```
-
-Install the identified Python application dependencies if they are absent:
-
-```bash
-python -m pip install jsonschema pandas streamlit
-```
-
-For a production-quality setup, dependency versions and GPU-model dependencies need to be locked and tested. `python -m pip install -e .` is **not** documented because no verified packaging manifest exists in the reviewed snapshot.
-
-### 3. Run from the repository root with the source path configured
-
-The project uses the `src/` layout. For individual commands, prefix with:
-
-```bash
-PYTHONPATH=src python ...
-```
-
-Or export it for the current shell session:
-
-```bash
-export PYTHONPATH="$PWD/src"
-```
-
-This ensures imports such as `healthcare_data_quality.agent_loop` resolve correctly.
-
-## Start and verify the local LLM
-
-All model-assisted operations require the **separately running** local model service. The reviewed backend client configuration is:
-
-| Setting | Value in inspected `llm_client.py` |
-| --- | --- |
-| Chat-completions URL | `http://127.0.0.1:8000/v1/chat/completions` |
-| Model identifier | `gemma4-12b` |
-| Inference protocol | OpenAI-compatible HTTP JSON |
-| Sampling temperature | `0` |
-| Default `query_local_model(..., max_tokens=...)` | `4096` generated tokens; callers may override (for example, small structured decisions) |
-| HTTP timeout per request | `600` seconds |
-
-The API is configured in `src/healthcare_data_quality/llm_client.py`. If your server publishes a different model identifier, **make the client and server names consistent**. The code expects the returned message to end with `finish_reason == "stop"`; an incomplete generation causes an error.
-
-### Start the existing local server
-
-Use your already configured vLLM serving procedure in **terminal A**. `scripts/serve_gemma4.sh` was present in a later reviewed source archive, although its exact model path and GPU settings must be verified against the live checkout. Review that script locally before running it. For the measured November 21 vLLM/CUDA Graphs configuration and its benchmark caveats, see [Gemma 4 12B inference optimization](#gemma-4-12b-inference-optimization).
-
-### Check endpoint accessibility
-
-In **terminal B**:
-
-```bash
-curl -fsS http://127.0.0.1:8000/v1/models
-```
-
-Confirm that the model service is reachable and that its configured model ID matches the client. A successful `/v1/models` response confirms endpoint reachability, **not** that every structured-output generation will work.
-
-If the endpoint is unavailable, do not troubleshoot the agent first—start or repair the local model server.
-
-### Offline requirement
-
-Model inference is designed to use loopback networking only. Initial installation/model downloads may require Internet access; **normal inference must not depend on an external LLM API**. Do not expose the local LLM service publicly by changing its binding address without appropriate security controls.
-
-## Quick start: exploratory investigation in the terminal
-
-> **Historical entry-point note:** the earlier `scripts/run_investigation.py` examples below document legacy exploratory behavior. For the latest demonstrated investigation-only CLI, prefer `PYTHONPATH=src:scripts python scripts/run_workflow.py --input /path/to/dataset.csv --interactive` (without `--enable-remediation`). See the system-design section for its current limitations.
-
-This is the preferred path for developing and testing the backend kernel.
-
-### 1. Generate an entirely synthetic test dataset
-
-```bash
-PYTHONPATH=src python scripts/create_poc_dataset.py
-```
-
-The generator creates:
-
-- `data/synthetic/poc_duplicate_columns.csv`: 80 synthetic records and 4 columns.
-- `data/synthetic/poc_duplicate_columns.provenance.json`: synthetic lineage evidence bound to the CSV SHA-256 hash.
-- A duplicate `Score` column pair at **1-based positions 2 and 4**.
-
-The companion provenance document records that both columns were generated from the same underlying synthetic score variable. This is **not** a template for making unsupported claims about real research data.
-
-**Important:** Regenerating the fixture may change data files or fingerprints if the generator changes. Existing approvals are tied to specific source content. Do not reuse an authorization against a changed dataset.
-
-### 2. Inspect CSV structure without the LLM
-
-```bash
-PYTHONPATH=src python src/healthcare_data_quality/ingestion.py \
-  data/synthetic/poc_duplicate_columns.csv
-```
-
-This inspects column headers, row widths, blank header positions, and repeated header names; it does **not** remove columns or require inference.
-
-Optional deeper profiling:
-
-```bash
-PYTHONPATH=src python src/healthcare_data_quality/dataset_profiler.py \
-  data/synthetic/poc_duplicate_columns.csv
-```
-
-### 3. Run the legacy exploratory investigation (not the default strict no-R mode)
-
-Start the local LLM first, then:
-
-```bash
-PYTHONPATH=src python scripts/run_investigation.py \
-  data/synthetic/poc_duplicate_columns.csv \
-  > /tmp/hdq_investigation.json
-```
-
-The CLI emits agent progress to **stderr** (visible in the terminal), preserving machine-readable JSON on **stdout** (redirected to the file). Depending on the model's decisions you may see progress resembling:
-
-```text
-[Agent] Profiling dataset structure...
-[Agent] Dataset profiling completed.
-[Agent] Step 1/4: Gemma is selecting the next investigation tool...
-[Agent] Step 1/4: Running compare_columns...
-[Agent] Step 1/4: compare_columns completed; observations recorded.
-...
-[Agent] Investigation ended: model_stopped
-```
-
-Tool names, action order, and termination status vary. Common stop statuses include `model_stopped`, `max_steps_reached`, `no_new_action`, and `tools_exhausted`. **`max_steps_reached` is not evidence of a comprehensive audit.**
-
-### 4. Validate the output JSON
-
-```bash
-python -m json.tool /tmp/hdq_investigation.json > /dev/null \
-  && echo "INVESTIGATION JSON: PASS"
-```
-
-Inspect the full artifact:
-
-```bash
-python -m json.tool /tmp/hdq_investigation.json | less
-```
-
-The investigation artifact normally contains `status`, `history`, `report`, `ingestion`, and `remediation.proposals`. Each tool-history item records the tool, arguments, reason, and observations.
-
-To inspect only the proposals:
-
-```bash
-python -c 'import json; d=json.load(open("/tmp/hdq_investigation.json")); print(json.dumps(d.get("remediation", {}).get("proposals", []), indent=2))'
-```
-
-> A valid JSON file is **not** proof that every claim, proposed operation, or dataset-quality category has been validated. Use the validator status and underlying tool evidence.
-
-## Complete CLI POC: review, authorize, remediate, verify
-
-This section documents the existing safe, *narrow* executable path. Use the **synthetic test fixture** and only proceed if the agent produced a qualifying `data_change` proposal with the exact expected operation and target. An `investigation` proposal cannot be substituted for a data-change approval.
-
-### Stage 0 — Confirm prerequisites and choose output paths
-
-The source must be the exact dataset used for investigation and review. Use a **new output filename** because the remediation code refuses to overwrite an existing output.
-
-```text
-SOURCE  = data/synthetic/poc_duplicate_columns.csv
-OUTPUT  = data/derived/poc_cleaned.csv
-KEEP    = 2
-REMOVE  = 4
-```
-
-Inspect the generated proposal for:
-
-- `action_kind: "data_change"`;
-- `operation.kind: "drop_duplicate_column"`;
-- `operation.keep_position: 2` and `operation.drop_position: 4`;
-- matching `target_ref.positions: [2, 4]`;
-- verified facts and `validation.status: "needs_human_review"`;
-- `execution_authorized: false` (normal before separate approval).
-
-The current deterministic validator authorizes this **proposal type for review** only when the tool history supports both identical columns and matching **synthetic-fixture** lineage. A real customer dataset with no recognized provenance may correctly receive an investigation recommendation rather than an executable change proposal. **Do not forge lineage files or hand-edit result JSON to bypass validation.**
-
-### Stage 1 — Preview the candidate operation (no change)
-
-```bash
-PYTHONPATH=src python scripts/preview_duplicate_removal.py \
-  data/synthetic/poc_duplicate_columns.csv 2 4
-```
-
-The preview checks exact row-wise equality and identical column names. It explicitly records that semantic equivalence is **not independently verified**, and that execution remains unauthorized.
-
-### Stage 2 — Human proposal review (first approval gate)
-
-```bash
-PYTHONPATH=src python scripts/review_proposals.py \
-  /tmp/hdq_investigation.json \
-  data/synthetic/poc_duplicate_columns.csv
-```
-
-The reviewer supplies an ID and reviews each validated proposal:
-
-- `A` = **accepted**: agree with the recommendation; **does not authorize cleaning**.
-- `R` = **rejected**: decline the recommendation.
-- `D` = **deferred**: more evidence or consideration is required.
-- `S` = skip, `Q` = quit.
-
-The reviewer may add a rationale without entering confidential subject information. The script detects previous reviews for the same dataset and proposal. Re-reviewing appends a **new** decision record; earlier history remains intact.
-
-If a qualifying `data_change` proposal is accepted, copy the printed **Decision ID** for the next stage. If the model produced only an investigation recommendation, stop here; do not attempt to authorize a deletion.
-
-Review records are written to:
-
-```text
-data/decision_memory/decisions.jsonl
-```
-
-### Stage 3 — Separate, explicit authorization (second approval gate)
-
-Run with the **actual accepted Decision ID** displayed by the previous command; replace the placeholder, never the dataset/operation details:
-
-```bash
-PYTHONPATH=src python scripts/authorize_duplicate_removal.py \
-  data/synthetic/poc_duplicate_columns.csv \
-  data/derived/poc_cleaned.csv \
-  --keep-position 2 \
-  --drop-position 4 \
-  --decision-id YOUR_ACCEPTED_DECISION_ID
-```
-
-The program verifies the original source fingerprint, accepted current review, exact column pair, supported evidence, output path, and that the review was not superseded. It then prompts for:
-
-1. Reviewer ID.
-2. Supporting scientific documentation reference; for the synthetic fixture, inspect `data/synthetic/poc_duplicate_columns.provenance.json` first.
-3. The **exact** phrase `AUTHORIZE DROP 4 TO COPY`.
-
-On success, it prints an **Authorization ID** and **Operation ID** and records authorization in:
-
-```text
-data/decision_memory/operation_authorizations.jsonl
-```
-
-**No data is modified at authorization time.** Missing evidence, incorrect confirmation, or an outdated review must result in refusal/deferment.
-
-### Stage 4 — Execute only the authorized operation on a copy
-
-Replace the placeholder with the actual Authorization ID:
-
-```bash
-PYTHONPATH=src python scripts/apply_duplicate_removal.py \
-  data/synthetic/poc_duplicate_columns.csv \
-  data/derived/poc_cleaned.csv \
-  --authorization-id YOUR_AUTHORIZATION_ID
-```
-
-The execution script checks that:
-
-- The authorization exists exactly once and matches the source hash, output path, operation, and positions.
-- The latest qualifying human review still authorizes the proposal; a later revocation/superseding review blocks the change.
-- The authorization/operation has not already been used (replay protection).
-- The compared columns still have identical headers and row-wise values.
-- The source cannot be overwritten, and the requested output does not already exist.
-- The derived CSV has the expected rows/cells; the source hash remains unchanged.
-
-A successful synthetic example has **80 data rows, 4 source columns, and 3 derived columns**. The script records its execution in:
-
-```text
-data/decision_memory/remediation_runs.jsonl
-```
-
-A technical cell-preservation check is **not** independent validation of scientific semantics. Follow organizational data-governance rules before any real-world deletion decision.
-
-### Stage 5 — Independently verify the derived dataset
-
-Replace `YOUR_OPERATION_ID` with the **actual Operation ID** recorded at authorization/execution; it is not the Authorization ID.
-
-```bash
-PYTHONPATH=src python scripts/verify_remediation.py \
-  data/synthetic/poc_duplicate_columns.csv \
-  data/derived/poc_cleaned.csv \
-  data/decision_memory/remediation_runs.jsonl \
-  --operation-id YOUR_OPERATION_ID \
-  --outcome-log data/decision_memory/remediation_outcomes.jsonl
-```
-
-Verification compares source/output fingerprints to the execution audit and checks every retained CSV cell against the expected transformation. The result should report:
-
-```text
-POST-REMEDIATION VERIFICATION: PASS
-```
-
-The verified-outcome log records technical success, retained-value preservation, and `semantic_verification: "not_established"`. It explicitly records `autonomous_execution_eligible: false`.
-
-If verification fails, **do not distribute the derived output**. Inspect the failure, source/output hashes, and associated audit record; do not modify logs manually to create a passing outcome.
-
-### Stage 6 — View the resulting artifacts
-
-| Artifact | Meaning | Source of authority |
-| --- | --- | --- |
-| `/tmp/hdq_investigation.json` | Investigation history, evidence-indexed report, proposals | Agent output + validator |
-| `decisions.jsonl` | Human recommendation reviews | Human review records |
-| `operation_authorizations.jsonl` | Explicit, scoped execution permissions | Human authorization records |
-| `data/derived/poc_cleaned.csv` | The newly generated result | Authorized transformation |
-| `remediation_runs.jsonl` | Actual operation/audit event | Execution process |
-| `remediation_outcomes.jsonl` | Independently verified technical outcome | Verification process |
-
-All `data/decision_memory/*.jsonl` records are **append-only application history**, not configuration files to edit manually.
-
-## Operate the Streamlit application
-
-**UI development lives on the `main` branch.** Keep the project clean, then switch to `main` before running or editing the latest interface:
-
-```bash
-git status --short
-git switch main
-```
-
-If you have uncommitted backend work, commit/stash it before switching. Do not use `git switch -f` or discard working changes.
-
-### 1. Start the model service
-
-Start the local Gemma/vLLM server in terminal A and confirm `/v1/models` responds as described above.
-
-### 2. Start Streamlit in terminal B
-
-```bash
-PYTHONPATH=src:scripts streamlit run app.py \
-  --server.address 127.0.0.1 \
-  --server.port 8501 \
-  --browser.gatherUsageStats false
-```
-
-Open:
-
-```text
-http://127.0.0.1:8501
-```
-
-The `127.0.0.1` binding is deliberate: it limits the application to local access rather than making the research-data interface accessible from another network device.
-
-### 3. Upload a dataset
-
-The reviewed UI supports a **CSV file** and currently rejects files larger than **20 MiB**. A local preview shows column names, sample rows, row count, column count, and structural issues. This is a POC ingestion constraint, not an enterprise file-size guarantee.
-
-The application also runs a read-only LLM investigation, presents findings and proposed actions, and exposes a human review form. The newer UI has an elapsed-time spinner, but true category-by-category progress/completeness and complete permission-to-execution controls are not yet finished.
-
-### 4. Read the current results correctly
-
-- **Structural quality findings:** Deterministic checks. A green message means no checked *header/row-width* problem was found; it does **not** certify overall dataset quality.
-- **AI Data Quality Audit:** The agent's investigation output; status may include `model_stopped` or `max_steps_reached`.
-- **Evidence-backed findings:** LLM report claims attached to actual tool evidence references.
-- **Unresolved questions:** Issues requiring more evidence, documentation, or user clarification; they are **not** necessarily data defects.
-- **Proposed actions:** Suggested investigation or data changes, with validation and uncertainty.
-- **Human review:** Record `accepted`, `rejected`, or `deferred`; this is **not** execution authorization.
-- **Previous decisions / outcomes:** Recalled history associated with the exact dataset. A previously seen dataset may have records; a new dataset may not.
-- **Detailed investigation evidence:** Tool-by-tool observations available for technical review.
-
-### 5. What is not yet available end to end in the UI
-
-The current UI does not replace the complete terminal sequence in [Complete CLI POC](#complete-cli-poc-review-authorize-remediate-verify). In particular, the operator should **not** assume that pressing **Accept** removes any column or changes data. The UI still needs properly wired operation-specific authorization, derived-copy creation, independent verification, and downloadable audit artifacts.
-
-### 6. Shut down cleanly
-
-Press `Ctrl+C` in the Streamlit terminal. Stop the vLLM server separately using its own startup process. Stopping the UI does not imply that model weights, review histories, or derived files are deleted.
-
 ## Understanding the investigation results
 
 ### Evidence identifiers
@@ -1335,139 +1717,6 @@ Memory records may contain reviewer identifiers, notes, and dataset fingerprints
 
 For a user-supplied dataset, a suitable workflow should first identify structural type, applicable checks, data dictionary availability, and expected relationships. There is currently no guarantee that arbitrary uploaded datasets receive every relevant check or that all uncertainties can be resolved without human input.
 
-## Tests and validation
-
-### Syntax checks (offline, no model required)
-
-```bash
-PYTHONPATH=src python -m py_compile \
-  src/healthcare_data_quality/agent_loop.py \
-  src/healthcare_data_quality/decision_memory.py \
-  src/healthcare_data_quality/remediation_validator.py \
-  scripts/run_investigation.py \
-  scripts/authorize_duplicate_removal.py \
-  scripts/apply_duplicate_removal.py \
-  scripts/verify_remediation.py
-```
-
-If working on `main`, also compile `app.py` and `workflow.py`:
-
-```bash
-PYTHONPATH=src python -m py_compile \
-  app.py src/healthcare_data_quality/workflow.py
-```
-
-### Recent focused integration checks (reported 2026-11-13)
-
-During the `backend` → `main` integration, the project reported **10 passed** for the findings-presentation test suite after correcting an outdated species-error assertion and a singular/plural separator message. The following source checks also completed without reported errors. These results cover the inspected working tree at that time, **not** every test or the live LLM/Streamlit browser execution.
-
-```bash
-PYTHONPATH=src:scripts python -m pytest -q tests/test_finding_presentation.py
-python -m compileall -q app.py src/healthcare_data_quality scripts
-git diff --cached --check
-```
-
-For future changes, execute tests **on the branch and exact commit being documented** and record the command and result. For sandbox-related tests, the operating system must provide the required Bubblewrap/R dependencies; syntax compilation and isolated UI tests are insufficient to validate them.
-
-### Targeted automated tests
-
-Run these **portable synthetic/mocked tests** from the repository root:
-
-```bash
-PYTHONPATH=src python tests/test_decision_memory.py
-PYTHONPATH=src python -m unittest tests/test_investigation_report.py
-PYTHONPATH=src python tests/test_apply_duplicate_removal.py
-```
-
-The last test exercises synthetic review, separate authorization, unsafe-output rejection, replay/revocation protections, derived-copy preservation, independent verification, and verified-outcome memory. These tests were exercised against the reviewed snapshot without a running model server.
-
-**Fixture-dependent test:** The reviewed version of `tests/test_remediation_validator.py` references a separately supplied local dataset under `data/` (not part of the public source archive). It will fail with `FileNotFoundError` in a clean checkout. Only run it when you have the specifically authorized local fixture, or first refactor the test to generate synthetic inputs:
-
-```bash
-# Run only if the test's required authorized local fixture exists:
-PYTHONPATH=src python tests/test_remediation_validator.py
-```
-
-Do **not** commit a confidential fixture merely to make a test pass. Converting remaining fixture-dependent tests to generated synthetic data is a reproducibility priority. The script-style tests and unittest-style tests use different entry patterns; do not assume all tests are automatically discovered in the same way. The **live investigation** does require the model server.
-
-### Live functional smoke test (current default no-R controller)
-
-Start local Gemma/vLLM first, then:
-
-```bash
-PYTHONPATH=src python scripts/create_poc_dataset.py
-PYTHONPATH=src:scripts python scripts/run_workflow.py \
-  --input data/synthetic/poc_duplicate_columns.csv
-ls -lt data/reports/ | head
-```
-
-The historical `run_investigation.py` smoke test can still be used for legacy experiments, **not** as a no-R safety validation.
-
-For a full functional assessment, review the history, validator statuses, and expected evidence—not only a successful exit code. Record exact command, source commit, model name, observations, and outcome outside the confidential-data repository.
-
-### Before committing code
-
-```bash
-git status --short
-git diff --check
-git diff --cached --check
-```
-
-If editing source files on Windows/WSL, use **LF line endings** to avoid CRLF-related Git whitespace warnings. `sed -i 's/\r$//' path/to/file.py` can normalize a known affected text file, but first review what will change.
-
-## Git workflow: one folder, two branches
-
-The project intentionally uses **one working directory** with two Git versions:
-
-| Branch | Purpose | Files it contains |
-| --- | --- | --- |
-| `backend` | Develop and validate the core offline Python kernel and CLI | Complete repository history; primarily change `src/`, relevant `scripts/`, tests, and shared documentation |
-| `main` | Develop the customer-facing Streamlit UI, using tested backend updates | Complete integrated application, including the backend; primarily change `app.py` and UI/integration assets |
-
-**Git branches are repository versions, not an API/client boundary.** `main` includes the backend code it needs. Do not split the code into unrelated engines or duplicate the cleaning checks in Streamlit.
-
-### Normal backend development cycle
-
-```bash
-# Start with a clean working tree
-git status --short
-
-git switch backend
-# Edit src/, scripts/, tests/ and run appropriate CLI tests
-
-git add src/ scripts/ tests/ README.md
-git diff --cached --check
-git diff --cached --stat
-git commit -m "feat: describe tested backend change"
-git push origin backend
-```
-
-`git add` is illustrative: stage only the files actually changed and reviewed. Do **not** stage private datasets or runtime JSONL files. If no README changes were made, omit it.
-
-### Bring tested backend changes into the Streamlit version
-
-```bash
-# Commit or stash all unfinished backend edits first
-git status --short
-git switch main
-git merge backend
-
-# Test integration and make UI changes here
-PYTHONPATH=src python -m py_compile app.py
-
-git push origin main
-```
-
-If `main` has independent commits, Git may create a merge commit or report conflicts. Review conflicts manually, especially imports and function signatures; never overwrite UI changes reflexively. **Do not develop separate implementations of the same backend rule on both branches.**
-
-### Switching safely in one folder
-
-Always check `git status --short` before switching. Commit a coherent checkpoint or use `git stash push -m "wip: reason"` for unfinished changes. Do not use `git switch --force`, `git reset --hard`, or `git worktree add` merely to alternate between the two requested versions.
-
-### README maintenance
-
-This README is shared documentation. Update it on `backend` for backend behavior and merge into `main`, then add UI-specific instructions on `main` when the interface changes. The two branches may temporarily describe slightly different code revisions; confirm the current branch when following version-dependent commands.
-
 ## Data privacy, security, and operational safeguards
 
 1. **Never commit confidential research or patient datasets.** The repository is intended for source code and synthetic or explicitly authorized samples.
@@ -1482,68 +1731,6 @@ This README is shared documentation. Update it on `backend` for backend behavior
 10. **Data governance before production:** Organizational approvals, access controls, retention/deletion policy, software validation, backups, monitoring, incident response, and a threat model are still required.
 
 The present project does **not** claim HIPAA certification, HIPAA compliance by default, clinical validation, security certification, or safe autonomous operation on confidential institutional datasets.
-
-## Troubleshooting
-
-### `ModuleNotFoundError: No module named 'healthcare_data_quality'`
-
-Run from the repository root with `PYTHONPATH=src`, or export `PYTHONPATH="$PWD/src"`. Verify the correct virtual environment is active.
-
-### `Connection refused` / local model errors / no response
-
-Verify the server process, `http://127.0.0.1:8000/v1/models`, `MODEL_URL`, and `MODEL_NAME`. A 180-second request timeout can result from slow inference or a stalled model; do not mistake the spinner for a guarantee of forward progress.
-
-### `vLLM HTTP 400` / model context length exceeded
-
-The client rehearsal exceeded Gemma's configured 12,288-token context when producing remediation proposals. Restrict retrieved history to a relevance-selected, token-budgeted subset, summarize duplicated instruction text, cap tool-evidence excerpts, and reserve output tokens. Preserve **all evidence IDs and verifiable source records** in the persisted audit; prompt truncation must not erase evidence or create a false coverage claim. Increasing `--max-model-len` is not the first remedy on a 16 GB GPU.
-
-### `investigate_with_r` repeatedly selected with invalid tool arguments
-
-The live agent selected `investigate_with_r` twice with invalid arguments, then ended at `no_new_action`. Treat this as a **failed investigation branch** and an unresolved coverage gap, not completed analysis. The newer default `run_workflow.py` investigation-only mode excludes this tool; further regression testing is still required for tool schemas and actionable validation feedback.
-
-### `Incomplete generation` or JSON parsing errors
-
-The client requires a complete response with `finish_reason == "stop"`. Investigate token budget, server logs, structured-output support, and model identifier compatibility before modifying downstream validation.
-
-### Audit says `max_steps_reached`
-
-This is the current budget, **not** a completed audit of all applicable categories. Raising `max_steps` alone is not a coverage policy. The planned controller must explicitly report category applicability, attempts, completion, evidence gaps, and unsupported checks.
-
-### A `provenance` result says `not_available`
-
-The current provenance tool looks for a companion file matching `<dataset-stem>.provenance.json` and validates a restricted synthetic-POC format. Absence is **not** proof that the scientific dataset lacks provenance, only that this tool did not find usable evidence in its supported format.
-
-### Agent proposes investigation instead of deletion
-
-This is often correct. Missing lineage, insufficient semantic evidence, incorrect target references, or unsupported operation types should block execution. Do not change the proposal JSON manually to force `data_change`.
-
-### Review accepted, but cleaning did not run
-
-Expected behavior. A recommendation review is not execution authorization. Complete the separate authorization CLI with the exact current accepted decision ID and supporting documentation, then execute using the resulting Authorization ID.
-
-### `Review decision has been superseded`
-
-A newer decision for the same dataset/proposal exists. Reevaluate and obtain authorization from the **latest** qualified review. Do not reuse the older ID.
-
-### `Authorization already used`, existing output, or output-path mismatch
-
-These are intentional safety checks. Do not replay an authorization, redirect an output, or overwrite an existing derived file. Create a new validated operation and obtain fresh scoped permission if another run is truly required.
-
-### Streamlit spinner shows elapsed time but not tool activity
-
-The elapsed-time indicator is useful but does not prove the model is progressing. Backend CLI progress callbacks exist; full live UI activity-event propagation and coverage-state reporting are still being refined. Treat a long period without backend events as something to diagnose through the terminal/model logs, not evidence of successful analysis.
-
-### WSL logs `gio: http://127.0.0.1:8501: Operation not supported`
-
-Streamlit's attempt to open a browser automatically may fail in WSL. If the server announces the local URL, open `http://127.0.0.1:8501` manually in Windows Chrome. This message alone does not indicate that the web application failed.
-
-### Git says `trailing whitespace` or displays `^M`
-
-A source file may have CRLF line endings. Normalize only the intended text files to LF, re-stage them, and rerun `git diff --cached --check`. Do not apply bulk rewrites to confidential datasets or generated artifacts.
-
-### GitHub authentication fails on password prompt
-
-GitHub HTTPS Git operations require token-based authentication. When appropriate, use `gh auth login`, then `gh auth setup-git`; never paste GitHub credentials into source, README, or screenshots. GitHub authentication is separate from the Linux password used by `sudo`.
 
 ## Development roadmap and acceptance criteria
 
