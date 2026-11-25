@@ -60,6 +60,7 @@ def _reviewed(status: str) -> bool:
 def _approval_ledger_matches_stage(
     sources: list[Path], staged: dict, columns: dict, rows: dict,
     history: list[dict], statuses: dict, titles: dict[str, str],
+    *, review_decisions: list[dict] | None = None,
 ) -> None:
     """Replay EXACT approved before/after values; structural events must match approvals.
 
@@ -123,7 +124,7 @@ def _approval_ledger_matches_stage(
                 # same immutable source while leaving `replay` unchanged.
                 flags = event.get('flags')
                 if (positions != [] or not isinstance(flags, list)
-                        or not flags or len(flags) > 50
+                        or not flags or len(flags) > 20000
                         or event.get('changes') != len(flags)):
                     raise PermissionError('Visual flag approval lacks exact source-bound targets')
                 unique = set()
@@ -131,9 +132,10 @@ def _approval_ledger_matches_stage(
                     if not isinstance(flag, dict):
                         raise PermissionError('Malformed visual flag target')
                     r, c = flag.get('row'), flag.get('column')
-                    if (type(r) is not int or type(c) is not int or c != 1
+                    if (type(r) is not int or type(c) is not int or not 1 <= c <= len(initial[0])
                             or r < 2 or r > len(initial)
                             or (r, c) in unique or flag.get('style') != 'bold_red'
+                            or type(flag.get('fill', True)) is not bool
                             or flag.get('before') != initial[r - 1][c - 1]):
                         raise PermissionError('Visual flag target does not match the original CSV')
                     unique.add((r, c))
@@ -165,12 +167,14 @@ def _approval_ledger_matches_stage(
                                (c.get('row'), c.get('source_row')) for c in item.get('changes', [])))] += 1
     if expected_columns != actual_columns or expected_rows != actual_rows:
         raise PermissionError('Export-only row or column operations lack matching approvals')
+    from .resolved_review_integrity import verified_prior_review_closures
+    verified_prior_review_closures(sources, rows, history, statuses, review_decisions)
     for fid, status in statuses.items():
         if not _reviewed(status) or fid not in titles:
             raise PermissionError('Review status does not belong to a known finding')
-        if status != 'Reviewed — no change' and not any(
+        if status not in {'Reviewed — no change', 'Resolved by earlier approved edit'} and not any(
                 e.get('finding_id') == fid for e in history):
-            raise PermissionError('Completed finding status lacks an approved operation')
+            raise PermissionError(f'Completed finding status lacks an approved operation: {fid}')
 
 
 def _checked_audits(audits: dict, statuses: dict) -> dict:
@@ -195,6 +199,7 @@ def save_approved_stage(
     sources: list[Path], staged: dict, columns: dict, rows: dict,
     history: list[dict], statuses: dict, reviewer: str, titles: dict[str, str],
     *, completed_audits: dict | None = None,
+    review_decisions: list[dict] | None = None,
 ) -> Path | None:
     """Persist only completed researcher decisions; no original CSV is saved.
 
@@ -260,13 +265,18 @@ def save_approved_stage(
         if ds_id not in datasets or event.get('source_sha256') != datasets[ds_id]['source_sha256']:
             raise PermissionError('Approval history does not match the original dataset')
     _approval_ledger_matches_stage(
-        sources, staged, columns, rows, relevant_history, safe_statuses, titles)
+        sources, staged, columns, rows, relevant_history, safe_statuses, titles,
+        review_decisions=review_decisions)
+    from .resolved_review_integrity import verified_prior_review_closures
+    resolution_proofs = verified_prior_review_closures(
+        sources, rows, relevant_history, safe_statuses, review_decisions)
     audits = _checked_audits(completed_audits or {}, safe_statuses)
     checkpoint = {
         'version': _VERSION,
         'source_hashes': hashes,
         'datasets': datasets,
         'history': relevant_history,
+        'resolution_proofs': resolution_proofs,
         'audits': audits,
         'audits_sha256': sha256(json.dumps(audits, ensure_ascii=False, sort_keys=True,
                                           separators=(',', ':')).encode('utf-8')).hexdigest(),
@@ -549,7 +559,10 @@ def verify_and_reconstruct(checkpoint: dict, sources: list[Path],
                 or event.get('source_sha256') != dataset_records[ds_id]['source_sha256']
                 or event.get('finding_id') not in finding_titles):
             raise PermissionError('Saved approval cannot be matched to this investigation')
-    _approval_ledger_matches_stage(sources, staged, cols, rows, history, statuses, finding_titles)
+    proofs = checkpoint.get('resolution_proofs', [])
+    _approval_ledger_matches_stage(
+        sources, staged, cols, rows, history, statuses, finding_titles,
+        review_decisions=proofs)
     visual_flags = {}
     for event in history:
         if event.get('operation') != 'flag_cells':
@@ -566,6 +579,7 @@ def verify_and_reconstruct(checkpoint: dict, sources: list[Path],
         'cleaning_approved_columns_by_dataset': cols,
         'cleaning_approved_rows_by_dataset': rows,
         'cleaning_history': history,
+        'cleaning_decisions': proofs,
         'cleaning_review_statuses': statuses,
         'cleaning_approved_reviewer': str(checkpoint.get('reviewer') or ''),
     }

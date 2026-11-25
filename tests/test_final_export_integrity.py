@@ -155,10 +155,13 @@ def test_review_label_does_not_describe_annotation_as_correction():
     root = Path(__file__).resolve().parents[1]
     content = (root / "app.py").read_text()
     assert "Reviewed — flagged (values unchanged)" in content
-    assert "verify_final_csv(" in content and "verify_final_excel(" in content
+    assert "verify_final_csv(" in content and "seal_verified_workbook" in content
+    from healthcare_data_quality.cleaning import final_export_integrity as integrity
+    import inspect
+    assert "verify_final_excel(" in inspect.getsource(integrity.verified_workbook_evidence)
 
 
-def test_highlight_on_later_replaced_value_requires_new_review(tmp_path):
+def test_highlight_on_later_replaced_value_retains_coordinate_style(tmp_path):
     path, original = _case(tmp_path)
     staged = original.replace(b"Bacteria;A,1,x", b"Bacteria;Amended,1,x")
     source_hash = hashlib.sha256(original).hexdigest()
@@ -171,9 +174,17 @@ def test_highlight_on_later_replaced_value_requires_new_review(tmp_path):
                   "reviewer": "R", "modified_positions": [{"csv_row": 2, "column": 1}], "changes": 1,
                   "approved_cell_changes": [{"row": 2, "column": 1, "before": "Bacteria;A",
                                               "after": "Bacteria;Amended"}]}
-    with pytest.raises(PermissionError, match="highlight"):
-        _verify(path, original, staged, history=[flag_event, edit_event],
-                statuses={"f1": "Applied and verified", "f2": "Applied and verified"})
+    result = _verify(path, original, staged, history=[flag_event, edit_event],
+                     statuses={"f1": "Applied and verified", "f2": "Applied and verified"})
+    assert result['flagged_cells'] == 1
+    _, workbook = build_styled_excel_download(staged, original_csv=original,
+        original_filename='source.csv', approved_flags=[flag],
+        approved_row_operations=[], approved_column_deletions=[])
+    verify_final_excel(workbook, staged, original_csv=original, approved_flags=[flag],
+                       approved_rows=[], approved_columns=[])
+    from openpyxl import load_workbook
+    cell = load_workbook(io.BytesIO(workbook)).active['A2']
+    assert cell.value == 'Bacteria;Amended' and cell.font.bold is True
 
 
 def test_approved_cell_replacement_hidden_by_later_row_deletion_is_audited(tmp_path):

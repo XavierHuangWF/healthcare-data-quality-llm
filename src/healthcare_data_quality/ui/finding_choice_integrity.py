@@ -62,6 +62,15 @@ def scoped_review_choices(finding: dict, source: Path | None,
         if not isinstance(operations, list) or not operations:
             continue
         kinds = {op.get('operation') for op in operations if isinstance(op, dict)}
+        if 'flag_cells' in kinds:
+            from healthcare_data_quality.cleaning.visual_recommendations import verify_visual_option
+            visual = verify_visual_option(finding, source, option)
+            if visual:
+                signature = json.dumps(visual['operations'], sort_keys=True, ensure_ascii=False)
+                if signature not in fingerprints:
+                    fingerprints.add(signature)
+                    result.append({**visual, 'finding_id':fid, 'dataset_id':dataset_id})
+            continue
         # An issue-specific recommendation cannot morph into an unrelated
         # correction merely because model/memory targets happen to exist.
         if check_key == 'find_duplicate_taxa' and not kinds <= {'drop_rows', 'merge_rows'}:
@@ -132,6 +141,8 @@ def scoped_clarification_choices(finding: dict, labels: list[str]) -> list[str]:
                     'fill missing value')):
                 continue
         elif check_key in {'find_invalid_counts', 'find_negative_counts'}:
+            if 'missing values' in str(finding.get('title') or '').casefold() and 'absolute value' in key:
+                continue
             if any(phrase in key for phrase in (
                     'taxonomy rank', 'taxonomy prefix', 'rename header',
                     'normalize separator', 'pad taxonomy')):

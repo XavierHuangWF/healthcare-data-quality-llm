@@ -51,8 +51,9 @@ def test_history_marker_does_not_unlock_unassessed_finding():
 
 def test_runner_html_safe_and_only_styled_noninteractive_row():
     html = waiting_card_html('Finding 1', '<test & unsafe>', 'running')
-    assert '🏃‍♂️' in html
-    assert '@keyframes hdq-finding-jog' in html
+    assert '>↻</span>' in html
+    assert 'data-motion="spin"' in html
+    assert '@keyframes hdq-finding-spin' in html
     assert 'prefers-reduced-motion' in html
     assert '&lt;test &amp; unsafe&gt;' in html
     assert '<test' not in html
@@ -96,7 +97,7 @@ def test_uploaded_project_page_and_findings_are_independently_gated():
 
 def test_current_source_uses_one_shared_readiness_watcher():
     source = (ROOT/'app.py').read_text(encoding='utf-8')
-    assert 'st.fragment(run_every="3s")(_refresh_parent_for_new_agent_b_choices)' in source
+    assert 'st.fragment(run_every="3s")(refresh_cleaning)' in source
     assert 'st.fragment(run_every="3s")(_render_live_agent_b_finding)' not in source
     assert "poll_finding_readiness)(st, job_id" not in source
 

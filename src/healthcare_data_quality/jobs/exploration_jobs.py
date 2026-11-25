@@ -13,7 +13,7 @@ import threading
 from typing import Callable
 
 from healthcare_data_quality.agents.exploratory_combined import run_exploratory_series
-from healthcare_data_quality.services.llm_client import model_request_priority
+from healthcare_data_quality.services.llm_client import model_request_priority, model_reconnect_mode
 
 
 def _utc_now() -> str:
@@ -90,8 +90,9 @@ class LiveExplorationJobs:
             # Exploration and recommendation generation are background work;
             # the existing request gate favors a waiting interactive chat.
             with model_request_priority("investigation"):
-                report = self._runner(datasets, audit, on_round=round_complete,
-                                      on_progress=progress)
+                with model_reconnect_mode():
+                    report = self._runner(datasets, audit, on_round=round_complete,
+                                          on_progress=progress)
             if not isinstance(report, dict):
                 raise ValueError("Exploration did not return a result record")
             runs = report.get("runs") or []

@@ -3,7 +3,7 @@ import inspect
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 
 from healthcare_data_quality.ui.evidence_view import DETECTION_IMPLEMENTATIONS, deterministic_detection_code
@@ -39,6 +39,8 @@ def _render_spy(app, monkeypatch):
         def __getattr__(self, name):
             def call(*args, **kwargs):
                 calls.append((name, args))
+                if name == "columns":
+                    return [SimpleNamespace(metric=lambda *a, **k: None) for _ in range(args[0])]
                 return _Context() if name in {"expander", "container"} else None
             return call
 
@@ -77,13 +79,13 @@ def test_evidence_view_shows_real_comparison_code_without_duplicate_agent_sectio
     calls = _render_spy(app, monkeypatch)
     path = _csv(tmp_path)
     audit = {'dataset_baselines': {'dataset_1': {'checks': {}}}}
-    app.render_finding_evidence(audit, [path], [path.name], [inspect_headers(path)], [])
+    app.render_combined_findings(audit, [path], [path.name], [inspect_headers(path)])
     rendered_code = [args[0] for name, args in calls if name == 'code']
     assert any('def header_findings(' in code and 'counts["matching"]' in code for code in rendered_code)
     assert any('def inspect_headers(' in code for code in rendered_code)
     titles = [args[0] for name, args in calls if name == 'expander']
     assert 'View Python detection code (advanced)' in titles
-    assert sum('identical values' in label for label in titles) == 1
+    assert sum('identical values' in args[0] for name, args in calls if name == 'markdown') == 1
     assert 'Gemma investigation evidence' not in ' '.join(str(args) for _, args in calls)
 
 
@@ -101,7 +103,7 @@ def test_count_validation_code_is_shown_and_matches_the_installed_function(tmp_p
              'original_value': '', 'issue_type': 'missing'},
         ]}}}
     audit = {'dataset_baselines': {'dataset_1': baseline}}
-    app.render_finding_evidence(audit, [path], [path.name], [inspect_headers(path)], [])
+    app.render_combined_findings(audit, [path], [path.name], [inspect_headers(path)])
     rendered_code = [args[0] for name, args in calls if name == 'code']
     expected = deterministic_detection_code('find_invalid_counts')[0]['code']
     assert expected in rendered_code
@@ -109,3 +111,48 @@ def test_count_validation_code_is_shown_and_matches_the_installed_function(tmp_p
     explanations = ' '.join(str(args) for name, args in calls if name == 'write')
     assert 'integral value' in explanations
     assert 'zero is not missing' in explanations
+
+
+def test_combined_page_shows_affected_cells_once_with_method_in_same_card(tmp_path, monkeypatch):
+    app = _app(monkeypatch)
+    calls = _render_spy(app, monkeypatch)
+    path = tmp_path / 'counts.csv'
+    path.write_text('Taxon,Sample\nA,-679\nB,12\n', encoding='utf-8')
+    baseline = {'checks': {'find_invalid_counts': {
+        'status': 'completed', 'counts_by_type': {'negative': 1},
+        'observations': [{'row': 2, 'column': 2, 'sample_id': 'Sample', 'taxon': 'A',
+                          'original_value': '-679', 'issue_type': 'negative'}],
+    }}}
+    app.render_combined_findings({'dataset_baselines': {'dataset_1': baseline}},
+                                 [path], [path.name], [inspect_headers(path)])
+    evidence = [args[0] for name, args in calls if name == 'dataframe'
+                and 'Original value' in args[0].columns]
+    assert len(evidence) == 1
+    assert str(evidence[0].iloc[0]['Original value']) == '-679'
+    heading_index = next(i for i, (name, args) in enumerate(calls)
+                         if name == 'markdown' and str(args[0]).startswith('**Finding 1'))
+    detail_index = next(i for i, (name, args) in enumerate(calls)
+                        if name == 'expander' and args[0] == 'Detection method and verification')
+    assert heading_index < detail_index
+    assert sum(name == 'expander' and args[0] == 'Detection method and verification'
+               for name, args in calls) == 1
+
+
+def test_gemma_candidate_evidence_and_method_appear_once(tmp_path, monkeypatch):
+    app = _app(monkeypatch)
+    calls = _render_spy(app, monkeypatch)
+    app.st.session_state = {'exploration_runs': [{
+        'proposal': {'hypothesis': 'Test rare count', 'method': 'Inspect source', 'code': 'print(1)'},
+        'result': {'summary': 'One candidate', 'findings': [{
+            'title': 'Rare count', 'description': 'Review count',
+            'evidence': [{'row': 2, 'column': 2, 'original_value': '123'}],
+        }]}, 'verification': {'status': 'source_cells_verified_and_output_reproduced'},
+    }], 'exploration_stop': True}
+    monkeypatch.setattr(app, 'prepare_exploration_state', lambda _: None)
+    app.render_exploratory_findings([], 'test', {})
+    tables = [args[0] for name, args in calls if name == 'dataframe']
+    assert len(tables) == 1
+    assert tables[0].iloc[0]['original_value'] == '123'
+    assert sum(name == 'expander' and args[0] == 'Check method and verification'
+               for name, args in calls) == 1
+    assert sum(name == 'code' for name, _ in calls) == 1

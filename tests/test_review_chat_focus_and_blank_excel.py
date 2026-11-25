@@ -87,6 +87,6 @@ def test_one_render_owner_when_agent_b_becomes_ready():
     text = (ROOT / 'app.py').read_text()
     assert 'st.fragment(run_every=None if fid in ready_ids else "3s")' not in text
     assert 'st.fragment(run_every="3s")(_render_live_agent_b_finding)' not in text
-    assert 'st.fragment(run_every="3s")(_refresh_parent_for_new_agent_b_choices)' in text
+    assert 'st.fragment(run_every="3s")(refresh_cleaning)' in text
     assert 'st.session_state.setdefault("cleaning_chat_focus_pending", set()).add(fid)' in text
     assert 'with st.container(key=review_chat_container_key(fid)):' in text

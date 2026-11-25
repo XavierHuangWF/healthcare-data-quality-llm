@@ -120,8 +120,8 @@ def build_reviewer_audit(
                         flag.get("before") != original[row-1][col-1]):
                     raise PermissionError("Audited flag does not match its original source cell")
                 result = record(event, operation, row=row, col=col,
-                                before=flag["before"], after="Bold red / yellow highlight (no value change)")
-                marked_evidence.append(dict(result))
+                                before=flag["before"], after=("Bold red / yellow highlight (no value change)" if flag.get("fill", True) else "Bold red font only (no value change)"))
+                marked_evidence.append({**result, 'fill': flag.get('fill', True)})
         elif operation in {"replace_cells", "rename_headers"}:
             cells = event.get("approved_cell_changes") or []
             if not cells and isinstance(event.get("changes"), list):
@@ -228,6 +228,32 @@ def build_reviewer_audit(
             'outcome': 'Reviewed — resolved by earlier approved deletions',
         })
 
+    # A reviewer may intentionally accept an issue without correction. This
+    # is NOT a validated remediation and must be distinguishable from an
+    # approved data edit or a no-issue Gemma check in the exported audit.
+    for decision in decisions or []:
+        if not isinstance(decision, dict) or decision.get('review_outcome') != 'reviewer_accepted_without_correction':
+            continue
+        if decision.get('source_sha256') != sha:
+            raise PermissionError('No-edit close review is not bound to this source CSV')
+        if not str(decision.get('reviewer') or '').strip() or decision.get('new_edits') != 0:
+            raise PermissionError('No-edit close review lacks a named zero-edit decision')
+        fid = str(decision.get('finding_id') or '')
+        if review_statuses.get(fid) != 'Reviewed — no change':
+            raise PermissionError('No-edit close decision is inconsistent with review status')
+        audit_rows.append({
+            'finding_id': fid, 'finding': finding_titles.get(fid, ''),
+            'reviewer': str(decision['reviewer']),
+            'operation': 'review_accepted_unchanged',
+            'original_location': 'Finding/check (original source)',
+            'final_location': 'No new changes authorized',
+            'original_csv_value': '(see immutable original CSV)',
+            'approved_before': 'Observed issue or check presented to reviewer',
+            'approved_after': 'Reviewer explicitly accepted unchanged state',
+            'final_csv_value': '(existing approved changes retained; none added by this review)',
+            'outcome': 'Reviewed — accepted unchanged; not corrected',
+        })
+
     # Reviewer decisions are independent from cell edits: a keep-as-is choice
     # must still be retained, with no fabricated replacement value.
     findings = [
@@ -328,10 +354,11 @@ def embed_reviewer_audit_sheets(excel_bytes: bytes, audit: dict) -> bytes:
         audit["flagged_source_evidence"],
         ["original_location", "original_csv_value", "final_location", "outcome", "reviewer", "finding"],
         [24, 92, 20, 45, 18, 55])
-    for row in flagged.iter_rows(min_row=2):
+    for row, record in zip(flagged.iter_rows(min_row=2), audit["flagged_source_evidence"]):
         value = row[1]
         value.font = Font(bold=True, color="FFDC2626")
-        value.fill = PatternFill("solid", fgColor="FFFFE699")
+        if record.get('fill', True):
+            value.fill = PatternFill("solid", fgColor="FFFFE699")
         value.alignment = Alignment(wrap_text=True, vertical="top")
     output = io.BytesIO()
     book.save(output)

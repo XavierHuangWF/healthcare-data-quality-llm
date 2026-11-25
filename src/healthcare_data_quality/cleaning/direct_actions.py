@@ -251,7 +251,7 @@ _TAXONOMY_PAD_COMMAND = re.compile(
     r"\b(?:pad|append|fill|complete|extend|add)\b", re.I,
 )
 _TAXONOMY_SEVEN_LEVELS = re.compile(
-    r"\b(?:7|seven)\s*(?:[- ]\s*)?(?:levels?|ranks?|positions?)\b", re.I,
+    r"\b(?:(?:7|seven)\s*(?:[- ]\s*)?(?:levels?|ranks?|positions?)|(?:levels?|ranks?|positions?)\s+(?:7|seven))\b", re.I,
 )
 
 
@@ -304,6 +304,16 @@ def propose_explicit_column_deletions(message: str, finding: dict, source: Path)
     if (not isinstance(message, str) or len(message) > 500
             or '?' in message or re.search(r"\b(?:don't|do not|never|without|instead of)\b", message, re.I)):
         return None
+    # "Delete these 3 columns" refers only to the selected check's exact
+    # independently displayed targets, not all columns named Blank globally.
+    relative = re.fullmatch(r"(?:please\s+)?(?:delete|drop|remove)\s+(?:these|those|the)\s+(?:(\d+)\s+)?columns?[.!]?", message.strip(), re.I)
+    if relative and finding.get('check_key') == 'gemma_check':
+        from healthcare_data_quality.ui.gemma_check_evidence import observed_check_data
+        observed = observed_check_data(finding, source)
+        positions = [item['Column'] for item in observed if item['Column'] > 1]
+        if not positions or (relative.group(1) and int(relative.group(1)) != len(positions)):
+            return None
+        message = 'delete columns ' + ', '.join(map(str, positions))
     match = _COLUMN_DELETE_INTENT.search(message)
     if not match:
         return None
@@ -325,3 +335,19 @@ def propose_explicit_column_deletions(message: str, finding: dict, source: Path)
             "operation": "none", "dataset_id": "", "changes": [],
             "operations": plans, "clarification_options": [],
             "explicit_columns": frozenset(columns)}
+
+
+def surviving_taxonomy_proposal(proposal: dict, finding: dict, source: Path, approved_rows: list[dict]) -> dict:
+    """Verify the complete source plan, then restrict it before Gemma appraisal.
+
+    Never resurrect a previously removed row. Do not change any proposed value.
+    This is only for taxonomy corrections, not a generic edit-scope expansion.
+    """
+    if (finding.get('check_key') not in {'inspect_taxonomy_structure', 'inspect_taxonomy_naming'}
+            or proposal.get('operation') != 'replace_cells'):
+        return proposal
+    from healthcare_data_quality.cleaning.finding_cleaning import validate_scoped_plan
+    from healthcare_data_quality.cleaning.proposal_conflicts import _row_deletions
+    checked = validate_scoped_plan(proposal, finding, source)
+    removed = _row_deletions(approved_rows)
+    return {**proposal, 'changes': [c for c in checked['changes'] if c['row'] not in removed]}

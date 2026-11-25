@@ -55,18 +55,19 @@ def test_baseline_and_exploration_share_one_data_quality_tab(monkeypatch):
     source = (ROOT / "app.py").read_text(encoding="utf-8")
     assert "_render_results_navigation(active_page, suggestions_ready)" in source
     assert 'active_page == "findings"' in source
-    assert 'render_finding_evidence(' in source
+    assert 'render_combined_findings(audit, paths,' in source
     assert 'render_cleaning_workspace(paths, uploaded, current, cache_key)' in source
     assert '"Exploratory discoveries", "Supporting evidence"' not in source
-    assert 'render_exploratory_findings(paths, cache_key, audit)' in source
-    assert 'render_baseline(dataset_id, baseline, source_path=paths[label_index])' in source
+    assert 'render_exploratory_findings(paths, cache_key, current)' in source
+    assert 'render_baseline(dataset_id, baseline, source_path=source, detail_for=detail_for)' in source
 
 
-def test_unified_run_opt_in_starts_nonblocking_exploration(monkeypatch):
+def test_unified_run_automatically_starts_nonblocking_exploration(monkeypatch):
     _app(monkeypatch)
     source = (ROOT / "app.py").read_text(encoding="utf-8")
     assert 'run_requested = st.button("Run full investigation", type="primary")' in source
-    assert '"Include Gemma\'s automatic exploratory analyses (isolated read-only Python)"' in source
+    assert "include_exploration = True" in source
+    assert "enable_unified_exploration" not in source
     assert 'if run_requested:' in source
     assert 'start_live_exploration(full, cache_key, paths, names)' in source
     assert 'investigation_manager().start(run_id, paths, runner=run_background,' in source
@@ -84,9 +85,9 @@ def test_full_run_progress_publishes_real_background_events(monkeypatch):
     assert 'progress_callback=progress,' in registered_worker
     assert 'baseline_ready_callback=publish_baseline' in registered_worker
     assert 'st.fragment(run_every="3s")(refresh_explorations)' in source
-    assert 'st.fragment(refresh_cleaning)()' in source
+    assert 'st.fragment(run_every="3s")(refresh_cleaning)()' in source
     assert 'with model_request_priority("investigation"):' in worker
-    assert "components.html(live_timer_html(self.started_epoch_ms)" in source
+    assert "st.iframe(live_timer_html(self.started_epoch_ms)" in source
     assert "estimated percentage or time remaining" in source
 
 
@@ -110,7 +111,8 @@ def test_zero_new_findings_are_a_valid_neutral_ui_outcome(monkeypatch):
     assert "No additional candidate issues were identified in the Gemma checks completed." in source
     assert "The dataset is not certified clean" not in source  # Never claim certification.
     assert "Try another exploratory investigation" not in source
-    assert "Investigation run status (advanced)" in source
+    assert "Investigation run status (advanced)" not in source
+    assert "exploratory_stop_decision=st.session_state.get" in source
     assert 'gemma_stop.get("stop_source") == "proposal_retry_exhausted"' in source
     assert "Gemma recommends stopping further exploration for now" not in source
 
@@ -328,3 +330,25 @@ def test_backend_budget_exhaustion_is_partial_even_without_found_issues(monkeypa
     )
     assert outcome["state"] == "partial"
     assert "step limit" in outcome["details"]
+
+
+def test_investigation_page_does_not_repeat_agent_card_status():
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+    for obsolete in (
+        'st.subheader("Investigate data quality")',
+        'Investigations run locally and do not change your uploaded CSV files.',
+        'A full run also automatically executes generated read-only Python',
+        'enable_unified_exploration',
+        'Investigation run status (advanced)',
+        'Agent stop reason:',
+        'Objective assessment:',
+        'No changes staged in this session',
+        'Recommendations: {rec_summary}',
+        'Technical stopping details are available in Investigation run status',
+    ):
+        assert obsolete not in source
+    assert 'include_exploration = True' in source
+    assert 'start_live_exploration(full, cache_key, paths, names)' in source
+    assert 'st.warning("Bubblewrap (`bwrap`) is not available' in source
+    assert 'st.error("Gemma could not complete proposal generation' in source
+    assert 'exploratory_stop_decision=st.session_state.get("exploration_stop")' in source

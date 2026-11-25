@@ -86,6 +86,28 @@ def format_elapsed(seconds: float) -> str:
             else f"{minutes:02}:{secs:02}")
 
 
+def final_verification_label(stage: str, elapsed: float, *, queued: bool = False,
+                             model_stage: str = "", attempt: int = 1) -> str:
+    """Describe real export phases and elapsed time, never a predicted ETA."""
+    if stage == "workbook":
+        activity = "1/3 · Preparing and checking Excel"
+    elif stage == "gemma":
+        activity = "2/3 · Gemma verifying approved changes"
+        if queued or model_stage == "waiting_for_inference_slot":
+            activity = "2/3 · Waiting for Gemma inference slot"
+        elif model_stage == "waiting_for_reconnect":
+            activity = "2/3 · Waiting for Gemma connection"
+        if attempt > 1:
+            activity += f" · Retry {attempt - 1}"
+    elif stage == "seal":
+        activity = "3/3 · Checking final Excel and audit formatting"
+    else:
+        raise ValueError("Unknown final verification stage")
+    if queued and stage != "gemma":
+        activity += " · Queued"
+    return f"Final verification · {activity} · Elapsed {format_elapsed(elapsed)}"
+
+
 def live_timer_html(start_epoch_ms: int) -> str:
     """Self-updating offline timer for blocked synchronous Gemma HTTP calls.
 

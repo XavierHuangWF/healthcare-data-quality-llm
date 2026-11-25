@@ -1,18 +1,21 @@
-"""Keep the animated waiting indicator next to each pending finding/check title."""
+"""Status indicators remain near the finding title; only real work animates."""
 from html import unescape
 
 from healthcare_data_quality.ui.finding_wait_gate import waiting_card_html
 
 
 def test_waiting_runner_is_between_chevron_and_finding_title():
-    for status in ("pending", "queued", "running"):
+    for status, figure, motion in (("pending", "◷", "static"), ("queued", "◷", "static"),
+                                   ("running", "↻", "spin"), ("revision", "↻", "spin"),
+                                   ("ordered", "🔒", "static")):
         html = unescape(waiting_card_html("Finding 4", "Duplicated taxonomy", status))
-        assert html.count("🏃‍♂️") == 1
+        assert html.count(f'>{figure}</span>') == 1
         assert (html.index('class="hdq-finding-wait-lock"')
                 < html.index('class="hdq-finding-wait-figure"')
                 < html.index('class="hdq-finding-wait-main"')
                 < html.index("Finding 4 · Duplicated taxonomy"))
-        assert "hdq-finding-jog" in html
+        assert f'data-motion="{motion}" role="img"' in html
+        assert "hdq-finding-spin" in html
 
 
 def test_check_runner_is_also_before_title():

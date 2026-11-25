@@ -75,7 +75,7 @@ def _record(finding: dict, event: str, operations: list[dict] | None,
     # Do not copy original patient/taxon labels or raw CSV cells to preferences.
     kinds = sorted({str(op.get('operation')) for op in operations or []
                     if isinstance(op, dict) and op.get('operation') in {
-                        'replace_cells', 'rename_headers', 'drop_column', 'drop_rows', 'merge_rows'}})
+                        'replace_cells', 'rename_headers', 'drop_column', 'drop_rows', 'merge_rows', 'flag_cells'}})
     return {'schema': 1, 'at': datetime.now(timezone.utc).isoformat(),
             'family': _family(finding), 'finding_type': str(finding.get('check_key') or '')[:70],
             'outcome': event, 'operations': kinds}

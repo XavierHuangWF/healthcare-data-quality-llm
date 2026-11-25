@@ -43,7 +43,7 @@ class ReviewUI(StubUI):
         if kwargs.get("disabled", False):
             return False
         return (label in self.pressed or
-                label.startswith("Yes — ") and
+                str(kwargs.get("key", "")).startswith("review_approve_yes_") and
                 "Approve & Stage in memory" in self.pressed)
 
     def error(self, message):

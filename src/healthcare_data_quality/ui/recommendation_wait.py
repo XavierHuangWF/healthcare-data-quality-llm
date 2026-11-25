@@ -135,7 +135,6 @@ def show_recommendation_wait_panel(st, audit: Mapping | None, context_key: str) 
     from healthcare_data_quality.jobs.cleaning_jobs import (
         recommendation_manager, job_fingerprint,
     )
-    import streamlit.components.v1 as components
 
     snapshot = None
     run_id = (audit or {}).get('cleaning_recommendation_run_id') if isinstance(audit, Mapping) else None
@@ -145,7 +144,7 @@ def show_recommendation_wait_panel(st, audit: Mapping | None, context_key: str) 
                 job_fingerprint(context_key, [], run_id=run_id))
         except (OSError, ValueError, TypeError, KeyError):
             pass
-    components.html(recommendation_wait_html(snapshot), height=134, scrolling=False)
+    st.iframe(recommendation_wait_html(snapshot), height=134)
     status = recommendation_wait_state(snapshot)
     if status['total'] and status['failed'] == status['total']:
         st.error('Agent B could not generate a suggestion. Check its failed-job details; no cleaning was authorized.')

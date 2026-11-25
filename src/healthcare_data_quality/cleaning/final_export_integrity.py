@@ -26,6 +26,7 @@ def verify_final_csv(
     approved_rows: list[dict], approved_columns: list[dict],
     dataset_id: str = "dataset_1",
     finding_checks: dict[str, dict] | None = None,
+    review_decisions: list[dict] | None = None,
 ) -> dict:
     """Reconcile every approved action and actual exported CSV; never trust UI state alone.
 
@@ -49,6 +50,7 @@ def verify_final_csv(
     _approval_ledger_matches_stage(
         [Path(source)], {dataset_id: staging}, {dataset_id: approved_columns},
         {dataset_id: approved_rows}, history, review_statuses, finding_titles,
+        review_decisions=review_decisions,
     )
     recomputed = apply_approved_row_operations(original, staging, approved_rows)
     recomputed = apply_approved_column_deletions(
@@ -74,6 +76,24 @@ def verify_final_csv(
     row_map, col_map = _exported_positions(
         original_rows, final_rows, approved_rows, approved_columns)
     if finding_checks:
+        from .previous_approval_resolution import source_verified_prior_row_resolution
+        for fid, status in review_statuses.items():
+            if status != 'Resolved by earlier approved edit' or any(
+                    event.get('finding_id') == fid for event in history):
+                continue
+            finding = finding_checks.get(fid)
+            proven = source_verified_prior_row_resolution(
+                finding, Path(source), approved_rows) if finding else None
+            if not proven:
+                raise PermissionError(f'Finding {fid} no longer has complete source-verified overlap evidence')
+            referenced = [d for d in (review_decisions or []) if isinstance(d, dict)
+                          and d.get('finding_id') == fid
+                          and d.get('decision') == 'resolved_by_prior_approvals']
+            if (len(referenced) != 1 or
+                referenced[0].get('original_csv_rows') != proven['rows'] or
+                sorted(referenced[0].get('earlier_approved_findings') or [])
+                    != proven['earlier_finding_ids']):
+                raise PermissionError(f'Finding {fid} has stale or mismatched overlap review proof')
         from .final_review_trace import verify_unchanged_headers
         verify_unchanged_headers(original_rows, final_rows, review_statuses,
                                  finding_checks, col_map)
@@ -93,20 +113,9 @@ def verify_final_csv(
             raise PermissionError("Approved flag does not match original source evidence")
     orphaned_flags = [(f["row"], f["column"]) for f in flags
                       if f["row"] not in row_map or f["column"] not in col_map]
-    # If another approved edit changed a flagged value after its style approval,
-    # the reviewer has not approved styling this replacement text. Require
-    # re-review rather than silently transferring formatting to a new value.
-    retargeted_flags = [(f["row"], f["column"]) for f in flags
-                        if f["row"] in row_map and f["column"] in col_map
-                        and final_rows[row_map[f["row"]] - 1][col_map[f["column"]] - 1]
-                        != f["before"]]
-    if retargeted_flags:
-        shown = ", ".join(f"R{r}:C{c}" for r, c in retargeted_flags[:8])
-        raise PermissionError(
-            f"{len(retargeted_flags)} approved highlight(s) now point to edited "
-            f"cell contents ({shown}). Reopen their visual-flag review to "
-            "approve the actual final text before exporting."
-        )
+    # Formatting is attached to a surviving physical coordinate, independently
+    # of a later named value approval. Original annotation evidence remains
+    # immutable; the verified final value is exported with the approved style.
     surviving = {(row_map[f["row"]], col_map[f["column"]]) for f in flags
                  if f["row"] in row_map and f["column"] in col_map}
     # A separately approved structural deletion supersedes an older value
@@ -155,7 +164,7 @@ def verify_final_excel(xlsx: bytes, final_csv: bytes, *, original_csv: bytes,
                 ["Cleaned dataset", "Review overview", "Audit trail",
                  "Source-to-final checks", "Interaction log", "Verification"]):
             raise PermissionError("Excel contains an unexpected worksheet")
-        sheet = workbook.active
+        sheet = workbook["Cleaned dataset"]
         if sheet.max_row != len(final_rows) or sheet.max_column != len(final_rows[0]):
             raise PermissionError("Excel rows or columns differ from the approved CSV")
         for row_number, row in enumerate(final_rows, 1):
@@ -168,17 +177,17 @@ def verify_final_excel(xlsx: bytes, final_csv: bytes, *, original_csv: bytes,
                 expected = (None if value == "" else
                             _excel_cell_value(value, column_number))
                 observed = sheet.cell(row_number, column_number).value
-                if observed != expected or type(observed) is not type(expected):
+                if sheet.cell(row_number, column_number).data_type == "f" or observed != expected or type(observed) is not type(expected):
                     raise PermissionError(
                         f"Excel does not preserve approved value at R{row_number}:C{column_number}")
-        expected_flags: set[tuple[int, int]] = set()
+        expected_flags: dict[tuple[int, int], bool] = {}
         for flag in approved_flags:
             row, col = flag["row"], flag["column"]
             if (flag.get("style") != "bold_red" or flag.get("before") != raw_rows[row - 1][col - 1]):
                 raise PermissionError("Excel flag does not match original source evidence")
             if row not in row_map or col not in col_map:
                 continue
-            expected_flags.add((row_map[row], col_map[col]))
+            expected_flags[(row_map[row], col_map[col])] = flag.get("fill", True)
         for row_number in range(2, sheet.max_row + 1):
             for column_number in range(1, sheet.max_column + 1):
                 cell = sheet.cell(row_number, column_number)
@@ -187,9 +196,11 @@ def verify_final_excel(xlsx: bytes, final_csv: bytes, *, original_csv: bytes,
                          cell.font.color.type == "rgb" else None)
                 fill = (cell.fill.fgColor.rgb if cell.fill.patternType == "solid" and
                         cell.fill.fgColor.type == "rgb" else None)
-                actual_flag = (cell.font.bold is True and color == "FFDC2626"
-                               and fill == "FFFFE699")
-                if actual_flag != is_flagged:
+                actual_flag = (cell.font.bold is True and color == "FFDC2626")
+                expected_fill = expected_flags.get((row_number, column_number), False)
+                if (actual_flag != is_flagged or (fill == "FFFFE699") != expected_fill
+                        or (not is_flagged and (cell.font.bold is True or color == "FFDC2626"))
+                        or (not expected_fill and cell.fill.patternType is not None)):
                     raise PermissionError(
                         f"Excel highlights do not match approved flags at R{row_number}:C{column_number}")
     except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
@@ -197,3 +208,102 @@ def verify_final_excel(xlsx: bytes, final_csv: bytes, *, original_csv: bytes,
     finally:
         if 'workbook' in locals():
             workbook.close()
+
+
+def verified_workbook_evidence(xlsx: bytes, final_csv: bytes, *, original_csv: bytes,
+                              approved_flags: list[dict], approved_rows: list[dict],
+                              approved_columns: list[dict], audit_tables: dict) -> dict:
+    """Bind Gemma's decision to actual read-back data and historical styling.
+
+    The complete actual workbook is checked by Python. The semantic digest is
+    stable when verification metadata/timestamps are subsequently appended.
+    """
+    import json
+    from openpyxl import load_workbook
+    from .reviewer_audit_workbook import verify_audit_sheets, _annotation_audit_targets
+    verify_final_excel(xlsx, final_csv, original_csv=original_csv,
+                       approved_flags=approved_flags, approved_rows=approved_rows,
+                       approved_columns=approved_columns)
+    verify_audit_sheets(xlsx, audit_tables)
+    raw, final = _records(original_csv), _records(final_csv)
+    rm,cm = _exported_positions(raw,final,approved_rows,approved_columns)
+    wb = load_workbook(io.BytesIO(xlsx), data_only=False)
+    try:
+        sheet = wb['Cleaned dataset']
+        def style(cell):
+            color = cell.font.color
+            return {'bold':bool(cell.font.bold),
+                    'red':bool(color is not None and color.type=='rgb' and color.rgb=='FFDC2626'),
+                    'yellow':bool(cell.fill.patternType=='solid' and cell.fill.fgColor.type=='rgb' and cell.fill.fgColor.rgb=='FFFFE699')}
+        annotations = []
+        for f in approved_flags:
+            r,c=f['row'],f['column']
+            location = [rm[r],cm[c]] if r in rm and c in cm else None
+            cell = sheet.cell(*location) if location else None
+            annotations.append({'source':[r,c], 'final':location,
+                'observed_style':style(cell) if cell else None,
+                'observed_value':cell.value if cell else None,
+                'expected_yellow':f.get('fill',True)})
+        audit_annotations = []
+        # Audit trail and source-to-final proofs are stable across metadata updates.
+        for name in ('Audit trail','Source-to-final checks'):
+            for r,c,fill in _annotation_audit_targets(name,audit_tables[name]):
+                cell=wb[name].cell(r,c)
+                audit_annotations.append({'sheet':name,'row':r,'coordinate':wb[name].cell(r,4).value,
+                                          'source_value':cell.value,'observed_style':style(cell)})
+        content = {'actual_cells': [[(cell.value,cell.data_type,style(cell)) for cell in row] for row in sheet.iter_rows()],
+                   'audit_trail':list(wb['Audit trail'].values),
+                   'source_to_final':list(wb['Source-to-final checks'].values),
+                   'overview':list(wb['Review overview'].values),
+                   'interactions':list(wb['Interaction log'].values),
+                   'audit_annotations':audit_annotations}
+        digest=hashlib.sha256(json.dumps(content,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+        return {'workbook_evidence_sha256':digest,'annotations':annotations,'audit_annotations':audit_annotations,
+                'cells_verified':len(final)*len(final[0]), 'audit_verified':True}
+    finally:
+        wb.close()
+
+
+def prepare_verified_workbook(*, filename, approved_flags, audit_arguments):
+    """CPU worker: construct the actual candidate and verify it before model review."""
+    from .styled_export import build_styled_excel_download
+    from .reviewer_audit_workbook import audit_tables, embed_audit_sheets
+    args = audit_arguments
+    # Rebuild only from immutable approved inputs. Never repair by altering data.
+    for attempt in range(2):
+        try:
+            name,base = build_styled_excel_download(args['final_csv'],original_csv=args['original_csv'],
+                original_filename=filename,approved_flags=approved_flags,
+                approved_row_operations=args['approved_rows'],approved_column_deletions=args['approved_columns'])
+            tables = audit_tables(**args)
+            provisional=embed_audit_sheets(base,tables)
+            proof=verified_workbook_evidence(provisional,args['final_csv'],original_csv=args['original_csv'],
+                approved_flags=approved_flags,approved_rows=args['approved_rows'],approved_columns=args['approved_columns'],audit_tables=tables)
+            return {'name':name,'base':base,'proof':proof}
+        except (PermissionError,ValueError,OSError):
+            if attempt:
+                raise
+
+
+def seal_verified_workbook(*, base, approved_flags, audit_arguments, reviewed_proof):
+    """CPU worker: attach final model result, reopen and verify delivered bytes."""
+    from .reviewer_audit_workbook import audit_tables, embed_audit_sheets
+    args=audit_arguments
+    result=args.get('verified',{}).get('gemma_final_review') or {}
+    if result.get('verified') is not True or result.get('workbook_evidence_sha256')!=reviewed_proof:
+        raise PermissionError('No matching Gemma workbook review')
+    if (result.get('source_sha256') != hashlib.sha256(args['original_csv']).hexdigest() or
+            result.get('final_sha256') != hashlib.sha256(args['final_csv']).hexdigest()):
+        raise PermissionError('Gemma final review is bound to different data')
+    for attempt in range(2):
+        try:
+            tables=audit_tables(**args)
+            data=embed_audit_sheets(base,tables)
+            actual=verified_workbook_evidence(data,args['final_csv'],original_csv=args['original_csv'],
+                approved_flags=approved_flags,approved_rows=args['approved_rows'],approved_columns=args['approved_columns'],audit_tables=tables)
+            if actual['workbook_evidence_sha256']!=reviewed_proof:
+                raise PermissionError('Final workbook differs from Gemma-reviewed workbook evidence')
+            return {'verified_excel':data,'workbook_evidence_sha256':reviewed_proof,'artifact_sha256':hashlib.sha256(data).hexdigest()}
+        except (PermissionError,ValueError,OSError):
+            if attempt:
+                raise

@@ -81,8 +81,9 @@ def test_source_exact_even_when_evidence_is_sampled(tmp_path):
     source = _source(tmp_path, 'Taxon,A,B\na,,\nb,0,\nc,3,5\n')
     finding = _finding(source, sample=True)
     choices = source_backed_choices(finding, source, {'choices': []})
-    assert [c['row'] for c in choices[0]['operations'][0]['changes']] == [2, 3]
-    assert len(choices) == 1
+    deletion = next(c for c in choices if c['operations'][0]['operation'] == 'drop_rows')
+    assert [c['row'] for c in deletion['operations'][0]['changes']] == [2, 3]
+    assert len(choices) >= 2
 
 
 @pytest.mark.parametrize('mismatch', ['count', 'before', 'duplicate', 'wrong_category', 'wrong_check'])
@@ -130,7 +131,8 @@ def test_real_dirty_dataset_has_six_deletable_rows():
 
 def test_never_offer_deleting_every_data_row(tmp_path):
     source = _source(tmp_path, 'Taxon,A\na,\nb,\n')
-    assert not source_backed_choices(_finding(source), source, {'choices': []})
+    choices = source_backed_choices(_finding(source), source, {'choices': []})
+    assert choices and all(op['operation'] != 'drop_rows' for choice in choices for op in choice['operations'])
 
 
 def test_click_request_is_approved_scope_not_model_invented_rows():

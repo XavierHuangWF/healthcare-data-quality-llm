@@ -50,7 +50,7 @@ def test_cleaning_page_is_open_while_individual_findings_wait(monkeypatch):
     labels = [label for label, _ in streamlit.buttons]
     assert labels == [
         "Clean data with LM model", "Manage skills & memory",
-        "Data quality findings", "Supporting evidence",
+        "Data quality findings",
     ]
     assert streamlit.buttons[0][1]["disabled"] is False
     assert all(not options["disabled"] for _, options in streamlit.buttons[1:])
@@ -70,9 +70,9 @@ def test_first_suggestion_unlocks_clean_as_default(monkeypatch):
     assert app._resolve_results_page("investigation-one", True) == "clean"
     app._render_results_navigation("clean", True)
     assert streamlit.buttons[0][1]["disabled"] is False
-    assert streamlit.buttons[0][1]["type"] == "primary"
+    assert streamlit.buttons[0][1]["type"] == "secondary"
     app._select_results_page("evidence")
-    assert app._resolve_results_page("investigation-one", True) == "evidence"
+    assert app._resolve_results_page("investigation-one", True) == "findings"
     assert app._resolve_results_page("new-investigation", False) == "clean"
     assert app._resolve_results_page("new-investigation", True) == "clean"
 
@@ -95,7 +95,7 @@ def test_main_ui_only_renders_one_page_and_has_one_suggestion_gate():
     code = (ROOT / "app.py").read_text(encoding="utf-8")
     assert 'active_page == "clean"' in code
     assert 'active_page == "findings"' in code
-    assert 'active_page == "evidence"' in code
+    assert 'active_page == "evidence"' not in code
     assert 'active_page == "memory"' in code
     assert "st.tabs(results_tab_labels)" not in code
     assert "st.fragment(run_every=\"3s\")(_unlock_results_when_suggestion_ready)()" in code

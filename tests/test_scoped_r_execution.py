@@ -209,7 +209,7 @@ class ReviewUI:
         return label == "Review R cleaning and insertion code"
 
     def form_submit_button(self, label, *args, **kwargs):
-        return self.exec_submit and label.startswith("Yes — Apply 1 verified cell change") and not kwargs.get("disabled", False)
+        return self.exec_submit and label.startswith("Apply 1 verified cell change") and not kwargs.get("disabled", False)
 
 
 def test_ui_automatically_runs_isolated_r_then_merges_only_after_final_approval(tmp_path, monkeypatch):

@@ -19,10 +19,10 @@ from pathlib import Path
 
 from healthcare_data_quality.ui.cleaning_review import recommend_single_finding
 from healthcare_data_quality.services.llm_client import (
-    model_request_priority, _max_active_requests, interactive_model_request_pending,
+    model_request_priority, model_reconnect_mode, _max_active_requests, interactive_model_request_pending,
 )
 
-_JOB_SCHEMA = 4
+_JOB_SCHEMA = 5
 _DEFAULT_CACHE_DIR = (Path.home() / ".local" / "share" /
                       "healthcare-data-quality-llm" / "cleaning-recommendations")
 
@@ -171,6 +171,16 @@ def ranked_reviewed_solutions(finding: dict, source: Path,
             for line in stream:
                 if len(line) <= 1_000_000:
                     recent.append(line)
+    from healthcare_data_quality.ui.human_choice_replay import action_key, _history
+    from collections import Counter
+    frequencies = Counter()
+    for r in _history(path):
+        if r.get("decision") != "approved_edit":
+            continue
+        try:
+            frequencies[(r.get("finding_type"), r.get("source_sha256"), action_key(r.get("operations") or []))] += 1
+        except (TypeError, AttributeError, ValueError):
+            continue
     ranked, seen_rules, revoked = [], set(), set()
     for line in reversed(recent):
         try:
@@ -191,10 +201,10 @@ def ranked_reviewed_solutions(finding: dict, source: Path,
                     or not isinstance(op.get("changes"), list) or not op["changes"]
                     for op in ops)):
             continue
-        fingerprint = json.dumps(ops, sort_keys=True, ensure_ascii=False, default=str)
+        fingerprint = action_key(ops)
         # Deduplicate the *method within the same issue*. A structurally
         # similar edit in another kind of finding can still inform Gemma.
-        seen_key = (record.get("finding_type"), fingerprint)
+        seen_key = (record.get("finding_type"), record.get("source_sha256"), fingerprint)
         if seen_key in seen_rules:
             continue
         seen_rules.add(seen_key)
@@ -214,9 +224,10 @@ def ranked_reviewed_solutions(finding: dict, source: Path,
                 4 if related else 5)
         match = {"match": "exact" if exact else "similar", "record": record,
                  "source_match": same_source,
+                 "historical_approval_count": frequencies[(record.get("finding_type"), record.get("source_sha256"), action_key(ops))],
                  "issue_relation": "same" if same_issue else "related" if related else "same_csv_other"}
         ranked.append((tier, match))
-    ranked.sort(key=lambda entry: entry[0])
+    ranked.sort(key=lambda entry: (entry[0], -entry[1]["historical_approval_count"]))
     main = [entry for _, entry in ranked if entry["issue_relation"] == "same"]
     other = [entry for _, entry in ranked if entry["issue_relation"] != "same"]
     if other and limit >= 2:
@@ -251,7 +262,10 @@ def reviewed_method_context(finding: dict, source: Path, *, limit: int = 16) -> 
             "operation_types": [str(op.get("operation") or "") for op in ops[:16]],
             "same_original_csv": bool(match.get("source_match")),
             "issue_relation": str(match.get("issue_relation") or "")[:28],
+            "historical_approval_count": match.get("historical_approval_count", 0),
             "historical_target_count": sum(len(op.get("changes") or []) for op in ops),
+            **({"previous_approved_button_wording": str(record["button_label"])[:140]}
+               if record.get("button_label") else {}),
         })
     return methods
 
@@ -295,6 +309,7 @@ def _prompt_finding(item: dict, runtime: dict | None = None) -> dict:
             "source_pattern_summary": (runtime or {}).get("source_pattern_summary"),
             "exact_prior_no_change": bool((runtime or {}).get("exact_prior_no_change")),
             "recent_failure_patterns": list((runtime or {}).get('recent_failure_patterns') or []),
+            "related_findings": list((runtime or {}).get('related_findings') or []),
             }
 
 
@@ -437,6 +452,10 @@ class CleaningRecommendationJobs:
                     # persistent job manifest remains _minimal_finding() and
                     # never serializes these potentially sensitive values.
                     "finding_for_memory": deepcopy(item),
+                    "related_findings": [
+                        {"id": f.get("id"), "title": str(f.get("title") or "")[:160],
+                         "check_key": f.get("check_key"), "affected_count": f.get("total_evidence_records", len(f.get("evidence") or []))}
+                        for f in catalog if f.get("dataset_id") == item.get("dataset_id") and f.get("id") != item.get("id")][:50],
                     "evidence_registry": item.get("evidence_registry"),
                     "reviewed_methods": list((reviewed_methods or {}).get(str(item["id"])) or []),
                     "learned_skills": _learned_skills_for_finding(item),
@@ -513,9 +532,13 @@ class CleaningRecommendationJobs:
         return key
 
     def snapshot(self, key: str) -> dict | None:
-        with self._lock:
-            result = self._load(key)
-            return deepcopy(result) if result else None
+        # _save publishes an atomic replacement; readers see an entire old or
+        # new JSON file, never a partially written queue. Do not hold the UI
+        # behind a writer's fsync (particularly on WSL-mounted storage).
+        try:
+            return self._load(key)
+        except FileNotFoundError:
+            return None
 
     def _run(self, key: str, *, assist: bool = False) -> None:
         try:
@@ -574,7 +597,7 @@ class CleaningRecommendationJobs:
             try:
                 # The background prompt is short. An interactive request already
                 # waiting gets priority before the NEXT background inference.
-                with model_request_priority("idle_assist" if assist else "recommendation"):
+                with model_request_priority("idle_assist" if assist else "recommendation"), model_reconnect_mode():
                     with self._lock:
                         runtime = self._runtime_context.get(key, {}).get(fid)
                     # Re-read approved methods and skills immediately before
@@ -612,23 +635,35 @@ class CleaningRecommendationJobs:
                                 record.get("decision") == "reviewed_no_change")
                         except (OSError, ValueError, TypeError):
                             current["exact_prior_no_change"] = False
-                    # A malformed/temporarily interrupted local inference gets
-                    # one automatic retry without resetting any other finding.
-                    for attempt in range(2):
-                        try:
-                            recommendation = self._recommender(_prompt_finding(next_item, current))
-                            if not isinstance(recommendation, dict) or not str(recommendation.get("suggestion", "")).strip():
-                                raise ValueError("Empty Gemma recommendation")
-                            break
-                        except (RuntimeError, ValueError, TimeoutError, OSError):
-                            if attempt:
-                                raise
+                    # Prepare exact remembered and source-backed candidates independently
+                    # of free-form drafting. When two choices already exist including
+                    # a prior human approval, Gemma reviews those directly rather than
+                    # requiring another speculative recommendation first.
+                    from healthcare_data_quality.ui.human_choice_replay import memory_first_candidates
+                    seeds = memory_first_candidates(full_finding, Path(source_path)) if source_path else []
+                    has_preferred = any(c.get('historical_approval_count', 0) > 0 for c in seeds)
+                    recommendation = None
+                    if len(seeds) >= 2 and has_preferred and self._choice_assessor is not None:
+                        recommendation = {'suggestion': 'Review previously approved and source-backed alternatives.',
+                                          'choices': []}
+                    if recommendation is None:
+                        for attempt in range(2):
+                            try:
+                                recommendation = self._recommender(_prompt_finding(next_item, current))
+                                if not isinstance(recommendation, dict) or not str(recommendation.get("suggestion", "")).strip():
+                                    raise ValueError("Empty Gemma recommendation")
+                                break
+                            except (RuntimeError, ValueError, TimeoutError, OSError):
+                                if attempt:
+                                    if not seeds or self._choice_assessor is None:
+                                        raise
+                                    recommendation = {'suggestion': 'Review independently prepared alternatives.',
+                                                      'choices': []}
                     reviewed_options = []
                     source_path = current.get('source_path')
                     if source_path is not None:
-                        from healthcare_data_quality.services.recommendation_options import source_backed_choices
                         full = current.get('finding_for_memory') or next_item
-                        candidates = source_backed_choices(full, Path(source_path), {
+                        candidates = memory_first_candidates(full, Path(source_path), {
                             **recommendation,
                             'memory_context': current.get('reviewed_methods') or [],
                             'approved_row_deletion_method_seen': any(
@@ -636,7 +671,7 @@ class CleaningRecommendationJobs:
                                 for m in current.get('reviewed_methods') or []),
                         })
                         if self._choice_assessor is not None:
-                            for candidate in candidates[:3]:
+                            for candidate in candidates[:5]:
                                 # A transient inference failure should not
                                 # strand this one finding. The second attempt
                                 # reviews the identical source-bound candidate;
@@ -646,14 +681,29 @@ class CleaningRecommendationJobs:
                                         assessment = self._choice_assessor(
                                             full, Path(source_path), candidate,
                                             methods=current.get('reviewed_methods'),
-                                            skills=current.get('learned_skills'))
+                                            skills=current.get('learned_skills'),
+                                            review_context={'findings': current.get('related_findings') or []})
                                         if not isinstance(assessment, dict) or 'can_offer' not in assessment:
                                             raise ValueError('Gemma option appraisal omitted its decision')
                                         reviewed_options.append(assessment)
                                         break
-                                    except (RuntimeError, ValueError, TimeoutError, OSError, ConnectionError):
+                                    except (RuntimeError, ValueError, TimeoutError, OSError, ConnectionError) as exc:
                                         if assessment_attempt:
-                                            raise
+                                            # A timed-out/invalid *advisory* review must
+                                            # not discard an independently source-verified
+                                            # recommendation and strand its reviewer UI.
+                                            # Record failure as not assessed, not endorsed.
+                                            from healthcare_data_quality.services.model_plan_review import option_fingerprint
+                                            reviewed_options.append({
+                                                'fingerprint': option_fingerprint(
+                                                    full, Path(source_path), candidate),
+                                                'can_offer': False,
+                                                'decision': 'unavailable',
+                                                'scope_matches': None,
+                                                'has_extra_changes': None,
+                                                'reason': ('Gemma assessment unavailable ('
+                                                           + type(exc).__name__ + ').'),
+                                            })
                 item = {"status": "ready", "updated_at": _now(),
                         "assisted_by_agent_c": bool(assist),
                         "suggestion": str(recommendation["suggestion"])[:2200],
@@ -673,7 +723,7 @@ class CleaningRecommendationJobs:
                              "same_original_csv": bool(m.get("same_original_csv"))}
                             for m in (current.get("reviewed_methods") or [])[:3]
                             if isinstance(m, dict)],
-                        "choices": list(recommendation.get("choices") or [])[:3],
+                        "choices": list(recommendation.get("choices") or [])[:5],
                         "gemma_option_reviews": reviewed_options,
                         # Bounded, aggregate-only trace of actual source
                         # patterns and prior exact-source no-change preference.
@@ -689,6 +739,10 @@ class CleaningRecommendationJobs:
                 item = {"status": "failed", "updated_at": _now(),
                         "assisted_by_agent_c": bool(assist),
                         "error": f"{type(exc).__name__}: {str(exc)[:400]}"}
+            # Durable producer provenance on BOTH success and failure.
+            # Rendering must not guess the worker from the global Agent B
+            # queue title after C borrows the idle recommendation lane.
+            item["worker_role"] = "agent_c_idle_assist" if assist else "agent_b"
             item["manual_retries"] = prior_retry_count
             with self._lock:
                 state = self._load(key)

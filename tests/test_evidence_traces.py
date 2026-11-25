@@ -93,10 +93,10 @@ def test_missing_gemma_citations_are_not_invented():
 
 def test_evidence_ui_does_not_repeat_entire_ai_history_or_empty_exploratory_banner():
     source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
-    view = source.split("def render_finding_evidence(", 1)[1].split("def render_cleaning_workspace(", 1)[0]
+    view = source.split("def render_finding_details(", 1)[1].split("def schedule_agent_b_once(", 1)[0]
     assert "render_technical_history(audit)" not in view
-    assert 'if exploratory_runs:' in view
-    assert 'st.markdown("#### Gemma exploratory findings")' not in view
-    assert "registered_investigation_evidence(audit, dataset_paths)" not in view  # duplicated narrative intentionally excluded
-    assert 'baseline_evidence_trace(' in view
-    assert "st.code(str(proposal.get(\"code\")" in view
+    assert "registered_investigation_evidence(audit, dataset_paths)" not in view
+    assert "baseline_evidence_trace(" in view
+    assert "dataset_finding_evidence(" in view
+    assert "render_details" in source
+    assert "def render_finding_evidence(" not in source

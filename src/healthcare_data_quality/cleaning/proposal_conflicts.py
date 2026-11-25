@@ -23,7 +23,8 @@ def _row_deletions(approved_rows: list[dict]) -> set[int]:
 
 def proposal_conflicts(operations: list[dict], source: Path, staged: bytes,
                        approved_rows: list[dict] | None = None,
-                       approved_columns: list[dict] | None = None) -> list[str]:
+                       approved_columns: list[dict] | None = None, *,
+                       approved_flags: list[dict] | None = None) -> list[str]:
     """Return specific conflicts; no mutation or plan rewriting is performed."""
     from healthcare_data_quality.cleaning.in_memory_cleaning import _records
     original = _records(Path(source).read_bytes())
@@ -34,6 +35,8 @@ def proposal_conflicts(operations: list[dict], source: Path, staged: bytes,
     removed_rows = _row_deletions(approved_rows or [])
     removed_columns = {p.get('position') for p in approved_columns or []}
     issues = []
+    # Visual annotations are coordinate-bound styling, not approved values.
+    # They persist on surviving cells; actual earlier value edits still conflict.
     for plan in operations or []:
         kind = plan.get('operation')
         for change in plan.get('changes') or []:
@@ -72,10 +75,18 @@ def filter_conflicting_choices(choices: list[dict], *, state, finding: dict,
         if choice.get('decision') == 'no_change':
             valid.append(choice)
             continue
+        if any(op.get('operation') == 'flag_cells' for op in choice.get('operations', [])):
+            from healthcare_data_quality.cleaning.visual_recommendations import visual_targets_current
+            if visual_targets_current(state, finding, source, choice):
+                valid.append(choice)
+            else:
+                blocked.append('Annotation targets changed or were removed')
+            continue
         conflicts = proposal_conflicts(
             choice.get('operations') or [], source, current,
             state.get('cleaning_approved_rows_by_dataset', {}).get(ds_id, []),
             state.get('cleaning_approved_columns_by_dataset', {}).get(ds_id, []),
+            approved_flags=state.get('cleaning_visual_flags_by_dataset', {}).get(ds_id, []),
         )
         if conflicts:
             blocked.extend(conflicts)

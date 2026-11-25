@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from time import monotonic, time
@@ -58,7 +59,8 @@ from healthcare_data_quality.ui.finding_presentation import (
 )
 from healthcare_data_quality.workflow import run_initial_audit
 from healthcare_data_quality.jobs.investigation_jobs import investigation_manager
-from healthcare_data_quality.services.llm_client import model_request_priority
+from healthcare_data_quality.services.llm_client import model_request_priority, model_reconnect_mode
+from healthcare_data_quality.services.model_connectivity import model_connection_snapshot
 from healthcare_data_quality.agents.exploratory_agent import MAX_ROUNDS
 from healthcare_data_quality.agents.exploratory_combined import run_exploratory_series
 from healthcare_data_quality.agents.exploratory_sandbox import sandbox_available, SandboxUnavailable
@@ -715,13 +717,14 @@ def preview_csv(path: Path) -> pd.DataFrame:
 
 
 def numbered_finding_title(title: str, index: int | None = None) -> str:
-    """Display-only numbering matching the Supporting evidence check order."""
+    """Display-only numbering shared by findings and their evidence."""
     return f"Finding {index} · {title}" if index is not None else title
 
 
 def show_finding(
     title: str, explanation: str, evidence: list[dict],
     next_step: str = "", *, finding_index: int | None = None,
+    render_details: Callable[[], None] | None = None,
 ) -> None:
     """Reader-facing finding; structured evidence stays expandable."""
     with st.container(border=True):
@@ -732,9 +735,12 @@ def show_finding(
         if evidence:
             with st.expander(f"View affected rows ({len(evidence):,})"):
                 st.dataframe(pd.DataFrame(evidence), hide_index=True, width="stretch")
+        if render_details:
+            render_details()
 
 
-def show_taxonomy_structure_finding(finding: dict, *, finding_index: int | None = None) -> None:
+def show_taxonomy_structure_finding(finding: dict, *, finding_index: int | None = None,
+                                    render_details: Callable[[], None] | None = None) -> None:
     """Show all original classifications and an explicit rank-by-rank expectation."""
     with st.container(border=True):
         st.markdown(f"**{numbered_finding_title(finding['title'], finding_index)}**")
@@ -756,10 +762,13 @@ def show_taxonomy_structure_finding(finding: dict, *, finding_index: int | None 
 
         if finding.get("next_step"):
             st.write("**What to check next:**", finding["next_step"])
+        if render_details:
+            render_details()
 
 
 
-def render_header_findings(path: Path, details: dict, *, start_index: int = 1) -> None:
+def render_header_findings(path: Path, details: dict, *, start_index: int = 1,
+                           detail_for: Callable[[int], Callable[[], None]] | None = None) -> None:
     repeated = header_findings(path, details)
     missing_and_width = header_issues(details)
     if not repeated and not missing_and_width:
@@ -776,13 +785,15 @@ def render_header_findings(path: Path, details: dict, *, start_index: int = 1) -
             "Rows not comparable": finding.get("uncomparable_rows", 0),
         }] if len(finding["columns"]) == 2 else []
         show_finding(finding["title"], finding["explanation"], evidence, finding["next_step"],
-                     finding_index=finding_index)
+                     finding_index=finding_index, render_details=detail_for(finding_index) if detail_for else None)
     for finding_index, finding in enumerate(missing_and_width, start=start_index + len(repeated)):
         show_finding(finding["title"], finding["explanation"], finding["rows"],
-                     finding["next_step"], finding_index=finding_index)
+                     finding["next_step"], finding_index=finding_index,
+                     render_details=detail_for(finding_index) if detail_for else None)
 
 
-def render_baseline(dataset_id: str, baseline: dict, source_path: Path | None = None) -> int:
+def render_baseline(dataset_id: str, baseline: dict, source_path: Path | None = None, *,
+                    detail_for: Callable[[int], Callable[[], None]] | None = None) -> int:
     checks = baseline.get("checks") or {}
     invalid = checks.get("find_invalid_counts") or {}
     counts = invalid.get("counts_by_type") or {}
@@ -807,11 +818,13 @@ def render_baseline(dataset_id: str, baseline: dict, source_path: Path | None = 
         st.markdown(f"**Issues to review ({len(findings)})**")
         for finding_index, finding in enumerate(findings, start=1):
             if finding.get("type") == "taxonomy_structure":
-                show_taxonomy_structure_finding(finding, finding_index=finding_index)
+                show_taxonomy_structure_finding(finding, finding_index=finding_index,
+                                               **({"render_details": detail_for(finding_index)} if detail_for else {}))
             else:
                 show_finding(finding["title"], finding["explanation"],
                              finding["evidence"], finding["next_step"],
-                             finding_index=finding_index)
+                             finding_index=finding_index,
+                             **({"render_details": detail_for(finding_index)} if detail_for else {}))
 
     with st.expander("Technical check results (advanced)"):
         check_table = []
@@ -995,217 +1008,74 @@ def render_technical_history(audit: dict) -> None:
                          "observations": observations})
 
 
-def render_finding_evidence(
-    audit: dict, dataset_paths: list[Path], filenames: list[str],
-    header_reports: list[dict], exploratory_runs: list[dict],
-) -> None:
-    """Show how each result was obtained, never a second findings report.
+def render_finding_details(entry: dict, baseline: dict, source: Path) -> None:
+    """Supplement one finding; do not repeat its affected-record table."""
+    trace = baseline_evidence_trace(entry, baseline, source)
+    with st.expander("Detection method and verification", expanded=False):
+        st.write(trace["rule"])
+        if trace["measurements"]:
+            st.dataframe(pd.DataFrame(measurement_rows_for_display(trace["measurements"])),
+                         hide_index=True, width="stretch")
+        st.caption(f"Read-only check: {trace['check_name']} · Source: original CSV")
+        # Header comparison samples are distinct from the primary pair summary.
+        if trace["check_key"] == "compare_repeated_headers" and trace["examples"]:
+            st.dataframe(pd.DataFrame(trace["examples"]), hide_index=True, width="stretch")
+            if trace["examples_omitted"]:
+                st.caption(f"{trace['examples_omitted']:,} additional rows not shown.")
+        st.caption("Scientific limitation: " + str(trace["limitation"]))
+        with st.expander("View Python detection code (advanced)"):
+            st.caption("Installed source code; historic audits may have used a different version.")
+            code_items = deterministic_detection_code(trace["check_key"])
+            if not code_items:
+                st.warning("Installed detection code is unavailable.")
+            for item in code_items:
+                st.write(f"**{item['path']} · {item['function']}()**")
+                st.code(item["code"], language="python")
 
-    This view is explanation-only: the Data quality findings tab retains the
-    full original affected rows. It does not re-run Gemma or authorize cleaning.
-    """
-    st.subheader("How the data quality results were obtained")
-    st.caption(
-        "Each check shows how the result was calculated from your original CSV. "
-        "Expand a check for its rule and measured observations; open 'View Python "
-        "detection code' only if you need to audit the actual implementation. "
-        "Complete affected records remain in Data quality findings."
-    )
+
+def render_combined_findings(audit: dict, paths: list[Path], filenames: list[str],
+                             header_reports: list[dict]) -> None:
+    """One read-only finding card per issue, with its evidence and method together."""
     baselines = audit.get("dataset_baselines") or {"dataset_1": audit.get("baseline") or {}}
     for dataset_id, baseline in baselines.items():
         index = int(dataset_id.rsplit("_", 1)[-1]) - 1
-        if not 0 <= index < len(dataset_paths):
+        if not 0 <= index < len(paths):
             continue
-        entries = dataset_finding_evidence(baseline, dataset_paths[index], header_reports[index])
-        if not entries:
-            continue
-        st.markdown(f"#### Dataset {index + 1}: {filenames[index]} — check evidence")
-        for ordinal, entry in enumerate(entries, start=1):
-            trace = baseline_evidence_trace(entry, baseline, dataset_paths[index])
-            # Short matching label is for navigation, not a second issue card.
-            with st.expander(f"Check {ordinal} · {entry['title']}"):
-                st.markdown("**Detection rule**")
-                st.write(trace["rule"])
-                if trace["measurements"]:
-                    st.markdown("**How the finding was calculated**")
-                    st.dataframe(pd.DataFrame(measurement_rows_for_display(trace["measurements"])),
-                                 hide_index=True, width="stretch")
-                st.caption(f"Read-only check: {trace['check_name']} · Source: original CSV")
-                with st.expander("View Python detection code (advanced)"):
-                    st.caption(
-                        "The actual source functions installed in this project, not "
-                        "AI-generated or illustrative code. The check reads the CSV; "
-                        "the Findings tab groups its recorded observations by issue type. "
-                        "For a restored historic run, the current source file may "
-                        "differ from the implementation used when the audit was saved."
-                    )
-                    code_items = deterministic_detection_code(trace["check_key"])
-                    if code_items:
-                        for item in code_items:
-                            st.write(f"**{item['path']} · {item['function']}()**")
-                            st.code(item["code"], language="python")
-                    else:
-                        st.warning(
-                            "The installed source for this check is not available. "
-                            "No replacement code has been fabricated."
-                        )
-                examples = trace["examples"]
-                if examples:
-                    with st.expander(f"Inspect source-data examples ({len(examples)} shown)"):
-                        st.dataframe(pd.DataFrame(examples), hide_index=True, width="stretch")
-                        if trace["examples_omitted"]:
-                            st.caption(
-                                f"{trace['examples_omitted']:,} additional observations/rows are "
-                                "not repeated here. Open the matching finding for its full source evidence."
-                            )
-                st.caption("Scientific limitation: " + str(trace["limitation"]))
-
-    # The first tab does not expose the agent's raw narrative as separate QC
-    # findings. Do not give it its own evidence list here: the registered tools
-    # frequently inspect exactly the cells already covered by deterministic
-    # checks (e.g. repeated headers). Those original observations are retained
-    # in the downloadable audit, not duplicated in this user-facing view.
-    #
-    # Only verified exploratory investigations that are ALSO shown in the
-    # Data quality findings tab receive evidence entries. This is alignment by
-    # the underlying result objects, never hard-coded overlap keywords or an
-    # extra, potentially non-deterministic model call on every Streamlit rerun.
-    if exploratory_runs:
-        st.markdown("#### Gemma investigation evidence")
-        st.caption(
-            "Evidence for the Gemma investigations shown in Data quality findings, "
-            "including completed checks that found no additional issue. "
-            "The original executed code and source verification are shown here; "
-            "agent tool logs already covered by dataset QC are not repeated."
-        )
-        # Use the same filtering and numbering as render_exploratory_findings.
-        visible_runs = exploratory_runs_with_findings(exploratory_runs)
-        checked_runs = exploratory_runs_without_findings(exploratory_runs)
-        for round_number, run in [*visible_runs, *checked_runs]:
-            proposal = run.get("proposal") or {}
-            output = run.get("result") or {}
-            verification = run.get("verification") or {}
-            findings = output.get("findings") or []
-            if findings:
-                label = f"Investigation {round_number} · {proposal.get('hypothesis') or 'Additional analysis'}"
-            else:
-                label = f"{gemma_completed_check_title(round_number, run)} — no additional issue"
-            with st.expander(label, expanded=False):
-                st.markdown("**How Gemma tested this**")
-                st.write("**Question examined:**", proposal.get("hypothesis") or "Not recorded")
-                st.write("**Detection method:**", proposal.get("method") or "Not recorded")
-                if proposal.get("assumptions"):
-                    st.write("Assumptions:", proposal["assumptions"])
-                # An accepted result must have already passed sandbox execution;
-                # this is its recorded code, never newly generated or executed.
-                with st.expander("View executed Gemma Python test (advanced)"):
-                    st.caption(
-                        "This is the saved code accepted for this check, including "
-                        "any successful repair. It was run in the read-only sandbox "
-                        "and is displayed here without executing it again."
-                    )
-                    st.code(str(proposal.get("code") or "# Code not recorded"), language="python")
-
-                st.markdown("**What the executed test returned**")
-                if findings:
-                    # These candidate findings are exactly the ones visible on
-                    # the first tab after exploration-stage redundancy filtering.
-                    for number, finding in enumerate(findings, start=1):
-                        st.write(f"Candidate {number}: {finding.get('title') or 'Untitled'}")
-                        refs = finding.get("evidence") or []
-                        if refs:
-                            st.dataframe(pd.DataFrame(refs), hide_index=True, width="stretch")
-                        else:
-                            st.warning("No individual source-cell references were saved for this candidate.")
-                else:
-                    # Empty candidate lists are still meaningful completed
-                    # tests. The current sandbox output schema provides a free-
-                    # text summary but not necessarily a per-column metric table.
-                    # Show the saved result, not manufactured measurements.
-                    st.write(output.get("summary") or "No summary was recorded.")
-                    st.caption(
-                        "No additional candidate findings were returned. If the "
-                        "summary contains no numerical breakdown, inspect the "
-                        "executed code; the audit does not provide one."
-                    )
-                with st.expander("Verification record (advanced)"):
-                    st.json(verification)
-                if verification.get("status") == "source_cells_verified_and_output_reproduced":
-                    st.caption(
-                        "Cited source cells (when present) matched the originals "
-                        "and the sandbox output was reproduced. This does not "
-                        "independently validate the scientific interpretation."
-                    )
-                else:
-                    st.caption(
-                        "Check the saved verification record before relying on "
-                        "this result; scientific interpretation requires review."
-                    )
+        source = paths[index]
+        st.subheader(f"Dataset {index + 1}: {filenames[index]}")
+        entries = dataset_finding_evidence(baseline, source, header_reports[index])
+        def detail_for(ordinal):
+            def render():
+                if 0 < ordinal <= len(entries):
+                    entry = entries[ordinal - 1]
+                    from healthcare_data_quality.cleaning.current_review_evidence import current_finding_evidence
+                    try:
+                        projection = current_finding_evidence(st.session_state if callable(getattr(st.session_state, "get", None)) else {}, {**entry,
+                            'id': f'{dataset_id}:qc:{ordinal}', 'dataset_id': dataset_id}, source, display=True,
+                            catalog=(st.session_state.get('cleaning_review_catalog_snapshot', [])
+                                     if callable(getattr(st.session_state, 'get', None)) else [])
+                                    or [{**e, 'source': 'QC', 'dataset_id': dataset_id,
+                                         'id': f'{dataset_id}:qc:{i}'} for i,e in enumerate(entries, 1)])
+                    except (OSError, ValueError, PermissionError, csv.Error):
+                        projection = []
+                    if any(r['Original'] != r['Current'] for r in projection):
+                        st.dataframe(pd.DataFrame(projection), hide_index=True, width='stretch')
+                    render_finding_details(entry, baseline, source)
+            return render
+        count = render_baseline(dataset_id, baseline, source_path=source, detail_for=detail_for)
+        render_header_findings(source, header_reports[index], start_index=count + 1,
+                               detail_for=detail_for)
 
 
 def schedule_agent_b_once(context_key: str, audit: dict, paths: list[Path],
                           names: list[str], runs: list[dict], *,
                           retry_failed: bool = False) -> str | None:
-    """Start Agent B during Agent A investigation, once per finding and run.
+    """Compatibility hook: discovery never schedules speculative recommendations.
 
-    First call follows deterministic QC; a second call after Gemma exploration
-    only appends new checks. No UI action or cleaned version re-runs advice.
+    The cleaning workspace owns Agent B dispatch for its single active finding.
+    Investigation callbacks run outside Streamlit and must not read review state.
     """
-    from healthcare_data_quality.cleaning.finding_cleaning import build_cleaning_findings
-    run_id = audit.get("cleaning_recommendation_run_id")
-    if not run_id:
-        return None
-    findings = build_cleaning_findings(audit, paths, names, runs)
-    if not findings:
-        return None
-    # Historical approvals are inputs to NEW Gemma assessments, never ready
-    # recommendations. Reuse only relevant, bounded method summaries, including
-    # related finding/check types, before the worker publishes a suggestion.
-    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, reviewed_method_context
-    reviewed_methods = {}
-    for finding in findings:
-        ds_id = str(finding.get("dataset_id") or "")
-        try:
-            index = int(ds_id.rsplit("_", 1)[-1]) - 1
-        except (ValueError, IndexError):
-            index = -1
-        # A Gemma check can span multiple uploads and have no dataset_id.
-        # Assess saved methods against each involved source rather than
-        # silently dropping memory for those checks.
-        sources = ([paths[index]] if 0 <= index < len(paths) else
-                   paths if finding.get("source") != "QC" else [])
-        candidates, seen = [], set()
-        for candidate_source in sources:
-            for method in reviewed_method_context(
-                    finding, Path(candidate_source), limit=16):
-                fingerprint = json.dumps(method, sort_keys=True, ensure_ascii=False)
-                if fingerprint not in seen:
-                    candidates.append(method)
-                    seen.add(fingerprint)
-                if len(candidates) >= 16:
-                    break
-            if len(candidates) >= 16:
-                break
-        reviewed_methods[finding["id"]] = candidates
-    # Source paths are intentionally held only in the worker's process
-    # memory. A later approval can therefore influence findings that were
-    # queued but had not yet received their Gemma inference call.
-    source_paths_by_finding = {}
-    for finding in findings:
-        ds_id = str(finding.get("dataset_id") or "")
-        try:
-            index = int(ds_id.rsplit("_", 1)[-1]) - 1
-        except (ValueError, IndexError):
-            index = -1
-        if 0 <= index < len(paths):
-            source_paths_by_finding[str(finding["id"])] = Path(paths[index])
-        elif len(paths) == 1:
-            source_paths_by_finding[str(finding["id"])] = Path(paths[0])
-    return recommendation_manager().start(
-        context_key, findings, run_id=run_id, reviewed_methods=reviewed_methods,
-        source_paths_by_finding=source_paths_by_finding,
-        retry_failed=retry_failed,
-    )
+    return None
 
 
 def _review_action_button_css() -> str:
@@ -1276,6 +1146,83 @@ def _review_action_button_css() -> str:
     div[data-testid="stMarkdown"]:has(.hdq-cleaning-completed-marker) {
         display: none;
     }
+        /* HDQ_MARK_REVIEWED_BLUE_V1: A reviewer decision to leave data unchanged is BLUE, not red. */
+    div[class*="st-key-review_mark_no_change_"] button:not(:disabled),
+    div[class*="st-key-review_mark_reviewed_"] button:not(:disabled),
+    div[class*="st-key-review_mark_unchanged_"] button:not(:disabled),
+    div[class*="st-key-review_no_action_"] button:not(:disabled),
+    div[class*="st-key-review_close_any_"] button:not(:disabled),
+    div[class*="st-key-review_no_change_"] button:not(:disabled),
+    div[class*="st-key-review_resolution_model_fallback_"] button:not(:disabled) {
+        background: #2563eb !important;
+        background-color: #2563eb !important;
+        border: 1px solid #2563eb !important;
+        color: #fff !important;
+        box-shadow: none !important;
+    }
+    div[class*="st-key-review_mark_no_change_"] button:not(:disabled):hover,
+    div[class*="st-key-review_mark_reviewed_"] button:not(:disabled):hover,
+    div[class*="st-key-review_mark_unchanged_"] button:not(:disabled):hover,
+    div[class*="st-key-review_no_action_"] button:not(:disabled):hover,
+    div[class*="st-key-review_close_any_"] button:not(:disabled):hover,
+    div[class*="st-key-review_no_change_"] button:not(:disabled):hover,
+    div[class*="st-key-review_resolution_model_fallback_"] button:not(:disabled):hover {
+        background: #1d4ed8 !important;
+        background-color: #1d4ed8 !important;
+        border-color: #1d4ed8 !important;
+        color: #fff !important;
+    }
+    div[class*="st-key-review_mark_no_change_"] button:not(:disabled):focus-visible,
+    div[class*="st-key-review_mark_reviewed_"] button:not(:disabled):focus-visible,
+    div[class*="st-key-review_mark_unchanged_"] button:not(:disabled):focus-visible,
+    div[class*="st-key-review_no_action_"] button:not(:disabled):focus-visible,
+    div[class*="st-key-review_close_any_"] button:not(:disabled):focus-visible,
+    div[class*="st-key-review_no_change_"] button:not(:disabled):focus-visible,
+    div[class*="st-key-review_resolution_model_fallback_"] button:not(:disabled):focus-visible {
+        outline: 3px solid #93c5fd !important;
+        outline-offset: 2px !important;
+    }
+    div[class*="st-key-review_mark_no_change_"] button:not(:disabled):active,
+    div[class*="st-key-review_mark_reviewed_"] button:not(:disabled):active,
+    div[class*="st-key-review_mark_unchanged_"] button:not(:disabled):active,
+    div[class*="st-key-review_no_action_"] button:not(:disabled):active,
+    div[class*="st-key-review_close_any_"] button:not(:disabled):active,
+    div[class*="st-key-review_no_change_"] button:not(:disabled):active,
+    div[class*="st-key-review_resolution_model_fallback_"] button:not(:disabled):active {
+        background-color: #1e40af !important;
+        border-color: #1e40af !important;
+        color: #fff !important;
+    }
+    </style>"""
+
+
+# HDQ_BLUE_REVIEW_CLOSURE_V3: CSS always accompanies the rendered review widget.
+def _blue_review_closure_css() -> str:
+    """Style actual dynamic close controls, including failure-recovery closure.
+
+    The previous installers targeted literal button labels or obsolete keys.
+    Current review cards use dynamically generated labels and
+    review_close_any_{fid}; they cannot be detected from label literals.
+    """
+    return """<style>
+    div[class*="st-key-review_close_any_"] button:not(:disabled),
+    div[class*="st-key-review_resolution_model_fallback_"] button:not(:disabled) {
+        background-color: #2563eb !important;
+        border: 1px solid #2563eb !important;
+        color: white !important;
+        -webkit-text-fill-color: white !important;
+    }
+    div[class*="st-key-review_close_any_"] button:not(:disabled):hover,
+    div[class*="st-key-review_resolution_model_fallback_"] button:not(:disabled):hover {
+        background-color: #1d4ed8 !important;
+        border-color: #1d4ed8 !important;
+        color: white !important;
+    }
+    div[class*="st-key-review_close_any_"] button:not(:disabled):focus-visible,
+    div[class*="st-key-review_resolution_model_fallback_"] button:not(:disabled):focus-visible {
+        outline: 3px solid #93c5fd !important;
+        outline-offset: 2px !important;
+    }
     </style>"""
 
 
@@ -1294,6 +1241,7 @@ def _open_agent_c_alternative_chat(fid: str, *, discard_plan: bool = False) -> N
             "cleaning_r_selfchecks_by_finding", "cleaning_rebased_previews_by_finding",
             "cleaning_explicit_row_deletions_by_finding",
             "cleaning_explicit_column_deletions_by_finding",
+            "cleaning_pending_visual_flags_by_finding",
         ):
             st.session_state.setdefault(field, {}).pop(fid, None)
     else:
@@ -1307,11 +1255,83 @@ def _open_agent_c_alternative_chat(fid: str, *, discard_plan: bool = False) -> N
     st.session_state.setdefault("cleaning_chat_focus_pending", set()).add(fid)
     finding_for_memory = st.session_state.get("cleaning_finding_type_lookup", {}).get(fid)
     if finding_for_memory:
-        try:
-            from healthcare_data_quality.learning.adaptive_skill_memory import record_review
-            record_review(finding_for_memory, "declined_proposal", build_skill=False)
-        except (OSError, ValueError, RuntimeError, TypeError):
-            pass
+        from healthcare_data_quality.ui.async_review_feedback import (
+            record_decline_without_blocking,
+        )
+        record_decline_without_blocking(finding_for_memory)
+
+
+
+def _retire_declined_job(fid: str) -> None:
+    state = st.session_state
+    pending = state.setdefault('cleaning_pending_gemma_b', {}).pop(fid, None)
+    if isinstance(pending, dict) and pending.get('job_id'):
+        state.setdefault('cleaning_retired_chat_jobs', set()).add(pending['job_id'])
+    state.setdefault('cleaning_completed_gemma', {}).pop(fid, None)
+    state.setdefault('cleaning_agent_c_completion_notified', set()).discard(fid)
+
+
+def _decline_and_discuss(fid: str) -> None:
+    """A real No rejects EVERY unapproved choice for this finding only.
+
+    Runs before the next Streamlit render (widget callback), so the old
+    choice tree is not painted again. Keep transcript/approved audit intact.
+    """
+    if not _sequential_owner_matches(fid):
+        return
+    state = st.session_state
+    thread = state.setdefault('cleaning_messages_by_finding', {}).setdefault(fid, [])
+    if (thread and thread[-1].get('reviewer_declined_all')
+            and state.get('cleaning_discussion_mode_by_finding', {}).get(fid) == 'alternative'
+            and not state.get('cleaning_plans_by_finding', {}).get(fid)
+            and not state.get('cleaning_pending_visual_flags_by_finding', {}).get(fid)):
+        return
+    from copy import deepcopy
+    rejected = [p for p in [state.get('cleaning_plans_by_finding', {}).get(fid),
+                *(state.get('cleaning_batch_queue_by_finding', {}).get(fid) or [])] if p]
+    visual = state.get('cleaning_pending_visual_flags_by_finding', {}).get(fid)
+    if visual:
+        rejected.append({'operation': 'flag_cells', 'changes': visual.get('flags', []),
+                         'scope': visual.get('scope'), 'request': visual.get('request')})
+    _open_agent_c_alternative_chat(fid, discard_plan=True)
+    _retire_declined_job(fid)
+    # A stale completion/automatic reassessment must not publish an option
+    # while the reviewer is composing a genuinely new instruction.
+    for name in ('cleaning_completed_gemma', 'cleaning_reassess_context_by_finding',
+                 'cleaning_close_request_by_finding', 'cleaning_cross_source_review_by_finding'):
+        state.setdefault(name, {}).pop(fid, None)
+    state.setdefault('cleaning_agent_c_completion_notified', set()).discard(fid)
+    state.setdefault('cleaning_memory_skipped', set()).add(fid)
+    thread.append({'role': 'user', 'content': 'No — Discuss Another Idea',
+                   'reviewer_declined_all': True,
+                   'rejected_proposals': deepcopy(rejected)})
+    state.setdefault('cleaning_keep_open_by_finding', {})[fid] = True
+    state['cleaning_active_finding'] = fid
+    state['cleaning_scroll_target'] = (fid, False)
+    state['cleaning_review_tree_refresh_required'] = True
+
+
+def _waiting_for_new_discussion(state, fid: str) -> bool:
+    """After No, wait for a new human message, not an old reply or hidden retry."""
+    if state.get('cleaning_discussion_mode_by_finding', {}).get(fid) != 'alternative':
+        return False
+    turns = [m for m in state.get('cleaning_messages_by_finding', {}).get(fid, [])
+             if m.get('role') == 'user' and not m.get('automatic')]
+    return (bool(turns[-1].get('reviewer_declined_all')) if turns else
+            not state.get('cleaning_messages_by_finding', {}).get(fid))
+
+
+def _replaceable_review_body(fid: str):
+    """Replace the frontend identity on explicit rejection, not a reused empty block."""
+    thread = st.session_state.get('cleaning_messages_by_finding', {}).get(fid, [])
+    epoch = sum(bool(m.get('reviewer_declined_all')) for m in thread)
+    digest = hashlib.sha256(fid.encode()).hexdigest()[:16]
+    return st.container(key=f'hdq_review_body_{digest}_{epoch}')
+
+
+def _flush_declined_review_tree() -> None:
+    """Consume the rejection marker inside the owning render, without rerunning the app."""
+    st.session_state.pop('cleaning_review_tree_refresh_required', None)
 
 
 def _recommendation_preview(text: str, max_chars: int = 220) -> str:
@@ -1342,7 +1362,78 @@ def _active_agent_c_control_generation(fid: str) -> int:
         "cleaning_control_generation_by_finding", {}).get(fid, 0))
 
 
-def _render_before_after(plans: list[dict]) -> None:
+def _render_proposed_numeric_context(source: Path | None, plans: list[dict]) -> None:
+    if source is None:
+        return
+    # Reference comparisons explain changed values/names, not removals.
+    # Mixed proposals still show evidence for their non-deletion operations.
+    evidence_plans = [p for p in plans if p.get('operation') in {'replace_cells', 'rename_headers', 'merge_rows'}]
+    active = st.session_state.get('cleaning_sequential_active')
+    ds = next((f.get('dataset_id') for f in st.session_state.get('cleaning_review_catalog_snapshot', []) if f.get('id') == active), None)
+    rows = []
+    if evidence_plans:
+        rows = _render_value_reference_context(source, evidence_plans, ds, active)
+    # Warn BEFORE committing an action which removes previously approved flags.
+    removed_rows = {ch.get('row') if p.get('operation') == 'drop_rows' else ch.get('source_row')
+                    for p in plans if p.get('operation') in {'drop_rows','merge_rows'} for ch in p.get('changes',[])}
+    removed_columns = {ch.get('position') for p in plans if p.get('operation') == 'drop_column' for ch in p.get('changes',[])}
+    if removed_rows or removed_columns:
+        from healthcare_data_quality.cleaning.styled_export import approved_flags_for_export
+        try:
+            flags = approved_flags_for_export(st.session_state.get('cleaning_history', []), ds, source.read_bytes()) if ds else []
+            already_rows = {ch.get('row') if a.get('operation') == 'drop_rows' else ch.get('source_row') for a in st.session_state.get('cleaning_approved_rows_by_dataset',{}).get(ds,[]) for ch in a.get('changes',[])}
+            already_cols = {a.get('position') for a in st.session_state.get('cleaning_approved_columns_by_dataset',{}).get(ds,[])}
+            affected = [f for f in flags if f['row'] not in already_rows and f['column'] not in already_cols and (f['row'] in removed_rows or f['column'] in removed_columns)]
+            if affected:
+                st.caption(f'{len(affected)} approved annotations will be removed from cleaned data; preserved in the styled audit.')
+        except (PermissionError,OSError,ValueError):
+            st.caption('Annotation impact unavailable; export remains subject to exact verification.')
+    if rows:
+        st.caption('Compare proposed values with other surviving observations in the same column (sample SD; excluding the target row).')
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+        if len(rows) == 32:
+            st.caption('Up to 32 numeric targets shown.')
+        st.caption('Descriptive statistics only; not proof of the true measurement.')
+
+
+def _render_value_reference_context(source: Path, plans: list[dict], ds: str | None, active: str | None) -> list[dict]:
+    from healthcare_data_quality.cleaning.numeric_context import proposal_numeric_comparisons
+    try:
+        stamp = source.stat().st_mtime_ns
+    except OSError:
+        return []
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    revision = dataset_review_context(st.session_state, ds, active)['revision'] if ds else None
+    key = hashlib.sha256(json.dumps([str(source), stamp, plans, revision], sort_keys=True, default=str).encode()).hexdigest()
+    cache = st.session_state.setdefault('cleaning_proposal_numeric_cache', {})
+    if key not in cache:
+        try:
+            from healthcare_data_quality.cleaning.sequential_context import projected_records
+            projected = projected_records(st.session_state, ds, source) if ds else None
+            cache[key] = proposal_numeric_comparisons(source, plans, projected=projected)
+        except (OSError, ValueError, csv.Error, ArithmeticError, PermissionError):
+            st.caption('Same-column statistics unavailable for this source.')
+            return []
+    from healthcare_data_quality.cleaning.proposal_reference import reference_evidence
+    reference_cache = st.session_state.setdefault('cleaning_proposal_reference_cache', {})
+    if key not in reference_cache:
+        try:
+            from healthcare_data_quality.cleaning.sequential_context import projected_records
+            projected = projected_records(st.session_state, ds, source) if ds else None
+            reference_cache[key] = reference_evidence(projected, plans) if projected else ([], [])
+        except (OSError, ValueError, csv.Error, PermissionError):
+            reference_cache[key] = ([], [])
+    reference_summary, reference_examples = reference_cache[key]
+    if reference_summary or reference_examples:
+        st.caption('Reference evidence · current surviving data')
+        if reference_summary:
+            st.dataframe(pd.DataFrame(reference_summary), hide_index=True, width='stretch')
+        if reference_examples:
+            st.dataframe(pd.DataFrame(reference_examples), hide_index=True, width='stretch')
+    return cache[key]
+
+
+def _render_before_after(plans: list[dict], source: Path | None = None) -> None:
     """Show only exact, independently verified intended edits.
 
     Model prose and aggregate statistics are not substitutes for each source
@@ -1355,6 +1446,7 @@ def _render_before_after(plans: list[dict]) -> None:
             {"Location": item["Target"], "Before": item["Before"],
              "After": item["After"]} for item in changes
         ]), hide_index=True, width="stretch")
+        _render_proposed_numeric_context(source, plans)
 
 
 def _render_source_deletion_details(source: Path, plans: list[dict],
@@ -1378,10 +1470,10 @@ def _agent_c_control_phase(*, mode: str | None, transcript: list,
     All agent roles use this same per-finding state; a prior button is not a
     live authorization to change data.
     """
-    if plan is not None or queued_actions:
-        return "approval", []
     if pending:
         return "processing", []
+    if plan is not None or queued_actions:
+        return "approval", []
     if mode not in {"accepted", "alternative"}:
         return "idle", []
     if custom_value or custom_operation:
@@ -1411,6 +1503,9 @@ def _finding_review_completed(fid: str) -> bool:
     }
     if status not in terminal:
         return False
+    if (fid in st.session_state.get("cleaning_pending_gemma_b", {}) or
+            st.session_state.get("cleaning_pending_visual_flags_by_finding", {}).get(fid)):
+        return False
     if st.session_state.get("cleaning_plans_by_finding", {}).get(fid):
         return False
     if st.session_state.get("cleaning_batch_queue_by_finding", {}).get(fid):
@@ -1430,45 +1525,20 @@ def _finding_review_completed(fid: str) -> bool:
 
 
 def _scroll_to_completed_finding_once(fid: str) -> None:
-    """Restore viewport focus to the just-approved header, only once.
+    """One-shot viewport restoration inside the same Streamlit document."""
+    if st.session_state.get('cleaning_scroll_to_completed_finding') == fid:
+        st.session_state['cleaning_scroll_target'] = (fid, True)
+        st.session_state.pop('cleaning_scroll_to_completed_finding', None)
 
-    Native Streamlit fragments preserve position across most reruns, but
-    collapsing a tall card can move its header out of view. This optional,
-    zero-height browser helper targets only our stable completed marker and
-    never reads user data or changes approval state. If a browser disallows
-    parent access from the component iframe, normal collapse still works.
-    """
-    if st.session_state.get("cleaning_scroll_to_completed_finding") != fid:
-        return
-    st.session_state.pop("cleaning_scroll_to_completed_finding", None)
-    try:
-        from streamlit.components.v1 import html
-    except ImportError:
-        return
-    marker_id = hashlib.sha256(fid.encode("utf-8")).hexdigest()[:20]
-    # The selector embeds only a SHA-256 hex digest, never filename/CSV text.
-    html('''<script>
-    (() => {
-      const markerId = "{marker_id}";
-      let attempts = 0;
-      const restore = () => {
-        try {
-          const node = window.parent.document.querySelector(
-            '.hdq-cleaning-completed-marker[data-review-focus="' + markerId + '"]');
-          const card = node && node.closest('details');
-          if (card) {
-            // Do not rely on Streamlit accepting the new expanded=False
-            // prop after the card was opened manually in the browser.
-            if (card.open) card.open = false;
-            card.scrollIntoView({ block: 'start', behavior: 'instant' });
-            return;
-          }
-        } catch (error) { return; }
-        if (++attempts < 12) window.setTimeout(restore, 75);
-      };
-      window.requestAnimationFrame(restore);
-    })();
-    </script>'''.replace("{marker_id}", marker_id), height=0, scrolling=False)
+
+def _restore_review_viewport():
+    target = st.session_state.pop('cleaning_scroll_target', None)
+    if target and hasattr(st, 'html'):
+        from healthcare_data_quality.ui.review_input_focus import review_viewport_html
+        try:
+            st.html(review_viewport_html(*target), unsafe_allow_javascript=True)
+        except TypeError:
+            pass
 
 
 def _rerun_cleaning_fragment(fid: str | None = None) -> None:
@@ -1480,13 +1550,17 @@ def _rerun_cleaning_fragment(fid: str | None = None) -> None:
     """
     if fid:
         open_map = st.session_state.setdefault("cleaning_keep_open_by_finding", {})
-        open_map.clear()
+        # Preserve unrelated cards' expansion preferences. Clearing this whole
+        # map on a Discuss click collapses other panels and shifts the viewport.
         if _finding_review_completed(fid):
+            open_map.pop(fid, None)
             st.session_state["cleaning_scroll_to_completed_finding"] = fid
         else:
             open_map[fid] = True
             st.session_state.pop("cleaning_scroll_to_completed_finding", None)
         st.session_state["cleaning_active_finding"] = fid
+        st.session_state["cleaning_scroll_target"] = (fid, _finding_review_completed(fid))
+    _flush_declined_review_tree()
     try:
         st.rerun(scope="fragment")
     except TypeError:
@@ -1501,25 +1575,88 @@ def _rerun_cleaning_fragment(fid: str | None = None) -> None:
 
 
 def _rerun_parent_after_agent_b_choice(fid: str) -> None:
-    """Refresh the parent review after clicking a nested Agent B control.
+    """Only redraw the selected cleaning fragment after an explicit No click.
 
-    Agent B is a polling child fragment. A fragment-scoped rerun there only
-    refreshes Agent B; the parent's Agent C input/approval cannot appear.
-    Force an app rerun for a *user click*, preserving the selected finding's
-    open state. Background polling continues to use its normal fragment.
+    Rendering the full application also rebuilds tabs, timers and unrelated
+    investigation cards, causing both perceptible delay and viewport jumps.
+    The Agent B choice is already inside the parent cleaning fragment, so a
+    fragment-scoped rerun is sufficient to show Agent C's focused input.
     """
-    keep_open = st.session_state.setdefault("cleaning_keep_open_by_finding", {})
-    keep_open.clear()
-    keep_open[fid] = True
-    st.session_state["cleaning_active_finding"] = fid
+    _rerun_cleaning_fragment(fid)
+
+
+def _render_visual_flag_preview(flags: list[dict], fid: str, *, phase: str, source: Path | None = None, scope: str = "cells") -> bool:
+    """Render exact annotation scope using native, bounded Streamlit elements.
+
+    Never inject a large HTML table into the fragment. Page through the same
+    verified flag list; presentation must not truncate the approved operation.
+    """
+    from healthcare_data_quality.cleaning.visual_flags import flag_preview_frame, flag_css, row_flag_preview
+    page_size = 200
+    total = len(flags)
+    if not total:
+        st.warning("No verified annotation targets to display.")
+        return False
     try:
-        st.rerun(scope="app")
-    except TypeError:
-        st.rerun()
-    except Exception as exc:
-        if type(exc).__name__ != "StreamlitAPIException":
-            raise
-        st.rerun()
+        if source and scope == "rows":
+            st.caption(f"{len({f['row'] for f in flags})} source row(s) · {total} cells · scroll horizontally to inspect every column.")
+            st.dataframe(row_flag_preview(flags, source), hide_index=True, width="stretch", height=min(380, 45 + 35 * 2 * len({f['row'] for f in flags})))
+            return True
+        pages = (total + page_size - 1) // page_size
+        page = 0
+        if pages > 1:
+            page = st.selectbox("Annotation preview page", options=list(range(pages)),
+                                format_func=lambda n: f"{n + 1} of {pages}",
+                                key=f"visual_preview_page_{phase}_{fid}")
+        start = page * page_size
+        visible = flags[start:start + page_size]
+        frame = flag_preview_frame(visible)
+        st.caption(f"Showing targets {start + 1}–{start + len(visible)} of {total}. "
+                   "All targets belong to the same proposed annotation; values stay unchanged.")
+        st.dataframe(frame.style.apply(lambda _: [flag_css(f) for f in visible], subset=["After"]),
+            hide_index=True, width="stretch", height=min(380, 42 + 35 * len(visible)))
+    except (ValueError, TypeError, KeyError, IndexError, RuntimeError, ImportError) as exc:
+        st.warning(f"Could not render the verified annotation preview: {exc}. "
+                   "No annotation will be approved from an unavailable preview.")
+        return False
+    return True
+
+
+def _render_bottom_review_closure(fid: str, finding: dict, source: Path | None,
+                                  applied: list[dict]) -> None:
+    """Final action BELOW the displayed suggestion, discussion and No option.
+
+    The click records a named, source-verified reviewer outcome with no new
+    data edits; it never silently treats acceptance as anomaly correction.
+    """
+    from healthcare_data_quality.cleaning.review_closure import closure_button_label
+    pending_proposal = bool(
+        st.session_state.cleaning_plans_by_finding.get(fid) or
+        st.session_state.cleaning_batch_queue_by_finding.get(fid) or
+        st.session_state.cleaning_pending_visual_flags_by_finding.get(fid)
+    )
+    reviewer_for_close = str(st.session_state.get('cleaning_approved_reviewer') or '').strip()
+    agent_c_active = (fid in st.session_state.get('cleaning_pending_gemma_b', {})
+                      and st.session_state.cleaning_pending_gemma_b[fid].get('kind') != 'exact_option_recovery')
+    close_label = closure_button_label(
+        has_edits=bool(applied), pending_proposal=pending_proposal)
+    if st.session_state.get('cleaning_close_request_by_finding', {}).get(fid):
+        st.caption('Your close request is ready for one named final-review decision.')
+    # Streamlit's primary button color is theme-dependent (red in this app).
+    # Keep this *no-edit* decision blue, on every fragment rerender.
+    st.markdown(_blue_review_closure_css(), unsafe_allow_html=True)
+    if st.button(close_label, key=f'review_close_any_{fid}',
+                 disabled=not bool(source and reviewer_for_close) or agent_c_active,
+                 type='secondary'):
+        try:
+            if (st.session_state.get('cleaning_pending_gemma_b', {}).get(fid) or {}).get('kind') == 'exact_option_recovery':
+                _retire_declined_job(fid)
+            _complete_general_review_closure(finding, source)
+        except (OSError, ValueError, PermissionError, KeyError) as exc:
+            st.error(f'Could not finalize review: {exc}')
+        else:
+            _rerun_cleaning_fragment(fid)
+
 
 
 def _render_live_finding_assignment(fid: str) -> None:
@@ -1543,6 +1680,10 @@ def _render_live_finding_assignment(fid: str) -> None:
     pending["assigned_agent"] = assigned
     phase = manager.phase_for(job_id) if hasattr(manager, "phase_for") else "queued"
 
+    if pending.get('kind', '').startswith('local_'):
+        label = 'Verification queued…' if phase == 'queued' else 'Verifying in isolated sandbox…'
+        st.status(label, state='running', expanded=False)
+        return
     if phase == "queued":
         label = "Queued — waiting for an inference slot"
     elif phase == "generating":
@@ -1561,79 +1702,138 @@ def _render_live_finding_assignment(fid: str) -> None:
     st.status(label, state="running", expanded=False)
 
 
-def _refresh_parent_for_new_agent_b_choices(
-    job_id: str | None, rendered_ready_ids: frozenset[str],
-) -> None:
-    """One lightweight poller for ALL findings, never a fragment per card.
+def _render_prior_agent_b_guidance(fid: str, *, completed: bool = False) -> None:
+    """Legacy entry point: rejected guidance is internal context, never UI."""
+    return
 
-    Rerender the parent only after an additional result is ready. Do not
-    remount an active review chat, pending Agent C response, or approval form.
-    The next normal reviewer interaction will pick up those queued results.
-    """
+
+def _refresh_parent_for_new_agent_b_choices(
+    job_id: str | None = None, rendered_ready_ids: frozenset[str] | None = None,
+) -> bool:
+    """Read readiness only; the owning review fragment renders the new results."""
+    if rendered_ready_ids is None:
+        job_id = st.session_state.get("cleaning_readiness_watch_job")
+        rendered_ready_ids = frozenset(st.session_state.get("cleaning_parent_ready_ids", ()))
     if not job_id:
-        return
+        return False
     from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager
     try:
         snapshot = recommendation_manager().snapshot(job_id) or {}
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
-        return
+        return False
     now_ready = frozenset(
         fid for fid, entry in (snapshot.get("entries") or {}).items()
         if isinstance(entry, dict) and entry.get("status") == "ready"
     )
-    if not (now_ready - rendered_ready_ids):
-        return
-    # Background completion should never steal focus from human input.
-    if (st.session_state.get("cleaning_pending_gemma_b")
-            or any(mode in {"alternative", "accepted"} and not _finding_review_completed(fid)
-                   for fid, mode in (st.session_state.get(
-                       "cleaning_discussion_mode_by_finding") or {}).items())
-            or any((st.session_state.get("cleaning_plans_by_finding") or {}).values())):
-        return
+    return bool(now_ready - rendered_ready_ids)
+
+
+def _queue_exact_option_recovery(fid, finding, source, suggestion, candidates):
+    from healthcare_data_quality.services.model_plan_review import (
+        assess_exact_options, dataset_review_context, option_fingerprint)
+    from copy import deepcopy
+    state = st.session_state
+    if fid in state.get('cleaning_pending_gemma_b', {}) or not candidates:
+        return False
     try:
-        st.rerun(scope="app")
-    except TypeError:
-        st.rerun()
-    except Exception as exc:
-        if type(exc).__name__ != "StreamlitAPIException":
-            raise
-        st.rerun()
+        context = dataset_review_context(state, finding['dataset_id'], fid, source=source)
+    except (OSError, ValueError, PermissionError, TypeError):
+        return False
+    identity = (context['revision'], tuple(option_fingerprint(finding, source, c) for c in candidates))
+    attempts = state.setdefault('cleaning_exact_option_attempts', {})
+    prior = attempts.get(fid)
+    if prior and prior[0] == identity[0]:
+        if set(identity[1]).issubset(prior[1]):
+            return False
+        candidates = [c for c in candidates if option_fingerprint(finding, source, c) not in prior[1]]
+        identity = (identity[0], tuple(dict.fromkeys((*prior[1], *identity[1]))))
+    try:
+        queued = _submit_review_worker(finding, source, 'exact_option_recovery',
+            assess_exact_options, (deepcopy(finding), Path(source), deepcopy(candidates), deepcopy(context)),
+            suggestion=deepcopy(suggestion), automatic=True)
+    except (ValueError, RuntimeError, OSError):
+        return False
+    if not queued:
+        return False
+    attempts[fid] = identity
+    return True
 
 
-def _render_live_agent_b_finding(
-    fid: str, finding: dict, source: Path | None, uploaded: list,
-    dataset_paths: list[Path], job_id: str | None, ds_id: str,
-) -> None:
-    """Render one finding's controls directly in its parent expander.
+def _queue_automatic_option_draft(fid, finding, source, suggestion):
+    """One background drafting recovery per source/revision; never a chat turn."""
+    from copy import deepcopy
+    from healthcare_data_quality.services.model_plan_review import (
+        draft_recovery_options, dataset_review_context)
+    state = st.session_state
+    if fid in state.get('cleaning_pending_gemma_b', {}) or _waiting_for_new_discussion(state, fid):
+        return False
+    try:
+        context = dataset_review_context(state, finding['dataset_id'], fid, source=source)
+    except (OSError, ValueError, PermissionError, TypeError):
+        return False
+    identity = (file_sha256(source), context['revision'], _active_agent_c_control_generation(fid))
+    context['recovery_feedback'] = [
+        {'decision': r.get('decision'), 'reason': str(r.get('reason') or '')[:200]}
+        for r in (suggestion.get('gemma_option_reviews') or []) if isinstance(r, dict)
+        and not r.get('can_offer')][:5]
+    attempts = state.setdefault('cleaning_auto_draft_attempts', {})
+    if attempts.get(fid) == identity:
+        return False
+    try:
+        queued = _submit_review_worker(finding, source, 'exact_option_recovery',
+            draft_recovery_options, (deepcopy(finding), Path(source), deepcopy(context)),
+            suggestion=deepcopy(suggestion), automatic=True, regenerate=True)
+    except (ValueError, RuntimeError, OSError):
+        return False
+    if queued:
+        attempts[fid] = identity
+    return bool(queued)
 
-    This is intentionally NOT a separately polling fragment. The single
-    readiness watcher above notices new suggestions without rendering any
-    buttons. Each review control therefore stays attached to its own finding.
+
+def _rearm_unpublished_review(fid, finding, source):
+    """Bounded delayed recovery for an empty review; never exposes a button.
+
+    All work remains in the existing routed worker pool. Scope-rejected
+    fingerprints stay rejected; only a fresh candidate or a missing/failed
+    assessment can become eligible. A new dataset revision gets a new budget.
     """
-    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager
-    from healthcare_data_quality.ui.finding_choice_integrity import finding_completed
-    # A previously completed finding must not resurrect late Agent B buttons.
-    if finding_completed(st.session_state, fid):
-        return
+    from healthcare_data_quality.ui.ordered_review import recovery_due
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    state = st.session_state
+    if source is None or fid in state.get('cleaning_pending_gemma_b', {}):
+        return False
+    identity = (file_sha256(source), dataset_review_context(state, finding['dataset_id'], fid)['revision'],
+                _active_agent_c_control_generation(fid))
+    if not recovery_due(state, fid, identity, monotonic()):
+        return False
+    state.setdefault('cleaning_exact_option_attempts', {}).pop(fid, None)
+    state.setdefault('cleaning_auto_draft_attempts', {}).pop(fid, None)
+    return True
 
-    entry = {}
-    if job_id:
-        try:
-            snapshot = recommendation_manager().snapshot(job_id) or {}
-            entry = ((snapshot.get("entries") or {}).get(fid) or {})
-        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            st.caption(f"Could not refresh Agent B's suggestion: {exc}")
 
+def _prepare_initial_review_choices(fid, finding, source, entry):
+    """Non-rendering publication gate: only exact, current options are ready.
+
+    A worker's ready flag is a draft delivery, not UI readiness. The same
+    returned options are used for rendering; no second assessment is started
+    inside the expander. An empty or failed result remains locked.
+    """
+    state = st.session_state
+    if fid in state.get('cleaning_pending_gemma_b', {}):
+        return "preparing", None, []
+    cached = state.get('cleaning_recommendations', {}).get(fid) or {}
+    if entry.get('status') in {'queued', 'pending', 'running'} and cached.get('_source') != 'exact_option_recovery':
+        return "preparing", None, []
     if entry.get("status") == "ready":
         previous = st.session_state.cleaning_recommendations.get(fid) or {}
         st.session_state.setdefault("cleaning_autoready_seen", set()).add(fid)
         review_status = st.session_state.cleaning_review_statuses.get(fid)
         # A background job must never replace a human-selected recommendation
         # or resurrect a completed/rejected review.
-        if (previous.get("_source") not in {"manual", "review_memory"} and
+        if (previous.get("_source") not in {"manual", "review_memory", "exact_option_recovery"} and
                 review_status in {None, "Awaiting review", "Agent B suggestion ready"}):
             st.session_state.cleaning_recommendations[fid] = {
-                "suggestion": entry["suggestion"],
+                "suggestion": entry.get("suggestion", ""),
                 "decision_needed": entry.get("decision_needed", ""),
                 "memory_assessed": entry.get("memory_assessed", False),
                 "method_candidates_considered": entry.get("method_candidates_considered", 0),
@@ -1644,6 +1844,10 @@ def _render_live_agent_b_finding(
                 "gemma_option_reviews": entry.get("gemma_option_reviews") or [],
                 "source_pattern_summary": entry.get("source_pattern_summary"),
                 "exact_prior_no_change": bool(entry.get("exact_prior_no_change")),
+                "_worker_role": (entry.get("worker_role") if entry.get("worker_role")
+                                 in {"agent_a", "agent_b", "agent_c_idle_assist"} else
+                                 ("agent_c_idle_assist" if entry.get("assisted_by_agent_c")
+                                  else "agent_b")),
                 "_source": "background",
             }
             st.session_state.cleaning_review_statuses[fid] = "Agent B suggestion ready"
@@ -1658,114 +1862,207 @@ def _render_live_agent_b_finding(
             or st.session_state.cleaning_discussion_mode_by_finding.get(fid) in {"accepted", "alternative"}
             or any(h.get("finding_id") == fid for h in st.session_state.cleaning_history)
             or st.session_state.cleaning_review_statuses.get(fid) == "Reviewed — no change"):
-        return
+        return "preparing", None, []
     suggestion = st.session_state.cleaning_recommendations.get(fid)
+    if not suggestion and entry.get('status') in {'ready', 'failed'} and source is not None:
+        # Recover purely source-derived reviewer choices (for example exact
+        # fractional count cells or negative-control columns). Gemma inference
+        # failure must not make the entire finding unreviewable. The regular
+        # source, conflict and approval gates below still apply.
+        from healthcare_data_quality.services.recommendation_options import source_backed_choices
+        recovery = source_backed_choices(finding, source, {'suggestion': ''})
+        suggestion = {
+            'suggestion': '', 'choices': recovery, 'gemma_option_reviews': [],
+            '_source': 'source_verified_fallback',
+        }
+        st.session_state.cleaning_recommendations[fid] = suggestion
     # Memory-backed findings use the single reviewed-solution Yes/No UI in
     # the parent finding, never a second Agent B recommendation widget.
     if suggestion and suggestion.get("_source") == "review_memory":
-        return
+        # Historical memory is a candidate, not an assessment.
+        suggestion = {**suggestion, 'gemma_option_reviews': [], '_source': 'source_verified_fallback'}
+        st.session_state.cleaning_recommendations[fid] = suggestion
+    if suggestion and source is None:
+        return "locked", suggestion, []
     if suggestion:
-        from healthcare_data_quality.ui.recommendation_memory_trace import memory_trace
-        trace = memory_trace(suggestion)
-        st.caption(trace["summary"])
-        profile = suggestion.get("source_pattern_summary") or {}
-        if (isinstance(profile, dict) and profile.get("data_rows_examined")
-                and finding.get("check_key") in {
-                    "inspect_headers", "inspect_taxonomy_naming", "inspect_taxonomy_structure"}):
-            st.caption(
-                f"Source pattern: {profile.get('taxonomy_seven_level_rows', 0)}/"
-                f"{profile['data_rows_examined']} seven-level labels · "
-                f"{profile.get('normal_taxonomy_separator', 'unknown')} separator · "
-                f"{profile.get('normal_taxonomy_prefix_style', 'unknown')} naming"
-            )
-        if entry.get("status") == "failed" and suggestion.get("_source") == "source_verified_fallback":
-            st.caption("Agent B failed; the proposed duplicate-column removal was independently verified against the original CSV.")
-        if trace["details"]:
-            with st.expander("Memory assessment", expanded=False):
-                for line in trace["details"]:
-                    st.caption(line)
-        from healthcare_data_quality.services.recommendation_options import source_backed_choices
-        from healthcare_data_quality.ui.human_choice_replay import prioritize_verified_human_choices
-        options = prioritize_verified_human_choices(
-            finding, source, source_backed_choices(finding, source, suggestion))
-        from healthcare_data_quality.ui.finding_choice_integrity import scoped_review_choices
-        options = scoped_review_choices(finding, source, options)
-        # Fail closed: deterministic validation proves source coordinates, but
-        # the reviewer specifically requires Gemma to assess each option before
-        # any executable button appears. Missing/old cache is not proof.
-        from healthcare_data_quality.services.model_plan_review import accepted_assessed_choices
-        options = accepted_assessed_choices(
+        # Unrelated approvals must not move idle findings into Agent C chat.
+        # Actual conflicting choices are filtered below and reassessed only if needed.
+        from healthcare_data_quality.ui.human_choice_replay import memory_first_candidates
+        options = memory_first_candidates(finding, source, suggestion)
+        if source:
+            from healthcare_data_quality.cleaning.current_review_evidence import project_current_choices
+            options = project_current_choices(st.session_state, finding, source, options)
+            from healthcare_data_quality.cleaning.proposal_conflicts import filter_conflicting_choices
+            options, _ = filter_conflicting_choices(options, state=st.session_state, finding=finding, source=source)
+        if (source and not options and st.session_state.get('cleaning_sequential_active') == fid
+                and not any(e.get('finding_id') == fid for e in st.session_state.get('cleaning_history', []))):
+            from healthcare_data_quality.cleaning.sequential_context import no_edit_review_option
+            keep = no_edit_review_option(st.session_state, finding, source)
+            if keep:
+                options = [keep]
+        exact_candidates = list(options)
+        # Gemma generates/appraises ideas; the named reviewer chooses. The
+        # independent source-and-finding scope validator above is mandatory.
+        # Do not turn Gemma's uncertainty or a missing model response into a
+        # silent veto on source-verified choices. Explicit model scope errors
+        # (foreign finding / extra edits) still block the proposed action.
+        from healthcare_data_quality.services.model_plan_review import (
+            reviewer_selectable_choices, dataset_review_context)
+        # Recovery assessments are revision-bound. A changed approved state must
+        # not reuse a model assessment produced against the previous context.
+        if (source and suggestion.get('_review_revision') and
+                suggestion['_review_revision'] != dataset_review_context(st.session_state, finding['dataset_id'], fid)['revision']):
+            suggestion = {**suggestion, 'gemma_option_reviews': []}
+            st.session_state.cleaning_recommendations[fid] = suggestion
+        # Older assessments were made without the verified preference context.
+        # Reappraise a historically approved exact candidate once under the new
+        # policy, rather than permanently hiding it behind a cached rejection.
+        from healthcare_data_quality.services.model_plan_review import EXACT_REVIEW_POLICY_VERSION, option_fingerprint
+        preferred_fps = {option_fingerprint(finding, source, o) for o in exact_candidates
+                         if o.get('historical_approval_count', 0) > 0}
+        old_reviews = suggestion.get('gemma_option_reviews') or []
+        obsolete = {r.get('fingerprint') for r in old_reviews if isinstance(r, dict)
+                    and r.get('fingerprint') in preferred_fps
+                    and (r.get('scope_matches') is False or r.get('has_extra_changes') is True)
+                    and r.get('review_policy', 0) != EXACT_REVIEW_POLICY_VERSION}
+        if obsolete:
+            suggestion = {**suggestion, '_source': 'exact_option_recovery', 'gemma_option_reviews': [r for r in old_reviews
+                          if not isinstance(r, dict) or r.get('fingerprint') not in obsolete]}
+            st.session_state.cleaning_recommendations[fid] = suggestion
+            st.session_state.setdefault('cleaning_exact_option_attempts', {}).pop(fid, None)
+        options = reviewer_selectable_choices(
             finding, source, options, suggestion.get('gemma_option_reviews')) if source else []
+        options = [o for o in options if o.get('gemma_review_status') in {'supported', 'disputed'}]
         if source and options:
             from healthcare_data_quality.cleaning.proposal_conflicts import filter_conflicting_choices
             options, conflicts = filter_conflicting_choices(
                 options, state=st.session_state, finding=finding, source=source)
-            if conflicts:
-                st.warning('Earlier approved changes supersede this proposal: '
-                           + '; '.join(conflicts[:3]) + '. Revise the earlier approval '
-                           'or discuss an alternative; no action has been repeated.')
-                # Only if NO current conversation exists, ask Agent C to
-                # re-evaluate the affected finding against the changed stage.
-                # This is read-only. Any replacement still needs exact original
-                # Before→After and a new named reviewer selection.
-                prior_approvals = [e for e in st.session_state.get('cleaning_history', [])
-                                   if e.get('dataset_id') == ds_id]
-                marker = hashlib.sha256(json.dumps(
-                    [{'finding_id':e.get('finding_id'), 'operation':e.get('operation'),
-                      'positions':e.get('modified_positions')}
-                     for e in prior_approvals], sort_keys=True, default=str).encode()).hexdigest()
-                triggered = st.session_state.setdefault(
-                    'cleaning_reassessment_versions_by_finding', {})
-                if (triggered.get(fid) != marker
-                    and fid not in st.session_state.cleaning_pending_gemma_b
-                    and not st.session_state.cleaning_messages_by_finding.get(fid)):
-                    triggered[fid] = marker
-                    st.session_state.cleaning_discussion_mode_by_finding[fid] = 'alternative'
-                    _queue_agent_c_for_finding(
-                        finding, source, uploaded, dataset_paths,
-                        'Reassess this finding because earlier approved actions '
-                        'superseded its old proposal. Do not repeat prior edits. '
-                        'Inspect the remaining source-backed issue and provide '
-                        'either an exact nonoverlapping Before→After action or '
-                        'an explicit explanation that no further change is needed.',
-                        automatic=True, require_gemma_review=True,
-                    )
-        if not options and suggestion.get('gemma_option_reviews'):
-            st.caption('Gemma did not endorse a verified action for this finding. '
-                       'Use Discuss to request a different approach.')
-        elif not options:
-            st.caption('No current Gemma assessment for these exact actions. '
-                       'Use Discuss; older cached suggestions cannot be approved.')
+        # Any narrowed action has a new fingerprint: appraise the surviving
+        # scope in the background rather than silently dropping it.
+        blocked = set()
+        waiting = []
+        if source and exact_candidates:
+            from healthcare_data_quality.cleaning.proposal_conflicts import filter_conflicting_choices
+            from healthcare_data_quality.services.model_plan_review import option_fingerprint
+            ready_fps = {option_fingerprint(finding, source, o) for o in options}
+            waiting, _ = filter_conflicting_choices([o for o in exact_candidates
+                if option_fingerprint(finding, source, o) not in ready_fps],
+                state=st.session_state, finding=finding, source=source)
+            # Explicit model scope mismatches are terminal for this exact proposal.
+            # Retry unavailable/missing appraisals in the background, not via buttons.
+            blocked = {r.get('fingerprint') for r in suggestion.get('gemma_option_reviews', [])
+                       if isinstance(r, dict)
+                       and (r.get('scope_matches') is False or r.get('has_extra_changes') is True)}
+            waiting = [o for o in waiting if option_fingerprint(finding, source, o) not in blocked]
+            # Do not delay two already actionable choices for a lower-ranked
+            # candidate. Recover missing higher-priority options or a shortage.
+            needs_choices = len(options) < 2 or (waiting and options and
+                max(o.get('historical_approval_count', 0) for o in waiting) >
+                min(o.get('historical_approval_count', 0) for o in options))
+            if waiting and needs_choices and _queue_exact_option_recovery(fid, finding, source, suggestion, waiting):
+                return "preparing", suggestion, []
+        from healthcare_data_quality.ui.human_choice_replay import rank_choices
+        options = rank_choices(finding, source, options)
+        if len(options) < 2 and source and _queue_automatic_option_draft(
+                fid, finding, source, {**suggestion, '_retained_ready_options': options}):
+            # Complete the bounded alternative search before first publication.
+            return "preparing", suggestion, []
+        # Do not open an initial finding containing only Discuss/Mark reviewed.
+        # Keep a legitimate sole verified option after the bounded search;
+        # never manufacture a second method to meet the target count.
+        if not options:
+            if _rearm_unpublished_review(fid, finding, source):
+                if waiting and _queue_exact_option_recovery(fid, finding, source, suggestion, waiting):
+                    return "preparing", suggestion, []
+                if _queue_automatic_option_draft(fid, finding, source, suggestion):
+                    return "preparing", suggestion, []
+            return "locked", suggestion, []
+        state.setdefault('cleaning_empty_review_recovery', {}).pop(fid, None)
+        return "ready", suggestion, options
+    return ("locked" if entry.get('status') in {'ready', 'failed'} else "preparing"), None, []
+
+
+def _render_live_agent_b_finding(
+    fid: str, finding: dict, source: Path | None, uploaded: list,
+    dataset_paths: list[Path], job_id: str | None, ds_id: str,
+    *, snapshot: dict | None = None, prepared=None,
+) -> None:
+    """Render one finding's controls directly in its parent expander.
+
+    This is intentionally NOT a separately polling fragment. The single
+    readiness watcher above notices new suggestions without rendering any
+    buttons. Each review control therefore stays attached to its own finding.
+    """
+    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager
+    from healthcare_data_quality.ui.finding_choice_integrity import finding_completed
+    # A previously completed finding must not resurrect late Agent B buttons.
+    if not _sequential_owner_matches(fid):
+        return
+    if finding_completed(st.session_state, fid):
+        return
+    if (st.session_state.get('cleaning_discussion_mode_by_finding', {}).get(fid)
+            in {'accepted', 'alternative'}
+            or st.session_state.get('cleaning_messages_by_finding', {}).get(fid)):
+        return
+
+    entry = {}
+    if job_id or snapshot is not None:
+        try:
+            snapshot = snapshot if snapshot is not None else (recommendation_manager().snapshot(job_id) or {})
+            entry = ((snapshot.get("entries") or {}).get(fid) or {})
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            st.caption(f"Could not refresh Agent B's suggestion: {exc}")
+
+    phase, suggestion, options = (prepared if prepared is not None else
+        _prepare_initial_review_choices(fid, finding, source, entry))
+    if phase != "ready" or not options or not suggestion:
+        # Defense in depth for standalone callers. No approval, decline or
+        # closure control belongs to an unpublished initial recommendation.
+        return
+    if suggestion:
+        from healthcare_data_quality.services.model_plan_review import option_fingerprint
+        # Keep a read-only snapshot of exactly the source-scoped, model-assessed
+        # guidance the reviewer saw. "No — Discuss" hides old action controls,
+        # but must NOT erase the context needed for the ensuing conversation.
+        from healthcare_data_quality.ui.discussion_reference import capture_discussion_reference
+        st.session_state.setdefault("cleaning_prior_guidance_by_finding", {})[fid] = (
+            capture_discussion_reference(suggestion, options)
+        )
         # Exact Before -> After is the primary interface. Do not turn a
         # plausible model narrative into an unverified operation button.
         if options:
-            for option_idx, option in enumerate(options):
-                if len(options) > 1:
-                    st.markdown('**' + option['label'] + '**')
-                st.dataframe(pd.DataFrame(option['rows']), hide_index=True, width="stretch")
-                if option.get('provenance'):
-                    st.caption(option['provenance'])
-                if option.get('observed_pattern'):
-                    st.caption(option['observed_pattern'] + ' — not a default rule for other datasets.')
-                if option.get('impact'):
-                    st.caption(option['impact'])
-                if option.get('memory_note'):
-                    st.caption(option['memory_note'])
-                # Provenance of the actual local Gemma decision (never a claim
-                # that the model approved or executed any data mutation).
-                if option.get('gemma_review_reason'):
-                    st.caption('Gemma scope review: ' + option['gemma_review_reason'])
-            # There is NO intermediary "prepare"/"approve" view. The reviewer
-            # has already seen the verified Before -> After and selected this
-            # exact option. Their click is the one named approval.
             reviewer = str(st.session_state.get("cleaning_approved_reviewer") or "").strip()
-            action_columns = st.columns(len(options))
             for index, option in enumerate(options):
-                label = "Yes — " + str(option.get("label") or "Apply verified changes")
-                if action_columns[index].button(
-                        label[:140],
-                        key=f"review_yes_{fid}_{_active_agent_c_control_generation(fid)}_option_{index}",
-                        disabled=not bool(reviewer), type='primary'):
+                with st.container(border=True):
+                    visual = option.get('visual_request') and len(option.get('operations', [])) == 1 and option['operations'][0].get('operation') == 'flag_cells'
+                    preview_ready = True
+                    if visual:
+                        op = option['operations'][0]
+                        preview_ready = _render_visual_flag_preview(op['changes'], fid, phase='initial_'+str(index), source=source, scope=op['visual_scope'])
+                    else:
+                        st.dataframe(pd.DataFrame(option['rows']), hide_index=True, width="stretch")
+                    _render_proposed_numeric_context(source, option.get('operations') or [])
+                    count = option.get('historical_approval_count', 0)
+                    if option.get('decision') != 'no_change':
+                        st.caption(f'{count} prior approval(s) · this CSV')
+                    if option.get('impact'):
+                        st.caption(option['impact'])
+                    with st.expander('Gemma assessment and sources', expanded=False):
+                        for field in ('provenance', 'observed_pattern', 'memory_note'):
+                            if option.get(field):
+                                st.caption(option[field])
+                        st.caption('Assessment: ' + str(option.get('gemma_review_status') or 'not assessed'))
+                        if option.get('gemma_review_reason'):
+                            st.caption(option['gemma_review_reason'])
+                    if option.get('gemma_review_status') == 'disputed':
+                        st.caption('Method uncertain; verify before approval.')
+                    from healthcare_data_quality.ui.clear_review_actions import option_action_label
+                    label = option_action_label(option, finding)
+                    selected = st.button(
+                            label,
+                            key=f"review_yes_{fid}_{_active_agent_c_control_generation(fid)}_option_{option_fingerprint(finding, source, option)[:20]}",
+                            disabled=not bool(reviewer) or not preview_ready, type='primary')
+                if selected:
                     if source is None:
                         st.error("The source dataset is missing; no changes were made.")
                         return
@@ -1778,41 +2075,32 @@ def _render_live_agent_b_finding(
                             _rerun_cleaning_fragment(fid)
                         return
                     try:
-                        from healthcare_data_quality.ui.one_click_choice import execute_verified_choice
-                        with st.spinner("Verifying and applying the selected changes"):
-                            outcome = execute_verified_choice(
-                                st.session_state, finding, source, option)
-                        if outcome.get("warning"):
-                            st.warning(outcome["warning"])
-                        # This finding is now terminal; the completed green
-                        # card collapses in place. No second Yes control exists.
+                        if visual:
+                            _assert_sequential_owner(fid)
+                            from healthcare_data_quality.cleaning.visual_recommendations import verify_visual_option, visual_targets_current
+                            from healthcare_data_quality.cleaning.visual_flags import requested_visual_flag
+                            from healthcare_data_quality.cleaning.one_click_visual_flag import apply_explicit_visual_flag_once
+                            from healthcare_data_quality.services.model_plan_review import dataset_review_context
+                            revision = dataset_review_context(st.session_state, finding['dataset_id'], fid)['revision']
+                            proof = next((r for r in suggestion.get('gemma_option_reviews', []) if r.get('fingerprint') == option_fingerprint(finding, source, option)), None)
+                            if (not preview_ready or not proof or suggestion.get('_review_revision') != revision
+                                    or not verify_visual_option(finding, source, option)
+                                    or not visual_targets_current(st.session_state, finding, source, option)):
+                                raise PermissionError('Annotation is no longer current; review again')
+                            plan = requested_visual_flag(option['visual_request'], finding, source)
+                            apply_explicit_visual_flag_once(st.session_state, finding, source, option['visual_request'],
+                                previously_displayed={**plan, 'gemma_review':proof,'review_revision':revision})
+                        else:
+                            _queue_local_choice(finding, source, option)
                         _rerun_cleaning_fragment(fid)
                     except (OSError, ValueError, PermissionError, RuntimeError,
                             AssertionError, IndexError, KeyError, TypeError, csv.Error) as exc:
                         st.error("No changes applied: " + str(exc))
                     return
-        else:
-            # Model did not provide exact source-backed actions. No fake
-            # before/after or green confirmation of a prose-only suggestion.
-            st.write(_recommendation_preview(str(suggestion['suggestion']), 180))
-            st.caption('Exact changes require source verification. Discuss the approach.')
         if st.button('No — Discuss Another Idea',
-                     key=f"review_no_{fid}_{_active_agent_c_control_generation(fid)}_choices"):
-            _open_agent_c_alternative_chat(fid, discard_plan=True)
+                     key=f"review_no_{fid}_{_active_agent_c_control_generation(fid)}_choices", on_click=_decline_and_discuss, args=(fid,)):
+            _decline_and_discuss(fid)
             _rerun_parent_after_agent_b_choice(fid)
-    else:
-        background_status = entry.get('status')
-        if background_status == 'running':
-            st.caption('Preparing recommendation')
-        elif background_status == 'pending':
-            st.caption('Recommendation queued')
-        elif background_status == 'failed':
-            # A failed model assessment is NOT a verified suggestion. Surface
-            # the actual bounded diagnostic and keep Agent C accessible for
-            # source-backed recovery, without fabricating approval options.
-            st.warning('Agent B could not verify this suggestion. ' +
-                       str(entry.get('error') or 'No diagnostic returned')[:300])
-            st.caption('You can discuss this finding with Agent C; no edit was staged.')
     # Do NOT st.rerun() here. The default scope causes a FULL app rerun
     # from nested Streamlit fragments, dimming/remounting the chat or a
     # pending approval every time another background suggestion arrives.
@@ -1830,10 +2118,12 @@ def _expand_ready_finding_without_rerun(fid: str) -> None:
     change an active reviewer decision. Browsers that disallow iframe parent
     access simply keep the normal manually expandable heading.
     """
+    if os.environ.get("HDQ_BROWSER_DOM_HELPERS") != "1":
+        return
     from html import escape
     try:
-        from streamlit.components.v1 import html as component_html
-    except ImportError:
+        component_html = st.iframe
+    except AttributeError:
         # Minimal unit-test stubs intentionally have no component runtime.
         return
     marker = hashlib.sha256(fid.encode("utf-8")).hexdigest()[:20]
@@ -1857,7 +2147,7 @@ def _expand_ready_finding_without_rerun(fid: str) -> None:
       };
       window.requestAnimationFrame(expand);
     })();
-    </script>'''.replace("{marker}", marker), height=0, scrolling=False)
+    </script>'''.replace("{marker}", marker), height=1)
 
 
 def _is_blank_control_check(finding: dict) -> bool:
@@ -1952,7 +2242,391 @@ def _cleaning_export_gate(catalog: list[dict], review_statuses: dict,
     return bool(ids and done == len(ids) and not investigation_running), done, len(ids)
 
 
-from healthcare_data_quality.ui.clear_review_actions import final_action_label
+from healthcare_data_quality.ui.clear_review_actions import final_action_label, direct_action_label, reflected_action_label
+
+
+def _reflected_interactive_label(plans, finding):
+    candidate = st.session_state.get('cleaning_memory_candidates', {}).get(finding['id'], {})
+    return reflected_action_label(plans, finding, candidate.get('button_label'))
+
+
+def _render_review_chat_input(fid, finding, source, uploaded, dataset_paths,
+                              session_context, *, placeholder, b_pending,
+                              control_phase="discussion") -> None:
+    # Keep the same widget identity across background
+    # suggestions and model replies; rotating a generation
+    # on every reply remounts chat and loses input focus.
+    chat_key = (f"review_message_{fid}_" +
+                hashlib.sha256(session_context.encode("utf-8")).hexdigest()[:12])
+    from healthcare_data_quality.ui.review_input_focus import (
+        review_chat_container_key, focus_reviewer_chat,
+    )
+    with st.container(key=review_chat_container_key(fid)):
+        message = (st.chat_input(placeholder, key=chat_key,
+                                 max_chars=4000, disabled=b_pending)
+                   if hasattr(st, "chat_input") else None)
+    focus_pending = st.session_state.setdefault(
+        "cleaning_chat_focus_pending", set())
+    if fid in focus_pending:
+        focus_pending.discard(fid)
+        if os.environ.get("HDQ_BROWSER_DOM_HELPERS") == "1":
+            focus_reviewer_chat(st, fid)
+    if message and str(message).strip():
+        if control_phase == "idle":
+            # Direct user feedback is a valid discussion even
+            # without clicking No first; do not auto-approve.
+            st.session_state.cleaning_discussion_mode_by_finding[fid] = "alternative"
+            st.session_state.cleaning_review_statuses[fid] = "Discussion open"
+        try:
+            _queue_agent_c_for_finding(finding, source, uploaded, dataset_paths,
+                                       str(message).strip())
+        except (OSError, ValueError, PermissionError, RuntimeError, KeyError,
+                TypeError, IndexError, UnicodeError, csv.Error) as exc:
+            # Source preparation can fail before a model job is queued.
+            # Preserve the exact input and surface a recoverable error in
+            # the owning finding rather than aborting the page render.
+            thread = st.session_state.cleaning_messages_by_finding.setdefault(fid, [])
+            question = str(message).strip()
+            if not thread or thread[-1].get('role') != 'user' or thread[-1].get('content') != question:
+                thread.append({'role': 'user', 'content': question})
+            thread.append({'role': 'assistant', 'content':
+                f'Could not prepare your request: {exc}. No new approval was applied.',
+                'controls_expired': True, 'proposal_preparation_failed': True})
+            st.session_state.cleaning_pending_visual_flags_by_finding.pop(fid, None)
+            st.session_state.cleaning_review_statuses[fid] = 'Discussion open'
+        st.session_state.cleaning_custom_value_input_by_finding.pop(fid, None)
+        st.session_state.cleaning_custom_operation_input_by_finding.pop(fid, None)
+        _rerun_cleaning_fragment(fid)
+
+
+def _sequential_owner_matches(fid):
+    # Standalone helpers/tests and legacy CLI do not mount the review controller.
+    state = st.session_state
+    return 'cleaning_sequential_active' not in state or state.get('cleaning_sequential_active') == fid
+
+
+def _assert_sequential_owner(fid):
+    if not _sequential_owner_matches(fid):
+        raise PermissionError('This review is locked until the current finding is finished')
+
+
+def _activate_sequential_review(active_id, numbered):
+    """A single UI owner; expire unapproved legacy drafts on hand-off.
+
+    Preserve immutable approvals and user conversation; never treat a late
+    speculative job as a fresh recommendation for the next review.
+    """
+    state = st.session_state
+    previous = state.get('cleaning_sequential_active')
+    initial = 'cleaning_sequential_active' not in state
+    state['cleaning_sequential_active'] = active_id
+    if not initial and previous == active_id:
+        return
+    from healthcare_data_quality.ui.ordered_review import publication_epoch
+    for _, item in numbered:
+        fid = item['id']
+        if _finding_review_completed(fid):
+            continue
+        if fid == active_id and not initial and previous == active_id:
+            continue
+        # On transition retire prior speculative work; never erase a named
+        # decision, staged data or the real interaction transcript.
+        _retire_declined_job(fid)
+        for field in ('cleaning_recommendations', 'cleaning_plans_by_finding',
+                      'cleaning_batch_queue_by_finding', 'cleaning_batch_total_by_finding',
+                      'cleaning_r_previews_by_finding', 'cleaning_compound_previews_by_finding',
+                      'cleaning_pending_visual_flags_by_finding', 'cleaning_resolution_gemma_review',
+                      'cleaning_exact_option_attempts', 'cleaning_auto_draft_attempts',
+                      'cleaning_empty_review_recovery', 'cleaning_review_revision_by_finding',
+                      'cleaning_reassess_context_by_finding', 'cleaning_cross_source_review_by_finding'):
+            state.setdefault(field, {}).pop(fid, None)
+        publication_epoch(state, fid, False)
+        _next_agent_c_ui_generation(fid)
+        thread = state.get('cleaning_messages_by_finding', {}).get(fid, [])
+        for turn in thread:
+            if turn.get('role') == 'assistant':
+                turn['controls_expired'] = True
+        if any(t.get('role') == 'user' and not t.get('automatic') for t in thread):
+            # A reviewer already declined or discussed this item in an older
+            # session. Resume that discussion, rather than revive its choices.
+            state.setdefault('cleaning_discussion_mode_by_finding', {})[fid] = 'alternative'
+            state.setdefault('cleaning_review_statuses', {})[fid] = 'Discussion open'
+        elif not any(e.get('finding_id') == fid for e in state.get('cleaning_history', [])):
+            state.setdefault('cleaning_discussion_mode_by_finding', {}).pop(fid, None)
+            state.setdefault('cleaning_review_statuses', {})[fid] = 'Awaiting review'
+
+
+def _retire_lookahead_record(record):
+    if record and record.get('job_id'):
+        record['stop'].set()
+        st.session_state.setdefault('cleaning_retired_chat_jobs', set()).add(record['job_id'])
+
+
+def _retire_lookahead(fid):
+    _retire_lookahead_record(st.session_state.setdefault('cleaning_lookahead_records', {}).pop(fid, None))
+
+
+def _collect_private_record(record, manager):
+    if not record.get('job_id'):
+        return
+    outcome = manager.take(record['job_id'])
+    if outcome.get('status') == 'running':
+        return
+    record.pop('job_id', None)
+    record.pop('stop', None)
+    result = outcome.get('result') if outcome.get('status') == 'done' else None
+    if record.get('branch'):
+        # Do not use the uncommitted base as the assessed state. Unwrap only
+        # a complete conditional result, never a failed/cancelled projection.
+        if isinstance(result, dict) and 'predicted' in result and 'prepared' in result:
+            record['snapshot'] = result['predicted']
+            result = result['prepared']
+        else:
+            result = None
+    record['result'] = result
+
+
+def _private_record_dependencies(record, state, finding, source):
+    from healthcare_data_quality.ui import review_lookahead as lookahead
+    if (source is None or record['finding'] != finding or record['source_sha256'] != file_sha256(source)):
+        return False
+    branch = record.get('branch')
+    if branch and record.get('job_id'):
+        return lookahead.branch_selected(branch['base'], state, branch['origin'], branch['choice'], source)
+    return lookahead.dependencies_unchanged(record['snapshot'], state, finding, source,
+        (record.get('result') or {}).get('candidates'), allow_pending=bool(record.get('job_id')))
+
+
+
+def _lookahead_source(finding, dataset_paths):
+    ds = finding.get('dataset_id') or ('dataset_1' if len(dataset_paths) == 1 else '')
+    if not ds.startswith('dataset_'):
+        return None, finding
+    try:
+        index = int(ds.rsplit('_', 1)[-1]) - 1
+        if 0 <= index < len(dataset_paths):
+            return Path(dataset_paths[index]), {**finding, 'dataset_id': ds, **({'name':Path(dataset_paths[index]).name} if not finding.get('dataset_id') else {})}
+    except (ValueError, IndexError):
+        pass
+    return None, finding
+
+
+def _collect_lookahead(numbered, dataset_paths, *, handoff=False, origin=None):
+    """Collect private B results; revise the window after a terminal decision."""
+    from healthcare_data_quality.ui import review_lookahead as lookahead
+    from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+    state = st.session_state
+    records = state.setdefault('cleaning_lookahead_records', {})
+    eligible = {f['id']:f for _,f in lookahead.window(numbered, _finding_review_completed)}
+    manager = interactive_chat_manager()
+    for fid in list(state.setdefault('cleaning_lookahead_revising', {})):
+        if fid not in eligible:
+            state['cleaning_lookahead_revising'].pop(fid, None)
+    for fid, record in list(records.items()):
+        if fid not in eligible:
+            _retire_lookahead(fid)
+            continue
+        _collect_private_record(record, manager)
+        if handoff:
+            source, finding = _lookahead_source(eligible[fid], dataset_paths)
+            try:
+                same = _private_record_dependencies(record, state, finding, source)
+            except (OSError, ValueError, KeyError, TypeError, PermissionError):
+                same = False
+            if not same:
+                _retire_lookahead(fid)
+                state.setdefault('cleaning_lookahead_revising', {})[fid] = origin or 'earlier review'
+    branch_record = state.get('cleaning_lookahead_branch')
+    if branch_record:
+        _collect_private_record(branch_record, manager)
+        if not handoff and state.get('cleaning_discussion_mode_by_finding', {}).get(branch_record['branch']['origin']['id']) in {'accepted','alternative'}:
+            # The predicted action has been rejected; stop before another POST.
+            state.pop('cleaning_lookahead_branch', None)
+            _retire_lookahead_record(branch_record)
+        elif handoff:
+            state.pop('cleaning_lookahead_branch', None)
+            fid = branch_record['finding']['id']
+            branch = branch_record['branch']
+            # The ordinary unaffected draft always wins. A conditional draft
+            # is only considered after the matching real named approval.
+            try:
+                source, finding = _lookahead_source(eligible[fid], dataset_paths)
+                use = (fid not in records and fid == state.get('cleaning_sequential_active')
+                    and lookahead.branch_selected(branch['base'], state, branch['origin'], branch['choice'], source)
+                    and (branch_record.get('job_id') or (branch_record.get('result') or {}).get('ready_count')
+                         or (branch_record.get('result') or {}).get('closure'))
+                    and _private_record_dependencies(branch_record, state, finding, source))
+            except (OSError, ValueError, KeyError, TypeError, PermissionError, AttributeError):
+                use = False
+            if use:
+                records[fid] = branch_record
+            else:
+                _retire_lookahead_record(branch_record)
+
+
+def _take_active_lookahead(finding, source):
+    """Return True only while a valid private job is still preparing this item.
+
+    Completed private work is promoted to the regular exact publication gate;
+    no later finding gains a chatbox or action controls here.
+    """
+    from healthcare_data_quality.ui import review_lookahead as lookahead
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    state = st.session_state
+    fid = finding['id']
+    record = state.setdefault('cleaning_lookahead_records', {}).get(fid)
+    if not record:
+        return False
+    if (state.get('cleaning_discussion_mode_by_finding', {}).get(fid) in {'accepted','alternative'}
+            or state.get('cleaning_messages_by_finding', {}).get(fid)
+            or state.get('cleaning_plans_by_finding', {}).get(fid)):
+        _retire_lookahead(fid)
+        return False
+    try:
+        if record.get('job_id'):
+            if _private_record_dependencies(record, state, finding, source):
+                return True
+            _retire_lookahead(fid)
+            state.setdefault('cleaning_lookahead_revising', {}).setdefault(fid, state.get('cleaning_lookahead_last_origin') or 'earlier review')
+            return False
+        promoted = lookahead.promote(record, state, finding, source)
+    except (OSError, ValueError, KeyError, TypeError, PermissionError):
+        promoted = None
+    _retire_lookahead(fid)
+    if not promoted:
+        state.setdefault('cleaning_lookahead_revising', {}).setdefault(fid, state.get('cleaning_lookahead_last_origin') or 'earlier review')
+        return False
+    if 'suggestion' in promoted:
+        state.setdefault('cleaning_recommendations', {})[fid] = promoted['suggestion']
+        # A completed private assessment already spent its exact-option
+        # retry budget. Do not repeat that work on the handoff. Recovery is
+        # still available after the normal bounded cooldown if no choice is valid.
+        from healthcare_data_quality.services.model_plan_review import option_fingerprint
+        revision = promoted['suggestion']['_review_revision']
+        state.setdefault('cleaning_exact_option_attempts', {})[fid] = (
+            revision, tuple(option_fingerprint(finding, source, c)
+                            for c in (record.get('result') or {}).get('candidates', [])))
+        if (record.get('result') or {}).get('draft_attempted'):
+            revision = dataset_review_context(state, finding['dataset_id'], fid)['revision']
+            state.setdefault('cleaning_auto_draft_attempts', {})[fid] = (
+                file_sha256(source), revision, _active_agent_c_control_generation(fid))
+    if 'closure' in promoted:
+        state.setdefault('cleaning_resolution_gemma_review', {})[fid] = promoted['closure']
+    state.setdefault('cleaning_lookahead_revising', {}).pop(fid, None)
+    return False
+
+
+def _schedule_lookahead(numbered, dataset_paths, active_id):
+    """Prepare up to two future items, in order, with Agent B's spare time.
+
+    Keep one speculative B job in flight: current-review recovery always has
+    priority, and there is no queue of stale work behind a changed decision.
+    Agent A and C keep their own independent roles and global model limit.
+    """
+    from threading import Event
+    from copy import deepcopy
+    from healthcare_data_quality.ui import review_lookahead as lookahead
+    from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+    state = st.session_state
+    if not active_id or _finding_review_completed(active_id):
+        return
+    if not state.get('cleaning_publication_epochs', {}).get(active_id, {}).get('published'):
+        return
+    if (state.get('cleaning_pending_gemma_b', {}).get(active_id) or {}).get('assigned_agent') == 'B':
+        return
+    records = state.setdefault('cleaning_lookahead_records', {})
+    branch_record = state.get('cleaning_lookahead_branch')
+    if any(r.get('job_id') for r in records.values()) or (branch_record or {}).get('job_id'):
+        return
+    future = lookahead.window(numbered, _finding_review_completed)[1:]
+    active_choices = state.get('cleaning_lookahead_active_choices') or {}
+    preferred = (lookahead.preferred_structural_branch(active_choices.get('options'))
+                 if active_choices.get('fid') == active_id else None)
+    next_record = records.get(future[0][1]['id'], {}) if future else {}
+    next_result = next_record.get('result') or {}
+    # During human reading time, prioritize the conditional immediate successor
+    # once its normal draft exists. The third draft follows; no additional lane.
+    prioritize_branch = (not branch_record and preferred and future
+                         and (next_result.get('ready_count') or (next_result.get('closure') or {}).get('can_offer')))
+    for _, item in ([] if prioritize_branch else future):
+        fid = item['id']
+        if fid in records or state.get('cleaning_messages_by_finding', {}).get(fid):
+            continue
+        source, finding = _lookahead_source(item, dataset_paths)
+        if source is None:
+            continue
+        try:
+            captured = lookahead.snapshot(state)
+            source_hash = file_sha256(source)
+            stop = Event()
+            job = interactive_chat_manager().submit_role('B', lookahead.prepare,
+                captured, deepcopy(finding), source, stop, _prior_closure_worker)
+            records[fid] = {'job_id':job, 'stop':stop, 'snapshot':captured,
+                'finding':deepcopy(finding), 'source_sha256':source_hash}
+        except (OSError, RuntimeError, ValueError, TypeError):
+            pass
+        return
+    # Prepare a likely structural branch when the immediate baseline is ready.
+    # Never queue speculative work behind an active B request.
+    if branch_record or not future:
+        return
+    active_choices = state.get('cleaning_lookahead_active_choices') or {}
+    if active_choices.get('fid') != active_id:
+        return
+    choice = lookahead.preferred_structural_branch(active_choices.get('options'))
+    if not choice:
+        return
+    next_item = future[0][1]
+    origin_item = next((item for _,item in numbered if item['id'] == active_id), None)
+    source, finding = _lookahead_source(next_item, dataset_paths)
+    origin_source, origin = _lookahead_source(origin_item, dataset_paths) if origin_item else (None, None)
+    if source is None or origin_source != source or not origin:
+        return
+    try:
+        captured = lookahead.snapshot(state)
+        stop = Event()
+        job = interactive_chat_manager().submit_role('B', lookahead.prepare_conditional,
+            captured, deepcopy(origin), choice, deepcopy(finding), source, stop, _prior_closure_worker)
+        state['cleaning_lookahead_branch'] = {'job_id':job,'stop':stop,'snapshot':captured,
+            'finding':deepcopy(finding),'source_sha256':file_sha256(source),
+            'branch':{'base':captured,'origin':deepcopy(origin),'choice':choice}}
+    except (OSError, RuntimeError, ValueError, TypeError):
+        pass
+
+
+def _seed_sequential_recommendation(finding, source):
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    state = st.session_state
+    fid = finding['id']
+    _assert_sequential_owner(fid)
+    if (_finding_review_completed(fid) or state.get('cleaning_discussion_mode_by_finding', {}).get(fid) in {'alternative','accepted'}
+            or state.get('cleaning_messages_by_finding', {}).get(fid)
+            or state.get('cleaning_plans_by_finding', {}).get(fid)
+            or any(e.get('finding_id') == fid for e in state.get('cleaning_history', []))):
+        return
+    if (state.get('cleaning_pending_gemma_b', {}).get(fid) or {}).get('kind') in {'local_choice', 'local_r_preview', 'local_compound_preview'}:
+        return
+    revision = dataset_review_context(state, finding['dataset_id'], fid)['revision']
+    saved = state.setdefault('cleaning_recommendations', {}).get(fid) or {}
+    if saved.get('_review_revision') == revision:
+        return
+    _retire_declined_job(fid)
+    for field in ('cleaning_exact_option_attempts', 'cleaning_auto_draft_attempts',
+                  'cleaning_empty_review_recovery'):
+        state.setdefault(field, {}).pop(fid, None)
+    state['cleaning_recommendations'][fid] = {'suggestion':'', 'choices':[],
+        'gemma_option_reviews':[], '_source':'exact_option_recovery',
+        '_worker_role':'agent_b', '_review_revision':revision}
+
+
+def _retry_sequential_closure(fid, finding, source):
+    import time
+    from healthcare_data_quality.ui.ordered_review import recovery_due
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    state = st.session_state
+    identity = ('closure', file_sha256(source), dataset_review_context(state, finding['dataset_id'], fid)['revision'])
+    if recovery_due(state, fid, identity, time.monotonic()):
+        state.setdefault('cleaning_resolution_gemma_review', {}).pop(fid, None)
 
 
 def render_cleaning_workspace(
@@ -1985,7 +2659,11 @@ def render_cleaning_workspace(
     session_context = f"{context_key}:{run_id}" if run_id else context_key
     if st.session_state.get("cleaning_context_key") != session_context:
         st.session_state.cleaning_context_key = session_context
+        st.session_state.pop('cleaning_saved_checkpoint_identity', None)
         st.session_state.cleaning_messages_by_finding = {}
+        for old_job in st.session_state.get('cleaning_pending_gemma_b', {}).values():
+            if isinstance(old_job, dict) and old_job.get('job_id'):
+                st.session_state.setdefault('cleaning_retired_chat_jobs', set()).add(old_job['job_id'])
         st.session_state.cleaning_pending_gemma_b = {}
         st.session_state.cleaning_completed_gemma = {}
         st.session_state.cleaning_plans_by_finding = {}
@@ -1999,8 +2677,30 @@ def render_cleaning_workspace(
         st.session_state.cleaning_r_selfchecks_by_finding = {}
         st.session_state.cleaning_plan_retry_once = set()
         st.session_state.cleaning_recommendations = {}
+        for old_fid in list(st.session_state.get('cleaning_lookahead_records', {})):
+            _retire_lookahead(old_fid)
+        st.session_state.cleaning_lookahead_records = {}
+        _retire_lookahead_record(st.session_state.pop('cleaning_lookahead_branch', None))
+        st.session_state.pop('cleaning_lookahead_active_choices', None)
+        st.session_state.cleaning_lookahead_revising = {}
+        st.session_state.pop('cleaning_lookahead_last_origin', None)
+        st.session_state.pop("cleaning_sequential_active", None)
+        st.session_state.pop("cleaning_sequential_status", None)
+        st.session_state.cleaning_order_revision_pending = {}
+        st.session_state.cleaning_publication_epochs = {}
+        st.session_state.cleaning_empty_review_recovery = {}
+        st.session_state.pop('cleaning_order_approval_snapshot', None)
+        st.session_state.pop('cleaning_order_known_ids', None)
+        st.session_state.pop('cleaning_final_model_review', None)
+        st.session_state.pop('cleaning_final_workbook_candidate', None)
+        st.session_state.pop('cleaning_final_preview', None)
+        st.session_state.cleaning_exact_option_attempts = {}
+        st.session_state.cleaning_auto_draft_attempts = {}
+        st.session_state.cleaning_show_current_evidence = {}
+        st.session_state.cleaning_prior_guidance_by_finding = {}
         st.session_state.cleaning_review_statuses = {}
         st.session_state.cleaning_discussion_mode_by_finding = {}
+        st.session_state.cleaning_close_request_by_finding = {}
         st.session_state.cleaning_custom_value_input_by_finding = {}
         st.session_state.cleaning_custom_operation_input_by_finding = {}
         st.session_state.cleaning_decisions = []
@@ -2017,6 +2717,10 @@ def render_cleaning_workspace(
         st.session_state.cleaning_explicit_column_deletions_by_finding = {}
         st.session_state.cleaning_history = []
         st.session_state.cleaning_pending_visual_flags_by_finding = {}
+        st.session_state.cleaning_visual_context_by_finding = {}
+        st.session_state.cleaning_review_revision_by_finding = {}
+        st.session_state.cleaning_review_catalog_snapshot = []
+        st.session_state.cleaning_reassess_context_by_finding = {}
         st.session_state.cleaning_visual_flags_by_dataset = {}
         # A user-initiated NEW investigation is a new review, even when the
         # source CSV is byte-identical to a previous run. Keep the saved
@@ -2054,8 +2758,10 @@ def render_cleaning_workspace(
             ("cleaning_r_selfchecks_by_finding", {}),
             ("cleaning_plan_retry_once", set()),
             ("cleaning_recommendations", {}),
+            ("cleaning_prior_guidance_by_finding", {}),
             ("cleaning_review_statuses", {}),
             ("cleaning_discussion_mode_by_finding", {}),
+            ("cleaning_close_request_by_finding", {}),
             ("cleaning_custom_value_input_by_finding", {}),
             ("cleaning_custom_operation_input_by_finding", {}),
             ("cleaning_decisions", []),
@@ -2113,6 +2819,9 @@ def render_cleaning_workspace(
         audit, dataset_paths, [file.name for file in uploaded],
         gemma_runs if gemma_runs is not None else (st.session_state.get("exploration_runs") or []),
     )
+    st.session_state.cleaning_review_catalog_snapshot = [
+        {**f, "dataset_id": f.get("dataset_id") or ("dataset_1" if len(dataset_paths) == 1 else "")}
+        for f in catalog]
     if not catalog:
         st.info("No findings or checks to review.")
 
@@ -2132,17 +2841,22 @@ def render_cleaning_workspace(
                              for value in st.session_state.cleaning_review_statuses.values()))
     if session_completed:
         try:
-            save_approved_stage(
-                source_paths,
-                st.session_state.cleaning_staged_bytes_by_dataset,
-                st.session_state.cleaning_approved_columns_by_dataset,
-                st.session_state.cleaning_approved_rows_by_dataset,
-                st.session_state.cleaning_history,
-                st.session_state.cleaning_review_statuses,
-                st.session_state.cleaning_approved_reviewer,
-                finding_titles,
-                completed_audits=st.session_state.cleaning_completed_audits_by_finding,
-            )
+            from healthcare_data_quality.ui.review_refresh import checkpoint_identity
+            checkpoint_key = checkpoint_identity(st.session_state, source_paths, finding_titles)
+            if st.session_state.get('cleaning_saved_checkpoint_identity') != checkpoint_key:
+                save_approved_stage(
+                    source_paths,
+                    st.session_state.cleaning_staged_bytes_by_dataset,
+                    st.session_state.cleaning_approved_columns_by_dataset,
+                    st.session_state.cleaning_approved_rows_by_dataset,
+                    st.session_state.cleaning_history,
+                    st.session_state.cleaning_review_statuses,
+                    st.session_state.cleaning_approved_reviewer,
+                    finding_titles,
+                    completed_audits=st.session_state.cleaning_completed_audits_by_finding,
+                    review_decisions=st.session_state.cleaning_decisions,
+                )
+                st.session_state['cleaning_saved_checkpoint_identity'] = checkpoint_key
         except (OSError, ValueError, PermissionError, AssertionError, csv.Error) as exc:
             st.warning("Current approvals are staged, but recovery could not be saved. "
                        "Export before ending this session.")
@@ -2229,10 +2943,17 @@ def render_cleaning_workspace(
             try:
                 recovered = verify_and_reconstruct(previous_stage, source_paths, finding_titles)
             except (OSError, ValueError, PermissionError, AssertionError, csv.Error) as exc:
-                st.warning("Previous cleaning edits do not match the current audit. "
-                           "Reuse individual saved solutions instead.")
+                st.warning("A saved cleaning checkpoint cannot be restored against "
+                           "this investigation's current finding IDs and source verification. "
+                           "Even when the CSV is unchanged, a changed investigation/version "
+                           "may make prior approval records incompatible. No edits were "
+                           "restored; saved memory is still available as suggestions.")
                 with st.expander("Recovery details"):
                     st.code(f"{type(exc).__name__}: {exc}")
+                if st.button("Start fresh review — retain old checkpoint",
+                             key="cleaning_skip_incompatible_checkpoint"):
+                    st.session_state.cleaning_recovery_dismissed = True
+                    _rerun_cleaning_fragment()
             else:
                 action_count, no_change_count = checkpoint_counts(previous_stage)
                 with st.container(border=True):
@@ -2288,138 +3009,44 @@ def render_cleaning_workspace(
     # Reviewer identity was registered at upload; individual approval cards
     # do not request it again. Each verified action still needs its own Yes.
 
-    # Recall saved methods only as suggestions. Even exact-source matches
-    # receive a fresh local Gemma applicability assessment before any plan is
-    # offered for independent validation and human approval.
-    # Agent B saves one suggestion per finding in the background. Agent C
-    # handles interactive discussion, plans and authorization review.
-    # Individual Agent B suggestion panels poll automatically.
-    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, job_fingerprint
-    jobs = recommendation_manager()
-    # Agent B runs once per finding during investigation, not by this tab.
-    # Agent C consumes its immutable advice and never reruns Agent B.
-    state = None
-    job_id = None
-    try:
-        if run_id:
-            job_id = job_fingerprint(context_key, catalog, run_id=run_id)
-        else:
-            # Backward compatibility: audits from before the once-only update
-            # may have completed the former Agent A recommendations in the old queue.
-            # Read them if available, but NEVER start an old queue or refresh it.
-            job_id = job_fingerprint(context_key, catalog)
-        state = jobs.snapshot(job_id)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        st.error(f"Could not read saved Gemma recommendations: {exc}")
-    if state:
-        # Never promote a failed model request to a READY executable button.
-        # A deterministic source check is useful evidence but is NOT the fresh
-        # Gemma assessment the reviewer requires. Failed findings remain
-        # discussable through Agent C and retain their actual error details.
-        entries = state["entries"]
-        ready_count = sum(v["status"] == "ready" for v in entries.values())
-        running_count = sum(v["status"] == "running" for v in entries.values())
-        failed_count = sum(v["status"] == "failed" for v in entries.values())
-        total_count = len(entries)
-        if failed_count:
-            with st.expander(f"{failed_count} recommendation(s) need retry", expanded=False):
-                retryable = []
-                for result_id, entry in entries.items():
-                    if entry["status"] == "failed":
-                        st.caption(f"{result_id}: {entry.get('error', 'Model recommendation unavailable')}")
-                        if int(entry.get('manual_retries', 0)) < 1:
-                            retryable.append(result_id)
-                if retryable and run_id and st.button(
-                        "Retry failed Agent B suggestions once",
-                        key=f"retry_failed_recommendations_{session_context}"):
-                    try:
-                        # Explicit reviewer retry only; never rerun a ready
-                        # recommendation or interrupt Agent C discussions.
-                        schedule_agent_b_once(
-                            context_key, audit, dataset_paths, [item.name for item in uploaded],
-                            gemma_runs if gemma_runs is not None else
-                            (st.session_state.get('exploration_runs') or []),
-                            retry_failed=True,
-                        )
-                        st.rerun()
-                    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
-                        st.error(f"Could not retry recommendation: {exc}")
-        for result_id, entry in entries.items():
-            if entry["status"] != "ready":
-                continue
-            if entry.get("origin") == "review_memory":
-                # The parent finding provides the only interaction for this
-                # memory-backed result; don't display competing Agent B advice.
-                continue
-            existing = st.session_state.cleaning_recommendations.get(result_id) or {}
-            review_status = st.session_state.cleaning_review_statuses.get(result_id)
-            if (existing.get("_source") == "manual" or
-                    review_status not in {None, "Awaiting review", "Agent B suggestion ready"}):
-                continue
-            st.session_state.cleaning_recommendations[result_id] = {
-                "suggestion": entry["suggestion"],
-                "decision_needed": entry.get("decision_needed", ""),
-                "memory_assessed": entry.get("memory_assessed", False),
-                "method_candidates_considered": entry.get("method_candidates_considered", 0),
-                "skill_candidates_considered": entry.get("skill_candidates_considered", 0),
-                "memory_assessment": entry.get("memory_assessment") or {},
-                "memory_context": entry.get("memory_context") or [],
-                "choices": entry.get("choices") or [],
-                "gemma_option_reviews": entry.get("gemma_option_reviews") or [],
-                "source_pattern_summary": entry.get("source_pattern_summary"),
-                "exact_prior_no_change": bool(entry.get("exact_prior_no_change")),
-                "_source": ("source_verified_fallback" if entry.get("origin") ==
-                            "source_verified_fallback" else "background"),
-            }
-            st.session_state.cleaning_review_statuses[result_id] = "Agent B suggestion ready"
-    else:
-        if run_id and catalog:
-            st.warning("No Agent B recommendation job was recorded for this investigation. "
-                       "This can happen when the earlier investigation callback failed. "
-                       "You can start the missing recommendations without rerunning Agent A.")
-            if st.button("Start missing Agent B recommendations",
-                         key=f"cleaning_start_missing_agent_b_{session_context}"):
-                try:
-                    started = schedule_agent_b_once(
-                        context_key, audit, source_paths,
-                        [item.name for item in uploaded], gemma_runs or [],
-                    )
-                except (OSError, ValueError, TypeError) as exc:
-                    st.error(f"Could not start Agent B recommendations: {exc}")
-                else:
-                    if started:
-                        _rerun_cleaning_fragment()
-                    else:
-                        st.error("No recommendation job was started. Check the current finding catalog.")
-        else:
-            st.caption("No Agent B recommendations were saved with this older investigation. "
-                       "Run a full investigation to generate them, or discuss a finding "
-                       "directly with Agent C below.")
-
-    # Agent B's new queue assesses relevant saved methods with Gemma before
-    # marking any suggestion ready. Never promote a historical approval to an
-    # actionable suggestion or count it as completed inference here.
-    # Intermediate results remain in session memory; no CSV is offered or
-    # written while findings are still being reviewed.
-    history_all = st.session_state.cleaning_history
-
-    ready_ids = {item_id for item_id, entry in ((state or {}).get("entries") or {}).items()
-                 if entry.get("status") == "ready"}
-
-    # Snapshot what the parent expander already knew when it was mounted.
-    # Child polling reruns the parent only for genuinely new readiness.
-    st.session_state.cleaning_parent_ready_ids = set(ready_ids)
-    # One shared, read-only readiness watcher replaces the unstable nested
-    # per-finding fragments. It never renders buttons or other finding content.
-    if job_id and hasattr(st, "fragment") and any(
-        entry.get("status") in {"pending", "running"}
-        for entry in ((state or {}).get("entries") or {}).values()
-        if isinstance(entry, dict)
-    ):
-        st.fragment(run_every="3s")(_refresh_parent_for_new_agent_b_choices)(
-            job_id, frozenset(ready_ids),
-        )
+    # One interactive owner, with a private, revision-aware B lookahead.
+    from healthcare_data_quality.ui.ordered_review import (
+        sequential_active_review, publication_epoch, sequential_status_snapshot,
+    )
+    from healthcare_data_quality.cleaning.visual_flags import visual_flags_from_history
+    st.session_state.cleaning_visual_flags_by_dataset = visual_flags_from_history(st.session_state.cleaning_history)
     numbered = indexed_review_catalog(catalog)
+    previous_active = st.session_state.get('cleaning_sequential_active')
+    # A completed background approval must be committed before choosing the
+    # next interactive owner, not halfway through rendering the old card.
+    # This eliminates the extra polling cycle without a forced full-app rerun.
+    pending = st.session_state.get('cleaning_pending_gemma_b', {}).get(previous_active) or {}
+    delivered = st.session_state.get('cleaning_completed_gemma', {}).get(previous_active) or {}
+    if pending.get('kind') == 'local_choice' and delivered.get('status') == 'done':
+        prior = next((f for _,f in numbered if f['id'] == previous_active), None)
+        if prior:
+            prior_source, prior = _lookahead_source(prior, dataset_paths)
+            if prior_source is not None:
+                _sync_gemma_conversations(prior, prior_source)
+    active_id, active_label = sequential_active_review(numbered, _finding_review_completed)
+    handoff = previous_active != active_id
+    origin = next((label for label, f in numbered if f['id'] == previous_active), None)
+    if handoff:
+        st.session_state['cleaning_lookahead_last_origin'] = origin
+    _activate_sequential_review(active_id, numbered)
+    _collect_lookahead(numbered, dataset_paths, handoff=handoff, origin=origin)
+    # Status is advisory only. The preparation gate below is authoritative.
+    state = sequential_status_snapshot(st.session_state, numbered, _finding_review_completed)
+    entries = state['entries']
+    ready_ids = {fid for fid, entry in entries.items() if entry['status'] == 'ready'}
+    job_id = None
+    st.session_state.cleaning_readiness_watch_job = None
+    st.session_state.cleaning_parent_ready_ids = set(ready_ids)
+    # Historical suffix locks belonged to the speculative queue; there is no
+    # downstream draft to revise now. Named approvals remain untouched.
+    st.session_state.cleaning_order_revision_pending = {}
+    state_for_lookahead = st.session_state
+    state_for_lookahead.pop('cleaning_lookahead_active_choices', None)
     last_group = None
     for label, finding in numbered:
         fid = finding["id"]
@@ -2446,15 +3073,51 @@ def render_cleaning_workspace(
             source = Path(dataset_paths[0])
             ds_id = "dataset_1"
             finding = {**finding, "dataset_id": ds_id, "name": uploaded[0].name}
+        # Capture the active ID once per render. Even if a worker commits
+        # during this pass, successors wait for the next render/transition.
+        if fid != active_id and not _finding_review_completed(fid):
+            publication_epoch(st.session_state, fid, False)
+            from healthcare_data_quality.ui.finding_wait_gate import render_waiting_card
+            private = st.session_state.get('cleaning_lookahead_records', {}).get(fid) or {}
+            result = private.get('result') or {}
+            private_phase = None
+            if private.get('job_id'):
+                from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+                manager = interactive_chat_manager()
+                private_phase = manager.phase_for(private['job_id']) if hasattr(manager, 'phase_for') else 'generating'
+            hint = (' · preparing privately' if private_phase == 'generating' else ' · queued privately' if private.get('job_id') else
+                    ' · prepared ahead' if result.get('ready_count') or (result.get('closure') or {}).get('can_offer') else
+                    ' · revision needed after ' + st.session_state['cleaning_lookahead_revising'][fid] if fid in st.session_state.get('cleaning_lookahead_revising', {}) else '')
+            render_waiting_card(st, label, finding['title'], 'ordered',
+                                reason=f'Waiting for {active_label} to finish{hint}')
+            continue
+        if fid == active_id and source is not None:
+            if _take_active_lookahead(finding, source):
+                publication_epoch(st.session_state, fid, False)
+                from healthcare_data_quality.ui.finding_wait_gate import render_waiting_card, active_wait_status
+                from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+                private = st.session_state['cleaning_lookahead_records'][fid]
+                manager = interactive_chat_manager()
+                worker_phase = manager.phase_for(private['job_id']) if hasattr(manager, 'phase_for') else 'generating'
+                live = manager.model_stage_for(private['job_id']) if hasattr(manager, 'model_stage_for') else {}
+                wait = active_wait_status('preparing', worker_phase=worker_phase, model_stage=live.get('stage'), revising=bool(private.get('branch')))
+                render_waiting_card(st, label, finding['title'], wait,
+                    entry={'worker_role':'agent_b'}, reason=('Agent B · queued' if wait == 'queued' else 'Agent B · waiting for Gemma recovery' if wait == 'recovering' else 'Agent B · finishing revised alternatives…' if private.get('branch') else 'Agent B · finishing prepared alternatives…'))
+                continue
+            _seed_sequential_recommendation(finding, source)
         # Historical Gemma replies saying "I will keep it as is" were left
         # as unfinished discussions. Recover the user's exact decision without
         # another model call or requiring them to type it again.
-        if _recover_completed_no_change_reply(finding, source):
-            _rerun_cleaning_fragment(fid)
-        if source is not None and _reconcile_approved_column_review(fid, ds_id, source):
-            # Persist the new terminal review status immediately rather than
-            # leaving it only in UI state until an unrelated click occurs.
-            _rerun_cleaning_fragment(fid)
+        if fid == active_id and not _waiting_for_new_discussion(st.session_state, fid):
+            if source is not None:
+                exact_job = st.session_state.get('cleaning_pending_gemma_b', {}).get(fid) or {}
+                if exact_job.get('kind') == 'exact_option_recovery' and (st.session_state.cleaning_plans_by_finding.get(fid)
+                        or st.session_state.cleaning_discussion_mode_by_finding.get(fid) in {'accepted','alternative'}):
+                    _retire_declined_job(fid)
+                # Collect completed worker results before selecting the card's
+                # terminal/open state. No extra rerun on worker delivery.
+                _sync_gemma_conversations(finding, source)
+        history_all = st.session_state.cleaning_history
         status = st.session_state.cleaning_review_statuses.get(fid, "Awaiting review")
         applied = [event for event in history_all if event["finding_id"] == fid]
         if applied:
@@ -2467,26 +3130,9 @@ def render_cleaning_workspace(
         remaining_batch = st.session_state.cleaning_batch_queue_by_finding.get(fid, [])
         current_plan = st.session_state.cleaning_plans_by_finding.get(fid)
         raw_status = st.session_state.cleaning_review_statuses.get(fid)
-        # Earlier named approval may already have fixed this finding's exact
-        # format defect (e.g. standardizing taxonomy also fixes its '|'
-        # delimiter). Do not ask to overwrite the better staged value with
-        # an old, less-complete proposal or demand another approval.
-        if (source and not applied and finding.get("check_key") in {
-                "inspect_taxonomy_structure", "inspect_taxonomy_naming"}
-                and any(event.get("dataset_id") == ds_id for event in history_all)):
-            from healthcare_data_quality.cleaning.direct_actions import already_resolved_format_issue
-            staged_now = st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id)
-            if staged_now and already_resolved_format_issue(finding, source, staged_now):
-                for field in (
-                    "cleaning_plans_by_finding", "cleaning_batch_queue_by_finding",
-                    "cleaning_batch_total_by_finding", "cleaning_r_previews_by_finding",
-                    "cleaning_compound_previews_by_finding",
-                ):
-                    st.session_state.setdefault(field, {}).pop(fid, None)
-                st.session_state.cleaning_review_statuses[fid] = "Reviewed — no change"
-                st.session_state.cleaning_discussion_mode_by_finding.pop(fid, None)
-                current_plan, remaining_batch = None, []
-                raw_status = "Reviewed — no change"
+        # Do not silently close a finding merely because an earlier format
+        # correction changed its cells. Current evidence below proves the
+        # actual state; Mark reviewed remains the named review decision.
         reviewed_no_change = (raw_status == "Reviewed — no change" and not applied)
         # Terminal approval state, not a leftover chat-mode flag, decides when
         # an approval has finished. Earlier versions left mode="alternative"
@@ -2497,9 +3143,7 @@ def render_cleaning_workspace(
             "Approved column deletion for final export",
             "Approved row changes for final export", "Reviewed — no change",
         }
-        completed = (bool(applied) or reviewed_no_change or
-                     raw_status == "Resolved by earlier approved edit") and (
-            not current_plan and not remaining_batch and raw_status in completed_statuses)
+        completed = _finding_review_completed(fid)
         # A review decision itself is an active interaction, even before the
         # researcher sends any text. In particular, clicking "No — discuss
         # another action" sets mode="alternative" with an EMPTY transcript.
@@ -2509,8 +3153,9 @@ def render_cleaning_workspace(
         active_conversation = (not completed and bool(
             discussion_mode in {"alternative", "accepted"}
             or st.session_state.cleaning_messages_by_finding.get(fid)
-            or fid in st.session_state.cleaning_pending_gemma_b
-            or current_plan or remaining_batch
+            or (fid in st.session_state.cleaning_pending_gemma_b and
+                st.session_state.cleaning_pending_gemma_b[fid].get("kind") not in {"exact_option_recovery", "prior_closure"})
+            or current_plan or remaining_batch or applied
         ))
         # Never change the expander's identity when approval changes status.
         # The expander title must remain stable through approvals; the green
@@ -2520,21 +3165,84 @@ def render_cleaning_workspace(
         # stale keep-open flag. Unfinished groups retain their active position.
         if completed:
             _scroll_to_completed_finding_once(fid)
-        # HDQ_PER_FINDING_READY_GATE_V2: show EVERY finding/check immediately,
-        # but keep its own evidence/actions locked until Agent B is ready.
-        from healthcare_data_quality.ui.finding_wait_gate import (
-            is_locked as _hdq_finding_locked, render_waiting_card as _hdq_wait_row,
-        )
-        if _hdq_finding_locked(
-                finding_id=fid, snapshot=state, completed=completed,
-                active_conversation=active_conversation):
-            _hdq_entry = ((state or {}).get("entries") or {}).get(fid) or {}
-            _hdq_wait_row(st, label, finding["title"],
-                          str(_hdq_entry.get("status") or "queued"))
+        # HDQ_PER_FINDING_READY_GATE_V2: prepare exact options before mounting
+        # a review expander. A raw draft/cache cannot bypass this gate.
+        from healthcare_data_quality.ui.finding_wait_gate import render_waiting_card as _hdq_wait_row
+        _hdq_entry = {} if fid == active_id else (entries.get(fid) or {})
+        prepared = None
+        phase = "completed" if completed else "discussion" if active_conversation else "preparing"
+        if not completed and not active_conversation:
+            resolution = _prior_approval_closure(finding, source)
+            if (resolution and st.session_state.get('cleaning_resolution_declined_by_finding', {}).get(fid) != resolution['fingerprint']):
+                closure = _prepare_prior_approval_closure(fid, finding, source, resolution)
+                phase = "preparing" if closure is None else "resolved" if closure.get("can_offer") else "locked"
+                if phase == "locked":
+                    _retry_sequential_closure(fid, finding, source)
+            else:
+                prepared = _prepare_initial_review_choices(fid, finding, source, _hdq_entry)
+                phase = prepared[0]
+        if phase == "ready" and (not prepared or not prepared[2]):
+            phase = "locked"
+        if phase in {"preparing", "locked", "unavailable"}:
+            publication_epoch(st.session_state, fid, False)
+            pending_now = st.session_state.get('cleaning_pending_gemma_b', {}).get(fid) or {}
+            progress_hint = ''
+            from healthcare_data_quality.ui.finding_wait_gate import active_wait_status
+            from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+            manager = interactive_chat_manager()
+            worker_phase = manager.phase_for(pending_now['job_id']) if pending_now.get('job_id') and hasattr(manager, 'phase_for') else ('generating' if pending_now.get('job_id') else None)
+            live = manager.model_stage_for(pending_now['job_id']) if pending_now.get('job_id') and hasattr(manager, 'model_stage_for') else {}
+            if pending_now.get('kind') == 'exact_option_recovery' and pending_now.get('queued_at') is not None:
+                elapsed = max(0, int(monotonic() - pending_now['queued_at']))
+                stage = 'Drafting alternatives' if pending_now.get('regenerate') else 'Assessing alternatives'
+                if worker_phase == 'queued':
+                    stage = 'Queued for Agent B'
+                elif live:
+                    stage = {
+                        'preparing_context': 'Preparing evidence',
+                        'assessing_batch': 'Preparing batch',
+                        'tokenizing': 'Checking token budget',
+                        'tokenized': 'Token budget checked',
+                        'tokenizer_unavailable': 'Tokenizer unavailable',
+                        'context_overflow': 'Context too large',
+                        'compacting_context': 'Reducing context',
+                        'waiting_for_inference_slot': 'Waiting for inference slot',
+                        'completion_sent': 'Request dispatched · waiting for Gemma',
+                        'completion_received': 'Verifying Gemma response',
+                        'http_error': 'Model HTTP error',
+                        'transport_error': 'Model connection error',
+                        'inference_timeout': 'Gemma completion timed out',
+                        'invalid_json_response': 'Checking model response format',
+                        'waiting_for_reconnect': 'Waiting for model recovery',
+                        'incomplete_generation': 'Incomplete response',
+                        'batch_assessment_failed': 'Recovering batch assessment',
+                        'assessing_remaining_option': 'Checking remaining option',
+                        'assessment_timed_out': 'Assessment timed out',
+                    }.get(live.get('stage'), stage)
+                progress_hint = f'Agent B · {stage} · {elapsed}s'
+            revision_origin = st.session_state.get('cleaning_lookahead_revising', {}).get(fid)
+            exhausted = st.session_state.get('cleaning_empty_review_recovery', {}).get(fid, {}).get('exhausted', False)
+            wait = active_wait_status(phase, worker_phase=worker_phase, model_stage=live.get('stage'), revising=bool(revision_origin), exhausted=exhausted)
+            reason = (progress_hint or ('Agent B · queued' if wait == 'queued' else 'Agent B · preparing current alternatives…'))
+            if wait == 'failed':
+                reason = 'No verified options · review blocked'
+            elif wait == 'recovering':
+                reason = progress_hint or 'Awaiting automatic recovery'
+            if revision_origin:
+                reason += ' · after ' + revision_origin
+            _hdq_wait_row(st, label, finding['title'], wait, entry={'worker_role':'agent_b'}, reason=reason)
             continue
-        with st.expander(f"{label} · {finding['title']}",
-                         expanded=bool(not completed and (
-                             active_conversation or keep_open or fid in ready_ids))):
+        if fid == active_id and phase == 'ready' and prepared:
+            state_for_lookahead['cleaning_lookahead_active_choices'] = {'fid':fid, 'options':prepared[2]}
+        st.session_state.setdefault('cleaning_lookahead_revising', {}).pop(fid, None)
+        epoch, just_opened = publication_epoch(st.session_state, fid, True)
+        # Stable finding-owned container: changing the approval/chat layout must
+        # not reuse another finding's frontend block path on fragment reruns.
+        with st.container(key=f"hdq_review_card_{hashlib.sha256(fid.encode()).hexdigest()[:16]}"), (expander := st.expander(
+                f"{label} · {finding['title']}", expanded=bool(not completed and (
+                    active_conversation or keep_open or just_opened or fid == active_id)),
+                **({'key':f"hdq_completed_{hashlib.sha256(fid.encode()).hexdigest()[:16]}_{'done' if completed else 'review'}_{epoch}", 'on_change':'rerun'}
+                   if getattr(st, '__version__', None) else {}))), _replaceable_review_body(fid):
             if completed and fid not in st.session_state.cleaning_batch_rejected_by_finding:
                 # Do not mark a partially rejected batch as fully completed.
                 # No extra caption: tint the whole heading green and append
@@ -2544,21 +3252,14 @@ def render_cleaning_workspace(
                     item.get("operation") == "flag_cells" for item in applied)
                 annotation_superseded = False
                 if annotation_only:
-                    removed_rows = {
-                        (change.get("row") if approval.get("operation") == "drop_rows"
-                         else change.get("source_row"))
-                        for approval in st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, [])
-                        for change in approval.get("changes", [])
-                    }
-                    removed_columns = {
-                        approval.get("position") for approval in
-                        st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
-                    }
-                    flags_for_finding = [flag for event in applied for flag in event.get("flags", [])]
-                    annotation_superseded = bool(flags_for_finding) and all(
-                        flag.get("row") in removed_rows or flag.get("column") in removed_columns
-                        for flag in flags_for_finding
+                    from healthcare_data_quality.cleaning.active_visual_flags import split_active_visual_flags
+                    candidate_flags = [flag for event in applied for flag in event.get("flags", [])]
+                    active_flags, superseded_flags = split_active_visual_flags(
+                        candidate_flags,
+                        st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, []),
+                        st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, []),
                     )
+                    annotation_superseded = bool(candidate_flags) and not active_flags
                 review_marker = (
                     " hdq-cleaning-annotation-superseded-marker" if annotation_superseded else
                     " hdq-cleaning-annotation-marker" if annotation_only else
@@ -2567,6 +3268,10 @@ def render_cleaning_workspace(
                     f'<span class="hdq-cleaning-completed-marker{review_marker}" '
                     f'data-review-focus="{marker_id}" aria-hidden="true">&#8203;</span>',
                     unsafe_allow_html=True)
+                # The status marker remains visible in the DOM; full evidence
+                # and audit are generated only when the reviewer opens the card.
+                if getattr(expander, 'open', None) is False:
+                    continue
             if finding.get("check_key") == "gemma_check" and source is None and len(dataset_paths) == 1:
                 source = Path(dataset_paths[0])
                 ds_id = "dataset_1"
@@ -2590,6 +3295,36 @@ def render_cleaning_workspace(
                                "name": uploaded[index].name}
                     if _reconcile_approved_column_review(fid, ds_id, source):
                         _rerun_cleaning_fragment(fid)
+            if finding.get("check_key") == "gemma_check":
+                from healthcare_data_quality.ui.gemma_check_evidence import check_evidence_rows
+                from healthcare_data_quality.ui.gemma_check_evidence import observed_check_data
+                try:
+                    from healthcare_data_quality.cleaning.proposal_conflicts import _row_deletions
+                    observed = observed_check_data(finding, source,
+                        staged=st.session_state.get('cleaning_staged_bytes_by_dataset', {}).get(ds_id),
+                        removed_rows=_row_deletions(st.session_state.get('cleaning_approved_rows_by_dataset', {}).get(ds_id, [])),
+                        removed_columns={c['position'] for c in st.session_state.get('cleaning_approved_columns_by_dataset', {}).get(ds_id, [])})
+                except (OSError, ValueError, csv.Error, UnicodeError):
+                    observed = []
+                if observed:
+                    st.dataframe(pd.DataFrame(observed), hide_index=True, width='stretch')
+                    st.caption('Current control counts · original column IDs')
+                else:
+                    st.caption('No additional anomalous source cells were reported by this check.')
+                with st.expander('Check method and verification', expanded=False):
+                    st.dataframe(pd.DataFrame(check_evidence_rows(finding)), hide_index=True, width='stretch')
+            evidence = finding.get("evidence") or []
+            current_rows = []
+            if source is not None and evidence:
+                from healthcare_data_quality.cleaning.current_review_evidence import current_finding_evidence
+                try:
+                    current_rows = current_finding_evidence(st.session_state, finding, source, display=True)
+                except (ValueError, OSError, PermissionError, csv.Error):
+                    current_rows = []
+                if current_rows and (any(r['Original'] != r['Current'] for r in current_rows)
+                        or st.session_state.get('cleaning_show_current_evidence', {}).get(fid)):
+                    st.markdown('**Current evidence · original CSV coordinates**')
+                    st.dataframe(pd.DataFrame(current_rows), hide_index=True, width='stretch')
             if completed:
                 if st.checkbox("Show completed finding audit",
                                value=True, key=f"review_completed_audit_{fid}"):
@@ -2653,37 +3388,32 @@ def render_cleaning_workspace(
                     visual_flag_events = [item for item in applied
                                           if item.get("operation") == "flag_cells"]
                     if visual_flag_events:
-                        from healthcare_data_quality.cleaning.visual_flags import flag_preview_html
                         approved_visual = [item for event in visual_flag_events
                                            for item in event.get("flags", [])]
                         if approved_visual:
-                            # Do not promise an export highlight on a row or
-                            # column that was removed by another named review.
-                            row_deletions = {
-                                (change.get("row") if entry.get("operation") == "drop_rows"
-                                 else change.get("source_row"))
-                                for entry in st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, [])
-                                for change in entry.get("changes", [])
-                            }
-                            column_deletions = {
-                                entry.get("position") for entry in
-                                st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, [])
-                            }
-                            discarded = [item for item in approved_visual
-                                         if item.get("row") in row_deletions or
-                                         item.get("column") in column_deletions]
+                            # Effective flags are a projection of the approved final
+                            # structure, not the original approval transcript.
+                            from healthcare_data_quality.cleaning.active_visual_flags import split_active_visual_flags
+                            active_flags, discarded = split_active_visual_flags(
+                                approved_visual,
+                                st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, []),
+                                st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, []),
+                            )
                             if discarded:
                                 removed_locations = ", ".join(
                                     f"R{item['row']}:C{item['column']}" for item in discarded[:8])
                                 st.info(
-                                    f"{len(discarded)} earlier highlight(s) superseded by approved "
-                                    f"row/column deletions ({removed_locations}). "
-                                    "They remain in the review history, but the deleted cells are "
-                                    "not present in the final file. To keep them, revise the deletion.")
+                                    f"{len(discarded)} historical flag(s) superseded by approved "
+                                    f"row/column deletion ({removed_locations}). "
+                                    "These appear only in the historical audit, not in "
+                                    "the active annotations or cleaned file."
+                                )
+                            if active_flags:
+                                st.caption(f"{len(active_flags)} active annotation(s) on surviving cells; "
+                                           "CSV values unchanged.")
+                                _render_visual_flag_preview(active_flags, fid, phase="completed")
                             else:
-                                st.caption("Visual annotation only — cell values unchanged.")
-                            st.markdown(flag_preview_html(approved_visual),
-                                        unsafe_allow_html=True)
+                                st.caption("No active highlights remain in the cleaned dataset.")
                     if rows_for_display:
                         actual_rows = None
                         if source:
@@ -2710,7 +3440,7 @@ def render_cleaning_workspace(
                         st.caption("Already completed in an earlier approved review")
                     else:
                         st.caption("Approved changes recorded")
-                    if st.button("Revise completed action", key=f"review_reopen_{fid}"):
+                    if active_id is None and st.button("Revise completed action", key=f"review_reopen_{fid}"):
                         if source is None:
                             st.error("Select the original CSV before revising this review.")
                         else:
@@ -2783,64 +3513,146 @@ def render_cleaning_workspace(
                 continue
             evidence = finding.get("evidence") or []
             if evidence and st.checkbox("Show original evidence",
-                                        value=True, key=f"review_evidence_{fid}"):
+                                        value=not any(r["Original"] != r["Current"] for r in current_rows), key=f"review_evidence_{fid}"):
                 from healthcare_data_quality.cleaning.visual_flags import styled_evidence
                 current_flags = st.session_state.cleaning_visual_flags_by_dataset.get(ds_id, [])
+                from healthcare_data_quality.cleaning.active_visual_flags import split_active_visual_flags
+                current_flags, _ = split_active_visual_flags(
+                    current_flags,
+                    st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, []),
+                    st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, []),
+                )
                 st.dataframe(styled_evidence(evidence, current_flags),
                              hide_index=True, width="stretch")
 
-            # A chat instruction may express a visual-flag intent, but it has
-            # NOT shown the reviewed Before -> After yet. Render the immutable
-            # source-backed preview first and let one *visible* action select it.
-            # This path is shared by QC findings and exploratory Gemma checks.
+            exact_job = st.session_state.get('cleaning_pending_gemma_b', {}).get(fid) or {}
+            if exact_job.get('kind') == 'exact_option_recovery' and (st.session_state.cleaning_plans_by_finding.get(fid)
+                    or st.session_state.cleaning_discussion_mode_by_finding.get(fid) in {'accepted','alternative'}):
+                _retire_declined_job(fid)
+
+            # Exclusive discussion state after No. No fall-through into old
+            # recommendations, memory, clarification or approval renderers.
+            if _waiting_for_new_discussion(st.session_state, fid):
+                for field in ('cleaning_plans_by_finding', 'cleaning_batch_queue_by_finding',
+                              'cleaning_batch_total_by_finding', 'cleaning_pending_visual_flags_by_finding',
+                              'cleaning_completed_gemma', 'cleaning_reassess_context_by_finding',
+                              'cleaning_cross_source_review_by_finding', 'cleaning_close_request_by_finding'):
+                    st.session_state.setdefault(field, {}).pop(fid, None)
+                _retire_declined_job(fid)
+                _render_visual_discussion(fid)
+                _render_review_chat_input(
+                    fid, finding, source, uploaded, dataset_paths, session_context,
+                    placeholder="Describe the new action or ask Agent C…", b_pending=False)
+                _render_bottom_review_closure(fid, finding, source, applied)
+                continue
+            # Multi-dataset checks can bind a source inside their card.
+            if source is not None and index < 0 and len(dataset_paths) > 1:
+                _sync_gemma_conversations(finding, source)
+            if not completed and _finding_review_completed(fid):
+                st.caption('Review completed.')
+                continue
+            if (st.session_state.get('cleaning_pending_gemma_b', {}).get(fid) or {}).get('kind') == 'exact_option_recovery':
+                st.caption('Checking current alternatives…')
+                if st.button('No — Discuss Another Idea', key=f'review_no_{fid}_recovery', on_click=_decline_and_discuss, args=(fid,)):
+                    _decline_and_discuss(fid)
+                    _rerun_parent_after_agent_b_choice(fid)
+                _render_bottom_review_closure(fid, finding, source, applied)
+                continue
+            if (st.session_state.get('cleaning_pending_gemma_b', {}).get(fid) or {}).get('kind') in {'local_choice', 'prior_closure', 'local_r_preview', 'local_compound_preview'}:
+                _render_visual_discussion(fid)
+                _render_live_finding_assignment(fid)
+                _render_bottom_review_closure(fid, finding, source, applied)
+                continue
             flag_plan = st.session_state.cleaning_pending_visual_flags_by_finding.get(fid)
             if flag_plan and source:
-                from healthcare_data_quality.cleaning.visual_flags import flag_preview_html
+                try:
+                    from healthcare_data_quality.cleaning.visual_flags import requested_visual_flag
+                    # Recompute exact scope, including legacy taxonomy-only drafts.
+                    exact = requested_visual_flag(flag_plan.get('request', ''), finding, source)
+                    if not exact or exact['flags'] != flag_plan['flags'] or exact['source_sha256'] != flag_plan.get('source_sha256'):
+                        raise PermissionError('The displayed highlight no longer matches the requested scope; submit the request again')
+                    _validate_pending_visual_scope(fid, finding, source, flag_plan)
+                    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+                    context = dataset_review_context(st.session_state, ds_id, fid)
+                    if (fid in st.session_state.cleaning_pending_gemma_b or not flag_plan.get('gemma_review') or flag_plan.get('review_revision') != context['revision']):
+                        st.session_state.cleaning_pending_visual_flags_by_finding.pop(fid, None)
+                        _submit_visual_review(finding, source, flag_plan, flag_plan.get('user_request', flag_plan['request']))
+                        flag_plan = None
+                except (ValueError, PermissionError, OSError, csv.Error, KeyError, IndexError, TypeError) as exc:
+                    st.session_state.cleaning_pending_visual_flags_by_finding.pop(fid, None)
+                    st.session_state.cleaning_review_statuses[fid] = 'Discussion open'
+                    _next_agent_c_ui_generation(fid)
+                    st.warning(f'Stale highlight discarded: {exc}. No styling was applied.')
+                    flag_plan = None
+            if flag_plan and source:
+                from healthcare_data_quality.cleaning.visual_flags import visual_scope_label
                 from healthcare_data_quality.cleaning.one_click_visual_flag import (
                     apply_explicit_visual_flag_once,
                 )
-                st.markdown('**Flag taxonomy — bold red (visible in Excel export)**')
-                st.caption('Preview only. The CSV values will stay unchanged; the red/bold '
-                           'annotation will be preserved in the exported Excel workbook.')
-                st.markdown(flag_preview_html(flag_plan["flags"]), unsafe_allow_html=True)
+                _render_visual_discussion(fid)
                 review_turns = [
                     entry for entry in st.session_state.cleaning_messages_by_finding.get(fid, [])
                     if entry.get("role") == "user" and not entry.get("automatic")
                 ]
                 explicitly_selected = bool(
-                    review_turns and review_turns[-1].get("content") == flag_plan.get("request")
+                    review_turns and review_turns[-1].get("content") == flag_plan.get("user_request", flag_plan.get("request"))
                 )
-                if explicitly_selected:
-                    reviewer = str(st.session_state.get('cleaning_approved_reviewer') or '').strip()
-                    if st.button(
-                        f"Yes — Apply red/bold highlighting to {len(flag_plan['flags'])} taxonomy cell(s)",
-                        key=f'flag_apply_verified_{fid}_{_active_agent_c_control_generation(fid)}',
-                        disabled=not bool(reviewer), type='primary',
-                    ):
-                        try:
-                            result = apply_explicit_visual_flag_once(
-                                st.session_state, finding, source, flag_plan["request"],
-                                previously_displayed=flag_plan,
-                            )
-                        except (ValueError, PermissionError, OSError, csv.Error, KeyError) as exc:
-                            st.error(f'Flag was not applied: {exc}')
-                        else:
-                            st.session_state.cleaning_messages_by_finding.setdefault(fid, []).append({
-                                'role': 'assistant', 'content':
-                                f'Applied {result["approved"]} red/bold flag(s) to the verified '
-                                'taxonomy cells. The CSV values remain unchanged.',
-                            })
-                            _rerun_cleaning_fragment(fid)
-                else:
-                    st.warning('This proposal has no matching attributable reviewer instruction. '
-                               'Discuss the exact scope; no styling was applied.')
-                if st.button('No — Discuss Another Idea',
-                             key=f'flag_no_{fid}_{_active_agent_c_control_generation(fid)}'):
-                    st.session_state.cleaning_pending_visual_flags_by_finding.pop(fid, None)
-                    _open_agent_c_alternative_chat(fid, discard_plan=True)
-                    _rerun_cleaning_fragment(fid)
+                with st.container(border=True):
+                    if explicitly_selected:
+                        st.caption('Bold red + yellow fill' if flag_plan['flags'][0].get('fill', True) else 'Bold red font only')
+                        st.caption('Excel annotation only; values unchanged.')
+                        preview_ready = _render_visual_flag_preview(flag_plan['flags'], fid, phase='pending', source=source, scope=flag_plan['scope'])
+                        yes_col, no_col = st.columns(2)
+                        reviewer = str(st.session_state.get('cleaning_approved_reviewer') or '').strip()
+                        highlight_clicked = yes_col.button(
+                            reflected_action_label({"operation":"flag_cells", "changes":flag_plan["flags"], "visual_scope":flag_plan["scope"]}, finding, flag_plan.get("gemma_review", {}).get("button_label")),
+                            key=f'flag_apply_verified_{fid}_{_active_agent_c_control_generation(fid)}',
+                            disabled=not bool(reviewer) or not preview_ready, type='primary',
+                        )
+                        if highlight_clicked and reviewer and preview_ready:
+                            try:
+                                from healthcare_data_quality.services.model_plan_review import dataset_review_context
+                                if dataset_review_context(st.session_state, ds_id, fid)['revision'] != flag_plan['review_revision']:
+                                    raise PermissionError('Other findings changed; Gemma must reassess this preview')
+                                result = apply_explicit_visual_flag_once(
+                                    st.session_state, finding, source, flag_plan["request"],
+                                    previously_displayed=flag_plan,
+                                )
+                            except (ValueError, PermissionError, OSError, csv.Error, KeyError) as exc:
+                                st.error(f'Flag was not applied: {exc}')
+                            else:
+                                st.session_state.cleaning_messages_by_finding.setdefault(fid, []).append({
+                                    'role': 'assistant', 'content':
+                                    f'Applied {result["approved"]} red/bold flag(s) to the verified '
+                                    'source cells. The CSV values remain unchanged.',
+                                })
+                                _rerun_cleaning_fragment(fid)
+                    else:
+                        _, no_col = st.columns(2)
+                        st.warning('This proposal has no matching attributable reviewer instruction. '
+                                   'Discuss the exact scope; no styling was applied.')
+                    if no_col.button('No — Discuss Another Idea',
+                                 key=f'flag_no_{fid}_{_active_agent_c_control_generation(fid)}'):
+                        _decline_and_discuss(fid)
+                        _rerun_cleaning_fragment(fid)
+                _render_bottom_review_closure(fid, finding, source, applied)
                 continue
-            # Gemma checks use the same model-assessed, source-verified
+            if source and fid not in st.session_state.cleaning_pending_gemma_b:
+                from healthcare_data_quality.services.model_plan_review import dataset_review_context
+                revision = dataset_review_context(st.session_state, ds_id, fid)['revision']
+                previous_revision = st.session_state.get('cleaning_review_revision_by_finding', {}).get(fid)
+                thread_now = st.session_state.cleaning_messages_by_finding.get(fid, [])
+                stale_clarification = bool(thread_now and thread_now[-1].get('role') == 'assistant'
+                    and not thread_now[-1].get('controls_expired') and not _latest_user_wants_visual_flag(thread_now))
+                needs_reassessment = st.session_state.setdefault('cleaning_reassess_context_by_finding', {}).pop(fid, False)
+                if (not _waiting_for_new_discussion(st.session_state, fid) and not applied and (needs_reassessment or (previous_revision and previous_revision != revision
+                        and (st.session_state.cleaning_plans_by_finding.get(fid)
+                             or st.session_state.cleaning_batch_queue_by_finding.get(fid) or stale_clarification)))):
+                    _open_agent_c_alternative_chat(fid, discard_plan=True)
+                    _queue_agent_c_for_finding(finding, source, uploaded, dataset_paths,
+                        'Reassess the last reviewer request and exact proposed changes using the updated cross-finding context. Do not repeat approved actions or change the requested scope.',
+                        automatic=True, require_gemma_review=True)
+            # Even a zero-issue Gemma negative-control check uses the same model-assessed, source-verified
             # Before→After selection as QC findings. A selector that defaults
             # to all blank controls would bypass that assessment and suppress
             # the reviewer's legitimate choice to retain negative controls.
@@ -2861,7 +3673,6 @@ def render_cleaning_workspace(
 
             # Job results are consumed by the UI, never by the worker. A
             # submitted user message is already visible while inference runs.
-            _sync_gemma_conversations(finding, source)
             # If EVERY source-evidenced target was removed by an earlier
             # named approval, offer one Gemma-reviewed CLOSE choice, not an
             # impossible second edit. Never open an unreviewed download gate.
@@ -2872,12 +3683,14 @@ def render_cleaning_workspace(
             # second "Prepare Changes" button for the same explicit request.
             # Reconciliation is source-exact and never bypasses final approval.
             prior_thread = st.session_state.cleaning_messages_by_finding.get(fid, [])
-            if (source and not completed and not st.session_state.cleaning_plans_by_finding.get(fid)
+            if (source and not completed and not _waiting_for_new_discussion(st.session_state, fid)
+                    and not st.session_state.cleaning_plans_by_finding.get(fid)
                     and not st.session_state.cleaning_batch_queue_by_finding.get(fid)
                     and fid not in st.session_state.cleaning_pending_gemma_b
                     and st.session_state.cleaning_discussion_mode_by_finding.get(fid) == "alternative"
                     and prior_thread and prior_thread[-1].get("role") == "assistant"
                     and not prior_thread[-1].get("controls_expired")
+                    and not prior_thread[-1].get("background_diagnostic")
                     and "pad" in str(prior_thread[-1].get("content", "")).casefold()):
                 last_request = next((str(m.get("content") or "") for m in reversed(prior_thread)
                                      if m.get("role") == "user" and not m.get("automatic")), "")
@@ -2885,8 +3698,13 @@ def render_cleaning_workspace(
                     propose_explicit_taxonomy_padding,
                 )
                 recovered = propose_explicit_taxonomy_padding(last_request, finding, source)
-                if recovered is not None:
-                    _record_gemma_b_response(fid, finding, source, recovered)
+                padding_recovery_key = hashlib.sha256(json.dumps([fid, last_request, source.stat().st_mtime_ns]).encode()).hexdigest()
+                recovered_requests = st.session_state.setdefault('cleaning_legacy_padding_recovery_once', set())
+                if recovered is not None and padding_recovery_key not in recovered_requests:
+                    recovered_requests.add(padding_recovery_key)
+                    _queue_agent_c_for_finding(finding, source, uploaded, dataset_paths,
+                        'Reassess the last explicit taxonomy padding request using exact source ranks. Prepare a read-only proposal only.',
+                        automatic=True, require_gemma_review=True)
             # Never generate a deterministic one-click proposal directly from
             # render(): Agent B's background model review must assess its scope
             # first. A source check alone does not satisfy reviewer policy.
@@ -2917,8 +3735,17 @@ def render_cleaning_workspace(
             # poller refreshes the parent only when safe (see below).
             if b_controls_allowed:
                 _render_live_agent_b_finding(
-                    fid, finding, source, uploaded, dataset_paths, job_id, ds_id,
+                    fid, finding, source, uploaded, dataset_paths, job_id, ds_id, snapshot=state or {}, prepared=prepared,
                 )
+                if prepared is not None and (prepared[0] != 'ready' or not prepared[2]):
+                    continue
+                if (prepared is not None or fid in ready_ids or st.session_state.cleaning_recommendations.get(fid)
+                        or fid in st.session_state.cleaning_pending_gemma_b
+                        or ((state or {}).get("entries") or {}).get(fid, {}).get("status") == "failed"):
+                    _render_bottom_review_closure(fid, finding, source, applied)
+                    continue
+            # Rejected Agent B guidance is retained internally only. The
+            # discussion transcript is the sole history shown to the reviewer.
             b_pending = fid in st.session_state.cleaning_pending_gemma_b
 
             # Once Yes or No is clicked the decision controls disappear.
@@ -2956,11 +3783,14 @@ def render_cleaning_workspace(
             choice_labels = scoped_clarification_choices(finding, choice_labels)
             if control_phase == 'clarification' and not choice_labels:
                 control_phase = 'discussion'
+            if _waiting_for_new_discussion(st.session_state, fid) and not b_pending:
+                control_phase, choice_labels = 'discussion', []
 
             last_assistant_message = (str(transcript[-1].get("content", ""))
                                       if clarification_needed else "")
             if (clarification_needed and control_phase == "discussion"
                     and not choice_labels
+                    and not (transcript[-1].get("controls_expired") or transcript[-1].get("proposal_preparation_failed"))
                     and fid not in st.session_state.cleaning_plan_retry_once):
                 # Retry once on an accepted action if Gemma answered in prose
                 # rather than supplying the structured plan. Do not repeatedly
@@ -2976,39 +3806,9 @@ def render_cleaning_workspace(
                     automatic=True,
                 )
                 _rerun_cleaning_fragment(fid)
-            if False and plan and transcript:
-                if False:
-                    for item in transcript:
-                        if item.get("automatic"):
-                            st.caption("Agent C retried the accepted plan automatically.")
-                        else:
-                            with st.chat_message(item["role"]):
-                                if item.get("role") == "assistant" and item.get("assigned_agent") in {"A", "B"}:
-                                    st.caption(f"Agent {item['assigned_agent']} assisted while C was busy")
-                                st.write(item["content"])
-            elif (mode == "alternative" or clarification_needed) and transcript:
-                st.markdown("**Discussion**")
-                for item in transcript:
-                    if not item.get("automatic"):
-                        with st.chat_message(item["role"]):
-                            st.write(item["content"])
+            _render_visual_discussion(fid)
             if b_pending:
                 _render_live_finding_assignment(fid)
-            if fid not in ready_ids and mode != "alternative" and not plan:
-                # The previous implementation required Agent B's ready flag to
-                # unlock any Agent C form. A failed/missing B queue therefore
-                # blocked all interaction, even though Agent C can independently
-                # analyze the current source and request an explicit approval.
-                if (source and not applied and not completed and not current_plan
-                        and not remaining_batch and not b_pending
-                        and st.session_state.cleaning_review_statuses.get(fid)
-                            != "Reviewed — no change"):
-                    if st.button("Discuss with Agent C now",
-                                 key=f"review_start_direct_agent_c_{fid}"):
-                        st.session_state.cleaning_discussion_mode_by_finding[fid] = "alternative"
-                        st.session_state.cleaning_review_statuses[fid] = "Alternative requested"
-                        _next_agent_c_ui_generation(fid)
-                        _rerun_cleaning_fragment(fid)
             # Use one replaceable control slot on Streamlit. Test/dummy
             # renderers without st.empty still use the same state guards.
             active_choice_slot = st.empty() if hasattr(st, "empty") else None
@@ -3021,13 +3821,13 @@ def render_cleaning_workspace(
                     if (control_phase == "clarification" and choice_labels
                             and (fid in ready_ids or mode == "alternative")):
                         st.markdown("**Choose an approach:**")
-                        st.caption("Choose a scope to discuss. No data is changed by these questions; exact Before → After is required before execution.")
+                        st.caption("Choose an approach to prepare an exact preview. Nothing changes until approval.")
                         # Two buttons per row remain readable with long column/row
                         # descriptions, including a third "other operation" choice.
                         choice_rows = [st.columns(2) for _ in range((len(choice_labels) + 1) // 2)]
                         for option_index, choice_label in enumerate(choice_labels, start=1):
                             choice_column = choice_rows[(option_index - 1) // 2][(option_index - 1) % 2]
-                            positive_label = "Clarify — " + choice_label
+                            positive_label = choice_label
                             if choice_column.button(positive_label,
                                     key=f"review_clarify_yes_{fid}_{_active_agent_c_control_generation(fid)}_{option_index}",
                                     disabled=b_pending):
@@ -3103,19 +3903,12 @@ def render_cleaning_workspace(
                                 _queue_agent_c_for_finding(
                                     finding, source, uploaded, dataset_paths, answer)
                                 _rerun_cleaning_fragment(fid)
-                        if st.button("No — Discuss Another Idea",
-                                     key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_clarify"):
-                            _open_agent_c_alternative_chat(fid)
-                            _rerun_cleaning_fragment(fid)
                     elif control_phase == "custom_input":
                         st.info(("Enter the exact replacement value for each affected cell below. "
                                  if custom_value_input else "Describe the alternative operation below. ")
                                 + "Press Enter to send.")
-                        if st.button("No — Discuss Another Idea",
-                                     key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_custom"):
-                            _open_agent_c_alternative_chat(fid)
-                            _rerun_cleaning_fragment(fid)
-                    elif control_phase == "discussion" and mode == "alternative":
+                    elif (control_phase == "discussion" and mode == "alternative"
+                          and not _waiting_for_new_discussion(st.session_state, fid)):
                         # Agent C prepares its source-exact proposal READ-ONLY.
                         # A prose recommendation is not itself a user-selectable
                         # action: do not request a preliminary approval and then
@@ -3127,7 +3920,13 @@ def render_cleaning_workspace(
                                 and last_reply.get("role") == "assistant"
                                 and str(last_reply.get("content") or "").strip()
                                 and not last_reply.get("automatic")
+                                and not last_reply.get("background_diagnostic")
+                                and any(item.get("role") == "user" and not item.get("automatic") for item in transcript)
                                 and not last_reply.get("controls_expired")
+                                and not last_reply.get("proposal_preparation_failed")
+                                and not str(last_reply.get("content", "")).startswith((
+                                    "The requested bulk action was not prepared", "Highlight not prepared", "Flag not prepared", "Could not"))
+                                and not _latest_user_wants_visual_flag(transcript)
                                 and any(word in str(last_reply.get("content") or "").casefold()
                                         for word in ("recommend", "propos", "replace", "delet",
                                                      "remov", "merge", "standardiz", "correct",
@@ -3170,13 +3969,6 @@ def render_cleaning_workspace(
                                 st.caption("Preparing the verified Before → After proposal." if
                                            fid in st.session_state.cleaning_pending_gemma_b else
                                            "A verified action is needed before approval.")
-                                if st.button(
-                                    "No — Discuss Another Idea",
-                                    key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_agent_c",
-                                ):
-                                    last_reply["controls_expired"] = True
-                                    _open_agent_c_alternative_chat(fid)
-                                    _rerun_cleaning_fragment(fid)
                     # One conversation form per finding, and none while a request is
                     # in flight. Show the form again when the reply has been collected.
                     # st.chat_input sends with Enter and inserts a newline with
@@ -3189,43 +3981,20 @@ def render_cleaning_workspace(
                             and st.session_state.cleaning_review_statuses.get(fid) != "Reviewed — no change"):
                         placeholder = ("Enter exact replacement values…" if custom_value_input
                                        else "Describe the new action or ask Agent C…")
-                        # Keep the same widget identity across background
-                        # suggestions and model replies; rotating a generation
-                        # on every reply remounts chat and loses input focus.
-                        chat_key = (f"review_message_{fid}_" +
-                                    hashlib.sha256(session_context.encode("utf-8")).hexdigest()[:12])
-                        from healthcare_data_quality.ui.review_input_focus import (
-                            review_chat_container_key, focus_reviewer_chat,
-                        )
-                        with st.container(key=review_chat_container_key(fid)):
-                            message = (st.chat_input(placeholder, key=chat_key,
-                                                     max_chars=4000, disabled=b_pending)
-                                       if hasattr(st, "chat_input") else None)
-                        focus_pending = st.session_state.setdefault(
-                            "cleaning_chat_focus_pending", set())
-                        if fid in focus_pending:
-                            focus_pending.discard(fid)
-                            focus_reviewer_chat(st, fid)
-                        if message and str(message).strip():
-                            if control_phase == "idle":
-                                # Direct user feedback is a valid discussion even
-                                # without clicking No first; do not auto-approve.
-                                st.session_state.cleaning_discussion_mode_by_finding[fid] = "alternative"
-                                st.session_state.cleaning_review_statuses[fid] = "Discussion open"
-                            _queue_agent_c_for_finding(finding, source, uploaded, dataset_paths,
-                                                       str(message).strip())
-                            st.session_state.cleaning_custom_value_input_by_finding.pop(fid, None)
-                            st.session_state.cleaning_custom_operation_input_by_finding.pop(fid, None)
-                            _rerun_cleaning_fragment(fid)
+                        _render_review_chat_input(
+                            fid, finding, source, uploaded, dataset_paths, session_context,
+                            placeholder=placeholder, b_pending=b_pending,
+                            control_phase=control_phase)
 
-            plan = st.session_state.cleaning_plans_by_finding.get(fid)
+            plan = (None if fid in st.session_state.cleaning_pending_gemma_b
+                    else st.session_state.cleaning_plans_by_finding.get(fid))
             approval_slot = st.empty() if hasattr(st, "empty") else None
             if plan is None:
                 if approval_slot is not None:
                     approval_slot.empty()
             else:
                 with (approval_slot.container() if approval_slot is not None
-                      else nullcontext()):
+                      else nullcontext()), st.container(border=True):
                     compound_active = bool(plan and st.session_state.cleaning_batch_queue_by_finding.get(fid))
                     if compound_active and source:
                         _render_compound_approval(fid, finding, source, ds_id, catalog)
@@ -3253,7 +4022,7 @@ def render_cleaning_workspace(
                             st.error(f"Column deletion proposal cannot be approved: {exc}")
                             can_delete = False
                         else:
-                            _render_before_after([checked])
+                            _render_before_after([checked], source)
                             if not _render_source_deletion_details(
                                     source, [checked], key=f"column_{fid}"):
                                 can_delete = False
@@ -3262,7 +4031,7 @@ def render_cleaning_workspace(
                             yes_col, no_col = st.columns(2)
                             with yes_col:
                                 approved = st.form_submit_button(
-                                    "Yes — " + final_action_label([plan], finding),
+                                    _reflected_interactive_label([plan], finding),
                                     disabled=not (can_delete and reviewer_for_approval),
                                     key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_column")
                             with no_col:
@@ -3270,7 +4039,7 @@ def render_cleaning_workspace(
                                     "No — Discuss Another Idea",
                                     key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_column")
                         if decline_column:
-                            _open_agent_c_alternative_chat(fid, discard_plan=True)
+                            _decline_and_discuss(fid)
                             _rerun_cleaning_fragment(fid)
                         if approved:
                             reviewer = str(reviewer_for_approval or "").strip()
@@ -3362,7 +4131,7 @@ def render_cleaning_workspace(
                             st.error(f"Row operation cannot be approved: {exc}")
                         else:
                             if is_merge:
-                                _render_before_after([checked])
+                                _render_before_after([checked], source)
                                 item = checked["changes"][0]
                                 # Show the actual numeric impact of merging before approval.
                                 from healthcare_data_quality.cleaning.in_memory_cleaning import _sum_count_cells
@@ -3389,7 +4158,7 @@ def render_cleaning_workspace(
                                 displayed = ", ".join(map(str, row_ids[:16]))
                                 if len(row_ids) > 16:
                                     displayed += f", … (+{len(row_ids) - 16} more)"
-                                _render_before_after([checked])
+                                _render_before_after([checked], source)
                                 if len(row_ids) > 16:
                                     with st.expander("All selected row numbers"):
                                         st.dataframe(pd.DataFrame({"CSV row": row_ids}),
@@ -3402,7 +4171,7 @@ def render_cleaning_workspace(
                             yes_col, no_col = st.columns(2)
                             with yes_col:
                                 row_approved = st.form_submit_button(
-                                    "Yes — " + final_action_label([plan], finding),
+                                    _reflected_interactive_label([plan], finding),
                                     disabled=not (can_approve_rows and row_reviewer),
                                     key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_rows")
                             with no_col:
@@ -3410,7 +4179,7 @@ def render_cleaning_workspace(
                                     "No — Discuss Another Idea",
                                     key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_rows")
                         if decline_rows:
-                            _open_agent_c_alternative_chat(fid, discard_plan=True)
+                            _decline_and_discuss(fid)
                             _rerun_cleaning_fragment(fid)
                         if row_approved:
                             if not str(row_reviewer or "").strip():
@@ -3484,15 +4253,12 @@ def render_cleaning_workspace(
                                 # Authorized only to PREVIEW: execute deterministic R on
                                 # the exact affected values in the isolated sandbox.
                                 # The working CSV is not touched by this step.
-                                prepared = prepare_and_execute_scoped_r_preview(plan, finding, source)
-                                st.session_state.cleaning_r_previews_by_finding[fid] = prepared
-                                st.session_state.cleaning_review_statuses[fid] = "R output verified — insertion awaiting approval"
-                                st.session_state.cleaning_decisions.append({
-                                    "finding_id": fid, "decision": "scoped_r_preview_tested_no_dataset_change",
-                                    "source_sha256": prepared["source_sha256"],
-                                    "r_preview_sha256": prepared["preview_sha256"],
-                                    "r_result_sha256": prepared["r_result"]["verified_output_sha256"],
-                                })
+                                from copy import deepcopy
+                                _submit_review_worker(finding, source, 'local_r_preview',
+                                    prepare_and_execute_scoped_r_preview, (deepcopy(plan), deepcopy(finding), Path(source)))
+                                _render_live_finding_assignment(fid)
+                                _render_bottom_review_closure(fid, finding, source, applied)
+                                continue
                             except (OSError, ValueError, KeyError, PermissionError, RuntimeError, csv.Error) as exc:
                                 diagnosis = diagnose_r_preview_failure(exc, plan, finding)
                                 previous_error = ("Isolated R preview failed: " + diagnosis["summary"]
@@ -3505,7 +4271,7 @@ def render_cleaning_workspace(
                             if diagnosis:
                                 # A failed operation must explain why it failed without
                                 # exposing the source CSV or raw model/R code.
-                                with st.expander("R failure details and next steps", expanded=True):
+                                with st.expander("R failure details and next steps", expanded=False):
                                     st.write("**Failed stage:**", diagnosis["stage"])
                                     st.write("**Error code:**", diagnosis["code"])
                                     st.write("**Likely cause:**", diagnosis["summary"])
@@ -3543,15 +4309,15 @@ def render_cleaning_workspace(
                                             if selfcheck.get("stderr_excerpt"):
                                                 st.code(selfcheck["stderr_excerpt"], language="text")
                                         st.caption(selfcheck["action"])
-                            if st.button("Retry isolated R preview", key=f"review_retry_r_{fid}"):
-                                st.session_state.cleaning_r_errors_by_finding.pop(fid, None)
-                                st.session_state.cleaning_r_diagnostics_by_finding.pop(fid, None)
-                                st.session_state.cleaning_r_selfchecks_by_finding.pop(fid, None)
-                                _rerun_cleaning_fragment(fid)
+                            with st.expander("Sandbox recovery", expanded=False):
+                                if st.button("Retry isolated R preview", key=f"review_retry_r_{fid}"):
+                                    st.session_state.cleaning_r_errors_by_finding.pop(fid, None)
+                                    st.session_state.cleaning_r_diagnostics_by_finding.pop(fid, None)
+                                    st.session_state.cleaning_r_selfchecks_by_finding.pop(fid, None)
+                                    _rerun_cleaning_fragment(fid)
                         elif prepared:
                             # The researcher sees actual proposed values; R proof
                             # remains available on demand, not a second summary.
-                            _render_before_after([prepared["insertion_plan"]])
                             affected = prepared["insertion_plan"]["changes"]
                             evidenced_cells, evidenced_headers = allowed_positions(finding, source)
                             required_positions = (evidenced_headers if
@@ -3662,7 +4428,10 @@ def render_cleaning_workspace(
                             except (OSError, ValueError, PermissionError, RuntimeError,
                                     csv.Error, KeyError) as exc:
                                 can_approve = False
+                                review = None
                                 st.error(f"In-memory insertion failed; no changes were staged: {exc}")
+                            if review is not None:
+                                _render_before_after([prepared["insertion_plan"]], source)
                             with st.form(f"review_execute_r_{fid}_{_active_agent_c_control_generation(fid)}"):
                                 reviewer_for_approval = (
                                     st.session_state.get("cleaning_approved_reviewer") or ""
@@ -3670,7 +4439,7 @@ def render_cleaning_workspace(
                                 yes_col, no_col = st.columns(2)
                                 with yes_col:
                                     execute = st.form_submit_button(
-                                        "Yes — " + final_action_label([plan], finding),
+                                        _reflected_interactive_label([prepared["insertion_plan"]] if review is not None else [plan], finding),
                                         disabled=not (can_approve and reviewer_for_approval),
                                         key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_cells")
                                 with no_col:
@@ -3678,7 +4447,7 @@ def render_cleaning_workspace(
                                         "No — Discuss Another Idea",
                                         key=f"review_discuss_no_{fid}_{_active_agent_c_control_generation(fid)}_cells")
                             if decline_cells:
-                                _open_agent_c_alternative_chat(fid, discard_plan=True)
+                                _decline_and_discuss(fid)
                                 _rerun_cleaning_fragment(fid)
                             if execute:
                                 reviewer = str(reviewer_for_approval or "").strip()
@@ -3781,42 +4550,9 @@ def render_cleaning_workspace(
                                             RuntimeError, csv.Error, KeyError) as exc:
                                         st.error(f"In-memory insertion failed; no changes were staged: {exc}")
 
-            # A partially approved batch may leave valid staged edits plus
-            # intentionally rejected remainder. Require an explicit final
-            # review decision, not an impossible "all reviewed" download gate.
-            if (applied and not plan and not remaining_batch and not b_pending and
-                    st.session_state.cleaning_review_statuses.get(fid) ==
-                    "Partially approved — remaining action rejected" and
-                    st.button("Finish review — keep approved changes",
-                              key=f"review_finish_partial_{fid}")):
-                st.session_state.cleaning_review_statuses[fid] = "Applied and verified"
-                st.session_state.cleaning_batch_rejected_by_finding.discard(fid)
-                st.session_state.cleaning_decisions.append({
-                    "finding_id": fid,
-                    "decision": "remaining_proposal_declined_existing_approvals_retained",
-                })
-                _rerun_cleaning_fragment(fid)
-            if (not plan and not applied and not b_pending and not remaining_batch and
-                    st.session_state.cleaning_review_statuses.get(fid) != "Reviewed — no change" and
-                    st.session_state.cleaning_discussion_mode_by_finding.get(fid) not in
-                        {"alternative", "accepted"} and
-                    not st.session_state.cleaning_messages_by_finding.get(fid) and
-                    st.button("Mark reviewed (no change)",
-                              key=f"review_no_action_{fid}")):
-                if source is None:
-                    st.error("Select the source dataset before completing a review.")
-                else:
-                    try:
-                        _gemma_preflight_explicit_reviewer_plan(
-                            finding, source, 'Mark reviewed — no change required now',
-                            {'decision': 'no_change'})
-                    except (ValueError, RuntimeError, OSError, PermissionError) as exc:
-                        st.error('No-change review not finalized: ' + str(exc))
-                    else:
-                        _complete_reviewer_no_change(
-                            finding, source, 'Mark reviewed — no change required now',
-                            already_in_transcript=True)
-                        _rerun_cleaning_fragment(fid)
+            # Universal waiver/finish control is LAST in every ordinary open
+            # finding/check, after the final No — Discuss Another Idea choice.
+            _render_bottom_review_closure(fid, finding, source, applied)
 
 
     # Export is intentionally locked until EVERY current finding and Gemma
@@ -3834,6 +4570,10 @@ def render_cleaning_workspace(
             isinstance(job, dict) and job.get("status") == "running"
             for job in (exploration, registered)
         )
+    _schedule_lookahead(numbered, dataset_paths, active_id)
+    st.session_state.cleaning_sequential_status = sequential_status_snapshot(
+        st.session_state, numbered, _finding_review_completed)
+    _restore_review_viewport()
     can_download, reviewed_count, review_count = _cleaning_export_gate(
         catalog, st.session_state.cleaning_review_statuses,
         st.session_state.cleaning_plans_by_finding,
@@ -3842,6 +4582,8 @@ def render_cleaning_workspace(
         st.session_state.cleaning_pending_visual_flags_by_finding,
         investigation_running=active_investigation,
     )
+    reviewed_count = sum(_finding_review_completed(f['id']) for f in catalog)
+    can_download = can_download and reviewed_count == review_count
     # Explicit button size; use Streamlit's native primary (green-themed) button
     # plus narrow, local styling for the download widget only.
     st.markdown("""
@@ -3883,27 +4625,14 @@ def render_cleaning_workspace(
         downloadable_flags = []
         can_download = False
     has_visual_flags = bool(downloadable_flags)
-    # One final download button with a format selector. The complete review
-    # package is the default because it contains the raw CSV, cleaned CSV,
-    # highlighted/audited Excel and reviewer/model interactions together.
-    file_format = (
-        st.selectbox(
-            "Download format",
-            ["Complete review package (.zip) — original, cleaned, Excel and audit",
-             "Excel (.xlsx) — data and review audit",
-             "CSV (.csv) — cleaned values only"],
-            index=0, key=f"cleaning_download_format_{session_context}",
-        ) if hasattr(st, 'selectbox') else "CSV (.csv) — cleaned values only"
-    )
-    want_zip = str(file_format).startswith("Complete")
-    want_excel = str(file_format).startswith("Excel")
+    if st.session_state.get('cleaning_order_revision_pending'):
+        can_download = False
     if not can_download:
-        if hasattr(st, "download_button"):
-            st.download_button(
-                "Download cleaned dataset", data=b"", file_name="review_required.txt",
-                mime="text/plain", key=f"cleaning_download_final_{session_context}",
-                type="primary", disabled=True,
-            )
+        st.session_state.pop('cleaning_final_workbook_candidate', None)
+        old_final = st.session_state.pop('cleaning_final_model_review', None) or {}
+        if old_final.get('job_id'):
+            st.session_state.setdefault('cleaning_retired_chat_jobs', set()).add(old_final['job_id'])
+        return
     else:
         try:
             datasets_for_download = []
@@ -3924,7 +4653,7 @@ def render_cleaning_workspace(
             # An approved UI status is not evidence of a correct export. Replay
             # all named approvals and compare the actual final bytes FIRST.
             from healthcare_data_quality.cleaning.final_export_integrity import (
-                verify_final_csv, verify_final_excel,
+                verify_final_csv,
             )
             if len(dataset_paths) != 1:
                 raise PermissionError("Select one dataset before exporting")
@@ -3938,46 +4667,170 @@ def render_cleaning_workspace(
                 approved_rows=st.session_state.cleaning_approved_rows_by_dataset.get("dataset_1", []),
                 approved_columns=st.session_state.cleaning_approved_columns_by_dataset.get("dataset_1", []),
                 finding_checks={str(item["id"]): item for item in catalog},
+                review_decisions=st.session_state.cleaning_decisions,
             )
+            # The exact deterministic proof is mandatory; Gemma independently
+            # reviews actual differences in the background. Bind the result to
+            # the current approval ledger, not just the filename or UI status.
+            from healthcare_data_quality.ui.ordered_review import snapshot_digest
+            from healthcare_data_quality.cleaning.final_model_verification import verify_export_with_gemma
+            from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+            from copy import deepcopy
+            ledger_key = snapshot_digest({'audit': export_audit,
+                'history': st.session_state.cleaning_history,
+                'decisions': st.session_state.cleaning_decisions,
+                'statuses': st.session_state.cleaning_review_statuses,
+                'reviewer': st.session_state.cleaning_approved_reviewer,
+                'catalog': finding_titles,
+                'discussions': st.session_state.cleaning_messages_by_finding,
+                'row_operations': st.session_state.cleaning_approved_rows_by_dataset,
+                'column_operations': st.session_state.cleaning_approved_columns_by_dataset})
+            # Prepare and inspect an actual XLSX (including the audit) BEFORE
+            # requesting Gemma's final verdict. No model review of a hypothetical
+            # spreadsheet is sufficient. Cache only immutable revision-bound bytes.
+            from healthcare_data_quality.cleaning.final_export_integrity import prepare_verified_workbook, seal_verified_workbook
+            from healthcare_data_quality.ui.investigation_progress import final_verification_label
+            final_csv_bytes = datasets_for_download[0][2]
+            def workbook_arguments(verified):
+                return dict(original_csv=source_for_export, final_csv=final_csv_bytes,
+                    history=deepcopy(st.session_state.cleaning_history),
+                    review_statuses=deepcopy(st.session_state.cleaning_review_statuses),
+                    findings={str(item['id']): f"{label} · {item['title']}" for label,item in indexed_review_catalog(catalog)},
+                    approved_rows=deepcopy(st.session_state.cleaning_approved_rows_by_dataset.get('dataset_1', [])),
+                    approved_columns=deepcopy(st.session_state.cleaning_approved_columns_by_dataset.get('dataset_1', [])),
+                    discussions=deepcopy(st.session_state.cleaning_messages_by_finding),
+                    reviewer=st.session_state.cleaning_approved_reviewer, verified=deepcopy(verified))
+            st.subheader('Cleaned dataset')
+            records = _records(final_csv_bytes)
+            metric_left, metric_right, metric_headers = st.columns(3)
+            metric_left.metric('Records', len(records)-1)
+            metric_right.metric('Columns', len(records[0]))
+            from collections import Counter
+            metric_headers.metric('Repeated column names', sum(n>1 for n in Counter(records[0]).values()))
+            if st.checkbox('View cleaned dataset preview', key=f'cleaning_final_preview_{session_context}'):
+                headers = [f'{i+1} · {name}' for i, name in enumerate(records[0])]
+                st.dataframe(pd.DataFrame(records[1:], columns=headers), hide_index=True, width='stretch')
+            manager = interactive_chat_manager()
+            candidate = st.session_state.get('cleaning_final_workbook_candidate') or {}
+            if candidate.get('ledger_key') != ledger_key:
+                candidate = {'ledger_key':ledger_key, 'verification_started_at': monotonic(),
+                    'job_id':manager.submit_local(prepare_verified_workbook,
+                    filename=uploaded[0].name, approved_flags=deepcopy(downloadable_flags),
+                    audit_arguments=workbook_arguments(export_audit))}
+            # Keep one clock for the same ledger across fragment reruns,
+            # transient retries and all three export-verification stages.
+            started_at = candidate.setdefault('verification_started_at', monotonic())
+
+            def show_final_progress(stage, job_id, *, attempt=1):
+                label = final_verification_label(
+                    stage, monotonic() - started_at,
+                    queued=manager.phase_for(job_id) == 'queued',
+                    model_stage=manager.model_stage_for(job_id).get('stage', ''),
+                    attempt=attempt)
+                # Native animated running state, refreshed by the existing
+                # cleaning fragment. No new threads, fragments or DOM scripts.
+                st.status(label, state='running', expanded=False)
+
+            if candidate.get('job_id'):
+                outcome = manager.take(candidate['job_id'])
+                if outcome.get('status') != 'running':
+                    candidate.pop('job_id',None)
+                    if outcome.get('status') == 'done':
+                        candidate.update(outcome['result'])
+                    else:
+                        candidate['error'] = outcome.get('error') or 'Workbook preparation failed'
+            st.session_state['cleaning_final_workbook_candidate'] = candidate
+            if not candidate.get('proof'):
+                if candidate.get('job_id'):
+                    show_final_progress('workbook', candidate['job_id'])
+                else:
+                    st.warning('Excel verification blocked. Download withheld.')
+                    with st.expander('Verification details'):
+                        st.caption(candidate.get('error','No verified workbook'))
+                return
+            proof = candidate['proof']
+            model_key = snapshot_digest({'ledger':ledger_key,'workbook':proof['workbook_evidence_sha256']})
+            record = st.session_state.get('cleaning_final_model_review') or {}
+            if record.get('key') != model_key:
+                if record.get('job_id'):
+                    st.session_state.setdefault('cleaning_retired_chat_jobs', set()).add(record['job_id'])
+                record = {'key': model_key, 'attempts': 0}
+            if record.get('job_id'):
+                outcome = manager.take(record['job_id'])
+                if outcome.get('status') != 'running':
+                    record.pop('job_id', None)
+                    result = outcome.get('result') or {}
+                    if (outcome.get('status') == 'done' and result.get('verified') is True
+                            and result.get('final_sha256') == export_audit['final_sha256']
+                            and result.get('source_sha256') == export_audit['source_sha256']
+                            and result.get('workbook_evidence_sha256') == proof['workbook_evidence_sha256']):
+                        record['result'] = result
+                    else:
+                        record['error'] = str(outcome.get('error') or 'Final verification failed')[:300]
+                        if 'PermissionError' in record['error']:
+                            record['attempts'] = 2
+            if not record.get('result') and not record.get('job_id') and record.get('attempts', 0) < 2:
+                record['attempts'] = record.get('attempts', 0) + 1
+                record['job_id'] = manager.submit_role('B', verify_export_with_gemma, source_for_export,
+                    datasets_for_download[0][2], deepcopy(st.session_state.cleaning_history),
+                    deepcopy(st.session_state.cleaning_approved_rows_by_dataset.get('dataset_1', [])),
+                    deepcopy(st.session_state.cleaning_approved_columns_by_dataset.get('dataset_1', [])),
+                    deepcopy(export_audit), deepcopy(proof))
+            st.session_state['cleaning_final_model_review'] = record
+            if not record.get('result'):
+                if record.get('job_id'):
+                    show_final_progress('gemma', record['job_id'], attempt=record['attempts'])
+                else:
+                    st.warning('Final verification blocked. Download withheld.')
+                    with st.expander('Verification details'):
+                        st.caption(record.get('error', 'No verified assessment'))
+                    if 'PermissionError' not in record.get('error','') and st.button('Retry final verification', key=f'final_verify_retry_{session_context}'):
+                        record['attempts'] = 0
+                        st.session_state['cleaning_final_model_review'] = record
+                return
+            export_audit['gemma_final_review'] = record['result']
+            if 'verified_excel' not in record:
+                if not record.get('seal_job_id') and not record.get('seal_error'):
+                    record['seal_job_id'] = manager.submit_local(seal_verified_workbook,
+                        base=candidate['base'], approved_flags=deepcopy(downloadable_flags),
+                        audit_arguments=workbook_arguments(export_audit),
+                        reviewed_proof=record['result']['workbook_evidence_sha256'])
+                if record.get('seal_job_id'):
+                    outcome = manager.take(record['seal_job_id'])
+                    if outcome.get('status') != 'running':
+                        record.pop('seal_job_id',None)
+                        result = outcome.get('result') or {}
+                        if (outcome.get('status') == 'done' and
+                            result.get('workbook_evidence_sha256') == record['result']['workbook_evidence_sha256']):
+                            record['verified_excel'] = result['verified_excel']
+                            record['artifact_sha256'] = result['artifact_sha256']
+                        else:
+                            record['seal_error'] = outcome.get('error') or 'Final workbook proof mismatch'
+                st.session_state['cleaning_final_model_review'] = record
+                if 'verified_excel' not in record:
+                    if record.get('seal_job_id'):
+                        show_final_progress('seal', record['seal_job_id'])
+                    else:
+                        st.warning('Final Excel verification blocked. Download withheld.')
+                        with st.expander('Verification details'):
+                            st.caption(record.get('seal_error','No verified workbook'))
+                    return
+            if hashlib.sha256(record['verified_excel']).hexdigest() != record['artifact_sha256']:
+                raise PermissionError('Download bytes differ from the verified Excel artifact')
+            # Freeze elapsed time only after the final artifact hash passed.
+            finished_at = record.setdefault('verification_finished_at', monotonic())
+            st.session_state['cleaning_final_model_review'] = record
+            file_format = st.selectbox('Download format', [
+                'Excel (.xlsx) — data and review audit',
+                'Complete review package (.zip) — original, cleaned, Excel and audit',
+                'CSV (.csv) — cleaned values only'], index=0,
+                key=f'cleaning_download_format_v2_{session_context}')
+            want_zip = str(file_format).startswith('Complete')
+            want_excel = str(file_format).startswith('Excel')
             if want_excel or want_zip:
-                from healthcare_data_quality.cleaning.styled_export import build_styled_excel_download
-                file_name, data = build_styled_excel_download(
-                    datasets_for_download[0][2], original_csv=source_for_export,
-                    original_filename=uploaded[0].name,
-                    approved_flags=downloadable_flags,
-                    approved_row_operations=st.session_state.cleaning_approved_rows_by_dataset.get(
-                        "dataset_1", []),
-                    approved_column_deletions=st.session_state.cleaning_approved_columns_by_dataset.get(
-                        "dataset_1", []),
-                )
+                file_name = candidate['name']
                 mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                from healthcare_data_quality.cleaning.reviewer_audit_workbook import (
-                    audit_tables, embed_audit_sheets, verify_audit_sheets,
-                )
-                reviewer_audit_tables = audit_tables(
-                    original_csv=source_for_export,
-                    final_csv=datasets_for_download[0][2],
-                    history=st.session_state.cleaning_history,
-                    review_statuses=st.session_state.cleaning_review_statuses,
-                    findings={str(item['id']): f"{label} · {item['title']}"
-                              for label, item in indexed_review_catalog(catalog)},
-                    approved_rows=st.session_state.cleaning_approved_rows_by_dataset.get('dataset_1', []),
-                    approved_columns=st.session_state.cleaning_approved_columns_by_dataset.get('dataset_1', []),
-                    discussions=st.session_state.cleaning_messages_by_finding,
-                    reviewer=st.session_state.cleaning_approved_reviewer,
-                    verified=export_audit,
-                )
-                data = embed_audit_sheets(data, reviewer_audit_tables)
-                verify_audit_sheets(data, reviewer_audit_tables)
-                # Reopen the ACTUAL exported workbook and verify every cell and
-                # every surviving approved flag, not merely its preview.
-                verify_final_excel(
-                    data, datasets_for_download[0][2],
-                    original_csv=source_for_export,
-                    approved_flags=downloadable_flags,
-                    approved_rows=st.session_state.cleaning_approved_rows_by_dataset.get("dataset_1", []),
-                    approved_columns=st.session_state.cleaning_approved_columns_by_dataset.get("dataset_1", []),
-                )
+                data = record['verified_excel']
                 if want_zip:
                     from healthcare_data_quality.cleaning.review_zip_bundle import build_review_zip_bundle
                     archive_name, archive_bytes = build_review_zip_bundle(
@@ -3996,14 +4849,17 @@ def render_cleaning_workspace(
                                         for label, item in indexed_review_catalog(catalog)},
                         agent_b_suggestions=st.session_state.cleaning_recommendations,
                         excel_attachment=(file_name, data),
+                        gemma_final_review=record['result'],
                     )
                     file_name, data, mime = archive_name, archive_bytes, 'application/zip'
         except ImportError:
             st.error("Excel export needs openpyxl in this Python environment. "
                      "Install it with: python -m pip install openpyxl")
-        except (ValueError, PermissionError, AssertionError, OSError, csv.Error) as exc:
+        except (ValueError, PermissionError, AssertionError, OSError, RuntimeError, csv.Error) as exc:
             st.error(f"Download unavailable: {exc}")
         else:
+            st.caption(f'Final verification passed · Elapsed {format_elapsed(finished_at - started_at)} · '
+                       'Original CSV, approvals, Excel values, annotations and Gemma review verified')
             if export_audit["flag_only_findings"]:
                 st.caption(
                     f"Export verified against named approvals · "
@@ -4027,14 +4883,10 @@ def render_cleaning_workspace(
                 )
                 removed_flags = len(downloadable_flags) - visible_flags
                 st.caption(f"{visible_flags} highlighted cell(s) survive" +
-                           (" · Excel applies red/bold text and yellow fill to surviving targets" if (want_excel or want_zip) and visible_flags else
+                           (" · Excel applies the exact approved annotation style to surviving targets" if (want_excel or want_zip) and visible_flags else
                             " · No highlights remain after approved deletions" if (want_excel or want_zip) else
                             " · CSV cannot retain styling") +
                            (f" · {removed_flags} prior annotation(s) superseded" if removed_flags else ""))
-            if want_excel or want_zip:
-                st.caption("Excel includes Cleaned dataset, Review overview (by finding), "
-                           "Audit trail (each approval), Source-to-final checks "
-                           "(exact differences), Interaction log and Verification.")
             if hasattr(st, "download_button"):
                 st.download_button(
                     "Download complete verified review ZIP" if want_zip else
@@ -4066,6 +4918,7 @@ def _prepare_finding_discussion(
                    **({"automatic": True} if automatic else {})})
     st.session_state.cleaning_review_statuses[fid] = "Discussion open"
     st.session_state.cleaning_plans_by_finding.pop(fid, None)
+    st.session_state.setdefault("cleaning_pending_visual_flags_by_finding", {}).pop(fid, None)
     st.session_state.setdefault("cleaning_compound_previews_by_finding", {}).pop(fid, None)
     st.session_state.setdefault("cleaning_explicit_row_deletions_by_finding", {}).pop(fid, None)
     st.session_state.setdefault("cleaning_explicit_column_deletions_by_finding", {}).pop(fid, None)
@@ -4094,11 +4947,39 @@ def _prepare_finding_discussion(
               "allowed_cell_positions": sorted(valid_cells)[:64],
               "allowed_header_positions": sorted(valid_headers),
               "all_affected_positions_count": len(valid_cells),
+              "evidence_sample_only": len(evidence) > 32,
+              "full_evidence_count": len(evidence),
               "verified_evidence_registry": prompt_evidence(registry) if registry else None,
               "evidence_registry_unavailable": finding.get("evidence_registry_error"),
               "latest_working_version": bool(st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id))}
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    scoped['cross_finding_review_context'] = dataset_review_context(st.session_state, ds_id, fid, source=source)
+    if source:
+        from healthcare_data_quality.cleaning.current_review_evidence import current_finding_evidence
+        current_evidence = current_finding_evidence(st.session_state, finding, source)
+        scoped['current_finding_evidence'] = current_evidence[:64]
+        scoped['current_finding_evidence_total'] = len(current_evidence)
+        scoped['current_finding_evidence_instruction'] = (
+            'Current values are authoritative; original values are historical evidence only. '
+            'A changed value is not necessarily resolved. Never claim previous actions corrected an issue '
+            'unless the current predicate is satisfied; cite the actual approval ID and operation. '
+            'Removal approved means absent from final export, not a corrected surviving value.')
     recommendation = st.session_state.cleaning_recommendations.get(fid)
-    if recommendation:
+    declined = any(item.get('reviewer_declined_all') for item in old_thread)
+    if declined:
+        scoped['rejected_suggestions_context'] = st.session_state.get('cleaning_prior_guidance_by_finding', {}).get(fid) or {}
+        scoped['rejected_discussion_proposals'] = [
+            {'operation': p.get('operation'), 'scope': p.get('scope'),
+             'changes': (p.get('changes') or [])[:16],
+             'target_count': len(p.get('changes') or [])}
+            for item in old_thread if item.get('reviewer_declined_all')
+            for p in item.get('rejected_proposals', [])
+        ][-8:]
+        scoped['reviewer_discussion_instruction'] = (
+            'The reviewer rejected ALL previous unapproved recommendations, including memory-derived alternatives. '
+            'Use them only as rejected historical context. Do not re-offer them unless the reviewer explicitly requests them. '
+            'Reason from the latest real reviewer request and current source/cross-finding evidence.')
+    if recommendation and not declined:
         # Batch recommendations are not part of the per-finding conversation.
         # Include the chosen suggestion as untrusted context before asking the
         # model to develop it; otherwise "I agree" has no referent.
@@ -4130,6 +5011,16 @@ def _prepare_finding_discussion(
         ]
         scoped["latest_staged_sha256"] = sha256_bytes(staged_bytes)
         scoped["latest_working_version"] = staged_bytes != original_bytes
+        # Source-verified same-column comparator statistics for model reasoning.
+        # This is READ-ONLY evidence: even an in-range abs() result cannot
+        # establish that the negative source measurement is authentic.
+        if finding.get('check_key') in {'find_invalid_counts', 'find_negative_counts'}:
+            from healthcare_data_quality.cleaning.numeric_context import (
+                compare_evidenced_numeric_cells,
+            )
+            from healthcare_data_quality.cleaning.sequential_context import projected_records
+            scoped['numeric_column_comparisons'] = compare_evidenced_numeric_cells(
+                source, finding, projected=projected_records(st.session_state, ds_id, source))
         headers = original_records[0]
         # Source-wide counts prevent the model from extrapolating from one
         # example (e.g. assuming taxonomy NA only appears in CSV Row 2).
@@ -4244,12 +5135,15 @@ def _render_compound_approval(fid: str, finding: dict, source: Path,
                      else None)
     if not preview or preview.get("digest") != digest:
         try:
-            preview = evaluate_compound(
-                plans, finding, source, staged, current_cols, current_rows,
+            from copy import deepcopy
+            from functools import partial
+            action = partial(evaluate_compound,
                 requested_rows=st.session_state.cleaning_explicit_row_deletions_by_finding.get(fid),
-                requested_columns=st.session_state.cleaning_explicit_column_deletions_by_finding.get(fid),
-            )
-            cache_map[fid] = preview
+                requested_columns=st.session_state.cleaning_explicit_column_deletions_by_finding.get(fid))
+            _submit_review_worker(finding, source, 'local_compound_preview', action,
+                (deepcopy(plans), deepcopy(finding), Path(source), staged, deepcopy(current_cols), deepcopy(current_rows)), digest=digest)
+            _render_live_finding_assignment(fid)
+            return
         except (OSError, ValueError, PermissionError, RuntimeError, AssertionError,
                 IndexError, KeyError, csv.Error) as exc:
             preview_error = str(exc)
@@ -4259,23 +5153,25 @@ def _render_compound_approval(fid: str, finding: dict, source: Path,
         preview = None
 
     with st.container(border=True):
-        _render_before_after(plans)
         if preview_error:
             st.error(f"Review blocked: {preview_error}")
-            if st.button("Retry verification", key=f"review_compound_retry_{fid}_{_active_agent_c_control_generation(fid)}"):
-                cache_map.pop(fid, None)
-                _rerun_cleaning_fragment(fid)
+            with st.expander("Verification recovery", expanded=False):
+                if st.button("Retry verification", key=f"review_compound_retry_{fid}_{_active_agent_c_control_generation(fid)}"):
+                    cache_map.pop(fid, None)
+                    _rerun_cleaning_fragment(fid)
         elif preview:
             if not _render_source_deletion_details(
                     source, plans, key=f"group_{fid}"):
                 preview = None
+            if preview is not None:
+                _render_before_after(plans, source)
         with st.form(f"review_compound_{fid}_{_active_agent_c_control_generation(fid)}"):
             reviewer = st.session_state.get("cleaning_approved_reviewer") or ""
             from healthcare_data_quality.ui.clear_review_actions import final_action_label
             approve_col, reject_col = st.columns(2)
             with approve_col:
                 approve = st.form_submit_button(
-                    "Yes — " + final_action_label(plans, finding),
+                    _reflected_interactive_label(plans, finding),
                     disabled=preview is None or not reviewer,
                     key=f"review_approve_yes_{fid}_{_active_agent_c_control_generation(fid)}_compound")
             with reject_col:
@@ -4285,7 +5181,7 @@ def _render_compound_approval(fid: str, finding: dict, source: Path,
 
         if reject:
             # Reject only the pending group. Do not submit a Gemma request.
-            _open_agent_c_alternative_chat(fid, discard_plan=True)
+            _decline_and_discuss(fid)
             st.session_state.cleaning_decisions.append({
                 "finding_id": fid, "decision": "compound_plan_rejected_no_change",
                 "operations": len(plans),
@@ -4436,7 +5332,7 @@ def _remember_approved_agent_c_solution(fid: str, finding: dict,
         save_reviewed_solution(
             finding, source, operations=annotate_source_headers(candidate["operations"], source),
             decision="approved_edit", user_request=candidate["user_request"],
-            agent_response=candidate["agent_response"],
+            agent_response=candidate["agent_response"], button_label=candidate.get("button_label"),
         )
         st.session_state.cleaning_memory_candidates.pop(fid, None)
     except (OSError, ValueError, TypeError, UnicodeError) as exc:
@@ -4465,6 +5361,8 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
         "Partially approved — remaining action rejected", "Reviewed — no change",
     }:
         return
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    st.session_state.setdefault('cleaning_review_revision_by_finding', {})[fid] = dataset_review_context(st.session_state, finding.get('dataset_id', ''), fid)['revision']
     st.session_state.setdefault("cleaning_compound_previews_by_finding", {}).pop(fid, None)
     thread = st.session_state.cleaning_messages_by_finding.setdefault(fid, [])
     from healthcare_data_quality.cleaning.cleaning_workspace import concise_agent_c_reply
@@ -4478,6 +5376,11 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
         except (OSError, ValueError, UnicodeError, csv.Error):
             verified_evidence = None
         reply = evidence_bound_response(reply, verified_evidence)
+    if _latest_user_wants_visual_flag(thread):
+        # A late/legacy generic model reply must not reinterpret the latest
+        # reviewer styling request as an unrelated value replacement.
+        thread.append({"role": "assistant", "content": "Ignored an outdated model proposal after the highlight request. No data were changed.", "controls_expired": True})
+        return
     proposals = response.get("operations") or []
     if not proposals and response.get("operation") != "none":
         proposals = [{"operation": response["operation"],
@@ -4499,6 +5402,12 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
                        "clarification_options": choices})
         return
     if not proposals:
+        if source and re.search(r'\b(?:already|previous|earlier|prior)\b', reply, re.I) and re.search(r'\b(?:fix(?:ed)?|correct(?:ed)?|resolv(?:ed|e)|standardiz(?:ed|e)|standardis(?:ed|e)|no further)\b', reply, re.I):
+            from healthcare_data_quality.cleaning.current_review_evidence import current_finding_evidence
+            current_rows = current_finding_evidence(st.session_state, finding, source)
+            if current_rows:
+                st.session_state.setdefault('cleaning_show_current_evidence', {})[fid] = True
+                reply = 'See Current evidence for the verified values and actual approvals. Earlier edits alone do not establish resolution.'
         st.session_state.cleaning_review_statuses[fid] = "Discussion updated"
         choices = agent_c_clarification_options(
             reply, response.get("clarification_options"))
@@ -4557,6 +5466,10 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
                 user_requested_columns=explicit_column_ids)
             verified_plans.append(checked)
             expanded_total += expanded_count
+        if not verified_plans:
+            st.session_state.cleaning_review_statuses[fid] = 'Discussion updated'
+            thread.append({'role':'assistant','content':'No remaining targets for this proposed edit. Review the existing approved changes.', 'controls_expired': True})
+            return
         from healthcare_data_quality.cleaning.intent_scope import reject_unrequested_extra_columns
         reject_unrequested_extra_columns(latest_explicit_user, finding, verified_plans)
         # Repeating an operation TYPE is safe. Repeating a SOURCE TARGET is
@@ -4570,6 +5483,7 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
             st.session_state.cleaning_staged_bytes_by_dataset.get(ds_id, source.read_bytes()),
             st.session_state.cleaning_approved_rows_by_dataset.get(ds_id, []),
             st.session_state.cleaning_approved_columns_by_dataset.get(ds_id, []),
+            approved_flags=st.session_state.get('cleaning_visual_flags_by_dataset', {}).get(ds_id, []),
         )
         if collisions:
             # Do not treat a duplicate proposal for fully removed source rows
@@ -4621,8 +5535,10 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
             # The actual reviewed action is more useful than the long,
             # generic drafting authorization for future recall.
             latest_user = full_scope_action
+        from healthcare_data_quality.ui.clear_review_actions import reflected_action_label
         st.session_state.setdefault("cleaning_memory_candidates", {})[fid] = {
             "operations": verified_plans,
+            "button_label": reflected_action_label(verified_plans, finding, response.get("button_label")),
             "approvals_before": sum(h.get("finding_id") == fid for h in
                                     st.session_state.cleaning_history),
             "user_request": latest_user,
@@ -4635,7 +5551,7 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
             for index, item in enumerate(verified_plans, start=1)
         )
         reply = summary + "\nReview below to approve or reject."
-    except (ValueError, KeyError, csv.Error, TypeError) as exc:
+    except (ValueError, PermissionError, OSError, KeyError, csv.Error, TypeError) as exc:
         st.session_state.cleaning_plans_by_finding.pop(fid, None)
         st.session_state.setdefault("cleaning_batch_queue_by_finding", {}).pop(fid, None)
         st.session_state.setdefault("cleaning_batch_total_by_finding", {}).pop(fid, None)
@@ -4643,6 +5559,9 @@ def _record_gemma_b_response(fid: str, finding: dict, source: Path | None,
         st.session_state.setdefault("cleaning_explicit_row_deletions_by_finding", {}).pop(fid, None)
         st.session_state.setdefault("cleaning_memory_candidates", {}).pop(fid, None)
         reply = f"Proposal not ready: {exc}. No changes made."
+        thread.append({"role": "assistant", "content": reply, "controls_expired": True,
+                       "proposal_preparation_failed": True})
+        return
     thread.append({"role": "assistant", "content": reply})
 
 
@@ -4699,6 +5618,62 @@ def _finished_background_agents_for_review() -> tuple[bool, bool]:
     return _background_agents_idle_for_run(context_key, run_id)
 
 
+def _complete_general_review_closure(finding: dict, source: Path | None) -> None:
+    """One-click reviewer waiver/finalization; NEVER mutate CSV or replay edits.
+
+    An unresolved QC anomaly can be ACCEPTED unchanged by the named reviewer.
+    That is not scientific validation or an assertion that it was corrected.
+    Existing approved edits are retained, while pending unapproved proposals
+    are discarded and independently verified again at final export.
+    """
+    if source is None:
+        raise ValueError('Original CSV is required for a recorded close review')
+    fid = finding['id']
+    _assert_sequential_owner(fid)
+    reviewer = str(st.session_state.get('cleaning_approved_reviewer') or '').strip()
+    if not reviewer:
+        raise PermissionError('A named reviewer is required')
+    if fid in st.session_state.get('cleaning_pending_gemma_b', {}):
+        raise PermissionError('Wait for the current Agent C request to finish')
+    from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
+    source_hash = file_sha256(source)
+    if finding.get('source_sha256') and finding['source_sha256'] != source_hash:
+        raise PermissionError('Source CSV changed since the finding was generated')
+    events = [e for e in st.session_state.get('cleaning_history', [])
+              if e.get('finding_id') == fid]
+    # With existing edits, no-change would falsely describe the prior work.
+    # Retain only independently approved edits; withdraw unapproved plans.
+    if events:
+        for name in (
+            'cleaning_plans_by_finding', 'cleaning_batch_queue_by_finding',
+            'cleaning_batch_total_by_finding', 'cleaning_compound_previews_by_finding',
+            'cleaning_r_previews_by_finding', 'cleaning_pending_visual_flags_by_finding',
+            'cleaning_explicit_row_deletions_by_finding',
+            'cleaning_explicit_column_deletions_by_finding',
+        ):
+            st.session_state.setdefault(name, {}).pop(fid, None)
+        st.session_state.setdefault('cleaning_batch_rejected_by_finding', set()).discard(fid)
+        st.session_state.setdefault('cleaning_discussion_mode_by_finding', {}).pop(fid, None)
+        st.session_state.setdefault('cleaning_close_request_by_finding', {}).pop(fid, None)
+        st.session_state.setdefault('cleaning_review_statuses', {})[fid] = 'Applied and verified'
+        st.session_state.setdefault('cleaning_decisions', []).append({
+            'finding_id': fid, 'decision': 'review_finished_no_additional_edits',
+            'reviewer': reviewer, 'source_sha256': source_hash,
+            'approved_actions_retained': len(events), 'new_edits': 0,
+        })
+        return
+    # A reviewer may accept an observed issue as-is. Never claim it was fixed.
+    _complete_reviewer_no_change(
+        finding, source, 'Mark reviewed — accepted unchanged (no correction asserted)',
+        already_in_transcript=True)
+    st.session_state.setdefault('cleaning_batch_rejected_by_finding', set()).discard(fid)
+    st.session_state.setdefault('cleaning_close_request_by_finding', {}).pop(fid, None)
+    st.session_state.cleaning_decisions[-1].update({
+        'source_sha256': source_hash, 'new_edits': 0,
+        'review_outcome': 'reviewer_accepted_without_correction',
+    })
+
+
 def _prior_approval_closure(finding: dict, source: Path | None) -> dict | None:
     """Validate the immutable source and the *entire* approved deletion scope."""
     if source is None:
@@ -4721,6 +5696,7 @@ def _complete_prior_approval_closure(
     if not current or current['fingerprint'] != previously_shown.get('fingerprint'):
         raise PermissionError('Prior approvals changed; review the finding again')
     fid = finding['id']
+    _assert_sequential_owner(fid)
     reviewer = str(st.session_state.get('cleaning_approved_reviewer') or '').strip()
     if not reviewer:
         raise PermissionError('Register a reviewer before closing this finding')
@@ -4752,6 +5728,40 @@ def _complete_prior_approval_closure(
     })
 
 
+def _decline_prior_resolution(fid: str, fingerprint: str) -> None:
+    st.session_state.setdefault('cleaning_resolution_declined_by_finding', {})[fid] = fingerprint
+    _decline_and_discuss(fid)
+
+
+def _prepare_prior_approval_closure(fid, finding, source, resolution):
+    if fid in st.session_state.get('cleaning_pending_gemma_b', {}):
+        return None
+    cache = st.session_state.setdefault('cleaning_resolution_gemma_review', {})
+    previous = cache.get(fid)
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    revision = dataset_review_context(st.session_state, finding['dataset_id'], fid)['revision']
+    if (not isinstance(previous, dict) or previous.get('fingerprint') != resolution['fingerprint']
+            or previous.get('review_revision') != revision):
+        from copy import deepcopy
+        thread = st.session_state.get('cleaning_messages_by_finding', {}).get(fid) or []
+        last_user = next((str(m.get('content') or '') for m in reversed(thread)
+                          if m.get('role') == 'user' and not m.get('automatic')), '')
+        historical, context = _explicit_review_context(finding, source)
+        try:
+            queued = _submit_review_worker(finding, source, 'prior_closure', _prior_closure_worker,
+                (deepcopy(finding), Path(source), deepcopy(resolution), last_user, deepcopy(historical), deepcopy(context)),
+                resolution_fingerprint=resolution['fingerprint'])
+        except (OSError, RuntimeError, ValueError) as exc:
+            cache[fid] = {'fingerprint':resolution['fingerprint'], 'review_revision':revision, 'can_offer':False, 'reason':str(exc)[:240]}
+            previous = cache[fid]
+        else:
+            if queued:
+                return None
+            cache[fid] = {'fingerprint':resolution['fingerprint'], 'review_revision':revision, 'can_offer':False, 'reason':'Assessment unavailable'}
+            previous = cache[fid]
+    return previous
+
+
 def _render_prior_approval_closure(
     fid: str, finding: dict, source: Path | None,
 ) -> bool:
@@ -4770,66 +5780,59 @@ def _render_prior_approval_closure(
         return False
     if st.session_state.setdefault('cleaning_resolution_declined_by_finding', {}).get(fid) == resolution['fingerprint']:
         return False
+    _render_visual_discussion(fid)
     rows = resolution['rows']
-    st.info('Already addressed by earlier approved deletions: original CSV rows '
-            + ', '.join(map(str, rows)) + '. No new edits are needed.')
-    cache = st.session_state.setdefault('cleaning_resolution_gemma_review', {})
-    previous = cache.get(fid)
-    if not isinstance(previous, dict) or previous.get('fingerprint') != resolution['fingerprint']:
-        question = ('Propose a final review with NO new edits for original rows '
-                    + ', '.join(map(str, rows))
-                    + ', already removed by named reviewer approvals.')
-        try:
-            from healthcare_data_quality.services.llm_client import model_request_priority
-            from healthcare_data_quality.services.resolved_review_button import (
-                generate_prior_approval_close_button,
-            )
-            thread = st.session_state.get('cleaning_messages_by_finding', {}).get(fid) or []
-            last_user = next((str(m.get('content') or '') for m in reversed(thread)
-                              if m.get('role') == 'user' and not m.get('automatic')), '')
-            with model_request_priority('interactive'):
-                generated = generate_prior_approval_close_button(
-                    finding, resolution, reviewer_request=last_user)
-            result = _gemma_preflight_explicit_reviewer_plan(
-                finding, source, generated['label'] + '. ' + question,
-                {'decision': 'resolved_by_prior_approvals'},
-            )
-            previous = {'fingerprint': resolution['fingerprint'],
-                        'can_offer': bool(result.get('can_offer')),
-                        'label': generated['label'],
-                        'reason': generated['reason'] + ' · ' + str(result.get('reason') or '')}
-        except (OSError, ValueError, RuntimeError, PermissionError, KeyError) as exc:
-            previous = {'fingerprint': resolution['fingerprint'],
-                        'can_offer': False, 'reason': str(exc)[:280]}
-        cache[fid] = previous
+    from healthcare_data_quality.cleaning.current_review_evidence import current_finding_evidence
+    try:
+        projection = current_finding_evidence(st.session_state, finding, source, display=True)
+    except (ValueError, OSError, PermissionError, csv.Error):
+        projection = []
+    origins = list(dict.fromkeys(f"{r['Approved by']} — {r['Action']}" for r in projection
+                                 if r['Status'] == 'Removal approved' and r['Approved by']))
+    st.info('Already addressed: original CSV rows ' + ', '.join(map(str, rows))
+            + ('. ' + '; '.join(origins) if origins else ' by earlier approved row operations')
+            + '. No new edits needed.')
+    previous = _prepare_prior_approval_closure(fid, finding, source, resolution)
+    if previous is None:
+        _render_live_finding_assignment(fid)
+        _render_bottom_review_closure(fid, finding, source, [])
+        return True
     if not previous.get('can_offer'):
-        st.warning('Gemma has not verified this close-review option: ' + str(previous.get('reason') or 'Unknown error'))
-        retry_col, discuss_col = st.columns(2)
-        with retry_col:
-            retry = st.button('Retry Gemma verification', key=f'review_resolution_retry_{fid}')
-        with discuss_col:
-            discuss = st.button('No — Discuss Another Idea',
-                                key=f'review_resolution_unverified_no_{fid}')
-        if retry:
-            cache.pop(fid, None)
-            _rerun_cleaning_fragment(fid)
-        elif discuss:
+        with st.expander('Review details', expanded=False):
+            st.caption('Gemma assessment unavailable: ' + str(previous.get('reason') or 'Unknown error'))
+        discuss = st.button('No — Discuss Another Idea',
+                            key=f'review_resolution_unverified_no_{fid}')
+        # The model may be unavailable or decline to generate UI text. A
+        # source-verified, zero-edit final review must remain available to a
+        # named human; otherwise model downtime deadlocks the export gate.
+        reviewer = str(st.session_state.get('cleaning_approved_reviewer') or '').strip()
+        st.markdown(_blue_review_closure_css(), unsafe_allow_html=True)
+        if st.button('Mark reviewed — verified earlier removals (no new edits)',
+                     key=f'review_resolution_model_fallback_{fid}_{resolution["fingerprint"][:12]}',
+                     disabled=not bool(reviewer), type='secondary'):
+            try:
+                _complete_prior_approval_closure(finding, source, resolution)
+            except (ValueError, OSError, PermissionError, KeyError) as exc:
+                st.error('Review not finalized: ' + str(exc))
+            else:
+                _rerun_cleaning_fragment(fid)
+            return True
+        if discuss:
             st.session_state.cleaning_resolution_declined_by_finding[fid] = resolution['fingerprint']
-            _open_agent_c_alternative_chat(fid, discard_plan=True)
+            _decline_and_discuss(fid)
             _rerun_cleaning_fragment(fid)
         # Model verification failed: block obsolete edit/approval widgets,
-        # but keep Retry and Discuss accessible. Never open the export gate.
+        # but keep Discuss accessible. Never open the export gate.
         return True
-    st.caption('Gemma review: ' + previous.get('reason', '')[:240])
+    with st.expander('Gemma assessment', expanded=False):
+        st.caption(previous.get('reason', '')[:240])
     reviewer = str(st.session_state.get('cleaning_approved_reviewer') or '').strip()
-    yes_col, no_col = st.columns(2)
-    with yes_col:
-        finish = st.button('Yes — ' + str(previous['label']),
-                           key=f'review_resolution_yes_{fid}_{resolution["fingerprint"][:12]}',
-                           disabled=not bool(reviewer), type='primary')
-    with no_col:
-        discuss = st.button('No — Discuss Another Idea',
-                            key=f'review_resolution_no_{fid}_{resolution["fingerprint"][:12]}')
+    discuss = st.button('No — Discuss Another Idea',
+                        key=f'review_resolution_no_{fid}_{resolution["fingerprint"][:12]}')
+    st.markdown(_blue_review_closure_css(), unsafe_allow_html=True)
+    finish = st.button(str(previous['label']),
+                       key=f'review_resolution_model_fallback_{fid}_{resolution["fingerprint"][:12]}',
+                       disabled=not bool(reviewer), type='secondary')
     if finish:
         try:
             _complete_prior_approval_closure(finding, source, resolution)
@@ -4840,7 +5843,7 @@ def _render_prior_approval_closure(
         return True
     if discuss:
         st.session_state.cleaning_resolution_declined_by_finding[fid] = resolution['fingerprint']
-        _open_agent_c_alternative_chat(fid, discard_plan=True)
+        _decline_and_discuss(fid)
         _rerun_cleaning_fragment(fid)
         return True
     return True
@@ -4856,6 +5859,7 @@ def _complete_reviewer_no_change(
     original source and independent approval ledger are unchanged.
     """
     fid = finding["id"]
+    _assert_sequential_owner(fid)
     if source is None:
         raise ValueError("A source CSV is required to record a no-change review")
     if any(event.get("finding_id") == fid for event in
@@ -4921,15 +5925,8 @@ def _recover_completed_no_change_reply(finding: dict, source: Path | None) -> bo
     return True
 
 
-def _gemma_preflight_explicit_reviewer_plan(
-    finding: dict, source: Path, question: str, proposal: dict,
-) -> dict:
-    """One local model appraisal BEFORE a reviewer-authored plan is shown.
-
-    Deterministic source validators still own every editable coordinate. The
-    model cannot approve an edit or add an extra operation in its reply.
-    """
-    from healthcare_data_quality.services.llm_client import model_request_priority
+def _explicit_review_worker(finding, source, question, proposal, historical, context):
+    """Background only: no Streamlit reads, rendering or writes."""
     from healthcare_data_quality.services.model_plan_review import assess_review_option
     from healthcare_data_quality.jobs.cleaning_jobs import reviewed_method_context
     from healthcare_data_quality.learning.adaptive_skill_memory import skill_context
@@ -4952,25 +5949,306 @@ def _gemma_preflight_explicit_reviewer_plan(
         else:
             raise ValueError('No operations available for Gemma preflight')
     option = option or {'label': question, 'operations': operations}
-    historical = [
-        {'finding_id': item.get('finding_id'), 'operation': item.get('operation'),
-         'positions': (item.get('modified_positions') or [])[:8]}
-        for item in st.session_state.get('cleaning_history', [])[-30:]
-        if isinstance(item, dict)
-    ]
-    with model_request_priority('interactive'):
-        with (st.spinner('Gemma is checking the complete reviewer request and exact proposed scope')
-              if callable(getattr(st, 'spinner', None)) else nullcontext()):
-            assessment = assess_review_option(
-            finding, source, option, user_request=question,
-            history=historical,
-            methods=reviewed_method_context(finding, source, limit=6),
-            skills=skill_context(finding, limit=3),
-        )
-    if not assessment['can_offer']:
+    assessment = assess_review_option(
+        finding, source, option, user_request=question, history=historical,
+        methods=reviewed_method_context(finding, source, limit=6),
+        skills=skill_context(finding, limit=3), review_context=context)
+    explicit_column_choice = (bool(operations) and all(op.get('operation') == 'drop_column' for op in operations)
+                              and bool(proposal.get('explicit_columns')))
+    if not assessment['can_offer'] and not (explicit_column_choice and assessment.get('scope_matches') is True
+            and assessment.get('has_extra_changes') is False):
         raise ValueError('Gemma did not support the exact requested plan: '
                          + assessment['reason'])
     return assessment
+
+
+
+def _submit_review_worker(finding, source, kind, action, args, **payload):
+    """One nonblocking job per finding, revision-bound until delivery."""
+    from copy import deepcopy
+    from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    state = st.session_state
+    fid = finding['id']
+    if fid in state.get('cleaning_pending_gemma_b', {}):
+        return False
+    context = dataset_review_context(state, finding['dataset_id'], fid)
+    source_hash = file_sha256(source)
+    manager = interactive_chat_manager()
+    _assert_sequential_owner(fid)
+    if kind.startswith('local_') and hasattr(manager, 'submit_local'):
+        job, agent = manager.submit_local(action, *args), 'local'
+    else:
+        # Automatic initial alternatives/closure belong to B; user-requested
+        # discussion and its follow-up verification belong to C.
+        agent = ('B' if kind in {'exact_option_recovery', 'prior_closure'}
+                 and state.get('cleaning_discussion_mode_by_finding', {}).get(fid) not in {'accepted','alternative'}
+                 else 'C')
+        if hasattr(manager, 'submit_role'):
+            job = manager.submit_role(agent, action, *args)
+        else:
+            job = manager.submit(action, *args)
+    state.setdefault('cleaning_completed_gemma', {}).pop(fid, None)
+    state.setdefault('cleaning_agent_c_completion_notified', set()).discard(fid)
+    state.setdefault('cleaning_pending_gemma_b', {})[fid] = {
+        'kind': kind, 'job_id': job, 'assigned_agent': agent,
+        'source_sha256': source_hash, 'review_revision': context['revision'],
+        'ui_generation': _active_agent_c_control_generation(fid), 'queued_at': monotonic(), **deepcopy(payload)}
+    return True
+
+
+def _explicit_review_context(finding, source=None):
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    state = st.session_state
+    historical = [{'finding_id': e.get('finding_id'), 'operation': e.get('operation'),
+                   'positions': (e.get('modified_positions') or [])[:8]}
+                  for e in state.get('cleaning_history', [])[-30:] if isinstance(e, dict)]
+    return historical, dataset_review_context(state, finding['dataset_id'], finding['id'], source=source)
+
+
+def _queue_explicit_review(finding, source, question, proposal):
+    from copy import deepcopy
+    historical, context = _explicit_review_context(finding, source)
+    if _submit_review_worker(finding, source, 'explicit_review', _explicit_review_worker,
+            (deepcopy(finding), Path(source), question, deepcopy(proposal), deepcopy(historical), deepcopy(context)),
+            proposal=proposal, question=question):
+        st.session_state.cleaning_review_statuses[finding['id']] = 'Review queued'
+
+
+def _prior_closure_worker(finding, source, resolution, last_user, historical, context):
+    from healthcare_data_quality.services.resolved_review_button import generate_prior_approval_close_button
+    generated = generate_prior_approval_close_button(finding, resolution, reviewer_request=last_user)
+    question = generated['label'] + '. No new edits for rows already removed by named approvals.'
+    result = _explicit_review_worker(finding, source, question,
+                {'decision': 'resolved_by_prior_approvals'}, historical, context)
+    return {'fingerprint': resolution['fingerprint'], 'can_offer': bool(result.get('can_offer')),
+            'label': generated['label'], 'reason': generated['reason'] + ' · ' + str(result.get('reason') or '')}
+
+
+def _queue_local_choice(finding, source, option):
+    from copy import deepcopy
+    from healthcare_data_quality.ui.one_click_choice import prepare_verified_choice_snapshot
+    state = st.session_state
+    names = ('cleaning_approved_reviewer', 'cleaning_review_statuses', 'cleaning_history',
+             'cleaning_staged_bytes_by_dataset', 'cleaning_approved_columns_by_dataset',
+             'cleaning_approved_rows_by_dataset', 'cleaning_visual_flags_by_dataset')
+    snapshot = {k: deepcopy(state[k]) for k in names if k in state}
+    return _submit_review_worker(finding, source, 'local_choice', prepare_verified_choice_snapshot,
+        (snapshot, deepcopy(finding), Path(source), deepcopy(option)),
+        option=option, reviewer=state.get('cleaning_approved_reviewer'))
+
+
+def _consume_review_worker(finding, source, pending, outcome):
+    """Publish a worker result only against the exact current review state."""
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+    state = st.session_state
+    fid = finding['id']; kind = pending['kind']
+    if not _sequential_owner_matches(fid):
+        return
+    if pending.get('ui_generation') != _active_agent_c_control_generation(fid) or _finding_review_completed(fid):
+        return
+    thread = state.setdefault('cleaning_messages_by_finding', {}).setdefault(fid, [])
+    try:
+        if not source or file_sha256(source) != pending['source_sha256']:
+            raise PermissionError('Source changed; review again')
+        if dataset_review_context(state, finding['dataset_id'], fid)['revision'] != pending['review_revision']:
+            raise PermissionError('Other approved changes changed this review; review again')
+        if outcome.get('status') != 'done':
+            raise ValueError(outcome.get('error', 'Worker unavailable'))
+        result = outcome['result']
+        if kind == 'prior_closure':
+            state.setdefault('cleaning_resolution_gemma_review', {})[fid] = {**result, 'review_revision': pending['review_revision']}
+        elif kind == 'explicit_review':
+            proposal = pending['proposal']
+            if proposal.get('decision') == 'no_change':
+                _complete_reviewer_no_change(finding, source, pending['question'], already_in_transcript=True)
+                thread.append({'role':'assistant','content':'Kept unchanged as requested.'})
+                return
+            if proposal.get('explicit_columns'):
+                state.setdefault('cleaning_explicit_column_deletions_by_finding', {})[fid] = proposal['explicit_columns']
+            _record_gemma_b_response(fid, finding, source, {**proposal, 'button_label': result.get('button_label')})
+        elif kind == 'local_choice':
+            if state.get('cleaning_approved_reviewer') != pending['reviewer']:
+                raise PermissionError('Reviewer changed; approve again')
+            from healthcare_data_quality.ui.one_click_choice import commit_verified_choice_snapshot
+            warning = commit_verified_choice_snapshot(state, finding, source, pending['option'], result)
+            if warning:
+                st.warning(warning)
+            state.setdefault('cleaning_keep_open_by_finding', {}).pop(fid, None)
+            state['cleaning_scroll_to_completed_finding'] = fid
+        elif kind == 'local_r_preview':
+            state.setdefault('cleaning_r_previews_by_finding', {})[fid] = result
+            state.cleaning_review_statuses[fid] = 'R output verified — insertion awaiting approval'
+            state.setdefault('cleaning_decisions', []).append({'finding_id':fid,'decision':'scoped_r_preview_tested_no_dataset_change',
+                'source_sha256':result['source_sha256'],'r_preview_sha256':result['preview_sha256'],
+                'r_result_sha256':result['r_result']['verified_output_sha256']})
+        elif kind == 'local_compound_preview':
+            state.setdefault('cleaning_compound_previews_by_finding', {})[fid] = result
+    except (OSError, ValueError, PermissionError, RuntimeError, KeyError, TypeError, csv.Error) as exc:
+        state.cleaning_review_statuses[fid] = 'Discussion open'
+        if kind == 'prior_closure':
+            state.setdefault('cleaning_resolution_gemma_review', {})[fid] = {
+                'fingerprint':pending['resolution_fingerprint'],'review_revision':pending['review_revision'],'can_offer':False,'reason':str(exc)[:240]}
+        elif kind == 'local_r_preview':
+            from healthcare_data_quality.r_runtime.r_diagnostics import diagnose_r_preview_failure
+            plan = state.get('cleaning_plans_by_finding', {}).get(fid) or {}
+            diagnosis = diagnose_r_preview_failure(exc, plan, finding)
+            state.setdefault('cleaning_r_diagnostics_by_finding', {})[fid] = diagnosis
+            state.setdefault('cleaning_r_errors_by_finding', {})[fid] = 'Isolated R preview failed: ' + diagnosis['summary'] + ' [' + diagnosis['code'] + ']'
+        elif kind == 'local_compound_preview':
+            state.setdefault('cleaning_compound_previews_by_finding', {})[fid] = {'digest':pending['digest'],'_error':str(exc)[:240]}
+        else:
+            thread.append({'role':'assistant','content':str(exc)[:300] + '. No changes applied.', 'controls_expired':True,'proposal_preparation_failed':True})
+            if kind == 'local_choice':
+                state.setdefault('cleaning_discussion_mode_by_finding', {})[fid] = 'alternative'
+
+def _validate_pending_visual_scope(fid: str, finding: dict, source: Path, plan: dict) -> None:
+    from healthcare_data_quality.cleaning.active_visual_flags import split_active_visual_flags
+    from healthcare_data_quality.cleaning.in_memory_cleaning import _records
+    ds = finding['dataset_id']
+    raw = source.read_bytes()
+    if plan.get('finding_id') != fid or plan.get('dataset_id') != ds or plan.get('source_sha256') != hashlib.sha256(raw).hexdigest():
+        raise PermissionError('Source or finding changed; submit the highlight request again')
+    flags = plan['flags']
+    _, removed = split_active_visual_flags(flags,
+        st.session_state.get('cleaning_approved_rows_by_dataset', {}).get(ds, []),
+        st.session_state.get('cleaning_approved_columns_by_dataset', {}).get(ds, []))
+    if removed:
+        raise PermissionError('Some highlight targets were removed by earlier approvals; select surviving targets')
+    original = _records(raw)
+    staged = _records(st.session_state.get('cleaning_staged_bytes_by_dataset', {}).get(ds, raw))
+    if len(original) != len(staged) or any(len(a) != len(b) for a,b in zip(original, staged)):
+        raise PermissionError('Staged CSV dimensions changed')
+    if any(staged[f['row']-1][f['column']-1] != f['before'] for f in flags):
+        raise PermissionError('Some highlight targets have edited values; reopen the relevant approval before highlighting')
+
+
+def _latest_user_wants_visual_flag(transcript: list[dict]) -> bool:
+    from healthcare_data_quality.cleaning.visual_flags import is_visual_flag_request
+    last = next((m for m in reversed(transcript) if m.get('role') == 'user' and not m.get('automatic')), {})
+    return bool(last.get('visual_request') or is_visual_flag_request(last.get('content', '')))
+
+
+def _recover_legacy_failed_visual_request(fid: str, finding: dict, source: Path) -> None:
+    """Retire a legacy auto-generated replacement after a failed visual request.
+
+    Only the latest real reviewer instruction is authoritative; never replay a
+    dismissed or already approved action. Recovery prepares a preview only.
+    """
+    state = st.session_state
+    if state.get('cleaning_pending_visual_flags_by_finding', {}).get(fid) or any(e.get('finding_id') == fid for e in state.get('cleaning_history', [])):
+        return
+    thread = state.get('cleaning_messages_by_finding', {}).get(fid, [])
+    last_user = next((i for i in range(len(thread)-1, -1, -1) if thread[i].get('role') == 'user' and not thread[i].get('automatic')), None)
+    if last_user is None:
+        return
+    question = thread[last_user].get('content', '')
+    from healthcare_data_quality.cleaning.visual_flags import is_visual_flag_request, requested_visual_flag, visual_scope_label
+    if not is_visual_flag_request(question):
+        return
+    failure = next((m for m in thread[last_user+1:] if m.get('role') == 'assistant'
+                    and 'The requested bulk action was not prepared: Gemma did not support' in str(m.get('content', ''))
+                    and not m.get('visual_recovery_handled')), None)
+    if failure is None:
+        return
+    failure['visual_recovery_handled'] = True
+    _next_agent_c_ui_generation(fid)
+    for key in ('cleaning_plans_by_finding', 'cleaning_batch_queue_by_finding', 'cleaning_batch_total_by_finding',
+                'cleaning_compound_previews_by_finding', 'cleaning_r_previews_by_finding', 'cleaning_memory_candidates',
+                'cleaning_pending_gemma_b', 'cleaning_completed_gemma'):
+        state.setdefault(key, {}).pop(fid, None)
+    state.cleaning_discussion_mode_by_finding[fid] = 'alternative'
+    state.cleaning_review_statuses[fid] = 'Discussion open'
+    try:
+        plan = requested_visual_flag(question, finding, source)
+        _validate_pending_visual_scope(fid, finding, source, plan)
+    except (ValueError, PermissionError, OSError, csv.Error, KeyError, TypeError) as exc:
+        thread.append({'role': 'assistant', 'content': f'Old replacement discarded. Highlight not prepared: {exc}', 'controls_expired': True})
+        return
+    _submit_visual_review(finding, source, {**plan, 'request': question}, question)
+
+
+def _render_visual_discussion(fid: str) -> None:
+    from healthcare_data_quality.ui.review_display import partition_review_thread
+    thread = st.session_state.get('cleaning_messages_by_finding', {}).get(fid, [])
+    visible, diagnostics = partition_review_thread(thread)
+    if visible and hasattr(st, 'chat_message'):
+        st.markdown('**Discussion**')
+        for item in visible:
+            with st.chat_message(item['role']):
+                st.write(item['content'])
+    if diagnostics:
+        with st.expander('Review details', expanded=False):
+            for item in diagnostics:
+                st.caption(item['content'])
+
+
+
+def _submit_visual_review(finding, source, plan, question):
+    from copy import deepcopy
+    from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context, review_visual_proposal
+    fid, ds = finding['id'], finding['dataset_id']
+    state = st.session_state
+    if fid in state.get('cleaning_pending_gemma_b', {}):
+        return
+    plan = {**plan, 'user_request': question}
+    context = dataset_review_context(state, ds, fid, source=source)
+    manager = interactive_chat_manager()
+    _assert_sequential_owner(fid)
+    args = (deepcopy(finding), Path(source), deepcopy(plan), question, deepcopy(context))
+    job_id = manager.submit_role('C', review_visual_proposal, *args) if hasattr(manager, 'submit_role') else manager.submit(review_visual_proposal, *args)
+    agent = 'C'
+    state.setdefault('cleaning_completed_gemma', {}).pop(fid, None)
+    state.setdefault('cleaning_agent_c_completion_notified', set()).discard(fid)
+    state.setdefault('cleaning_pending_gemma_b', {})[fid] = {
+        'kind': 'visual_review', 'job_id': job_id, 'assigned_agent': agent,
+        'source_sha256': plan['source_sha256'], 'ui_generation': _active_agent_c_control_generation(fid),
+        'plan': plan, 'review_revision': context['revision'],
+    }
+    state.setdefault('cleaning_review_statuses', {})[fid] = f'Agent {agent} reviewing annotation scope'
+    state.setdefault('cleaning_discussion_mode_by_finding', {})[fid] = 'alternative'
+
+
+def _consume_visual_review(finding, source, pending, outcome):
+    from healthcare_data_quality.services.model_plan_review import dataset_review_context, option_fingerprint
+    from healthcare_data_quality.cleaning.visual_flags import requested_visual_flag, visual_scope_label
+    state = st.session_state
+    fid, ds = finding['id'], finding['dataset_id']
+    thread = state.setdefault('cleaning_messages_by_finding', {}).setdefault(fid, [])
+    if pending.get('ui_generation') != _active_agent_c_control_generation(fid):
+        return
+    if _finding_review_completed(fid):
+        return
+    try:
+        if source is None:
+            raise ValueError('Original source unavailable')
+        plan = pending['plan']
+        verified = requested_visual_flag(plan['request'], finding, source)
+        if not verified or verified['flags'] != plan['flags']:
+            raise PermissionError('Annotation no longer matches source')
+        _validate_pending_visual_scope(fid, finding, source, plan)
+        context = dataset_review_context(state, ds, fid)
+        if context['revision'] != pending['review_revision']:
+            _submit_visual_review(finding, source, plan, plan['user_request'])
+            return
+        if outcome.get('status') != 'done':
+            raise ValueError(outcome.get('error', 'Gemma review unavailable'))
+        result = outcome['result']
+        assessment = result['visual_review']
+        option = {'label': 'Visual annotation only', 'operations': [{'operation': 'flag_cells', 'changes': plan['flags'], 'visual_scope': plan['scope'], 'style': ('bold red and yellow fill' if plan['flags'][0].get('fill', True) else 'bold red font only')}]}
+        if (result.get('revision') != context['revision'] or
+                assessment.get('fingerprint') != option_fingerprint(finding, source, option)):
+            raise PermissionError('Gemma reviewed a different annotation or dataset revision')
+        if not assessment.get('can_offer'):
+            raise PermissionError('Gemma did not support this exact scope: ' + str(assessment.get('reason', 'scope unclear')))
+        state.setdefault('cleaning_pending_visual_flags_by_finding', {})[fid] = {**plan, 'gemma_review': assessment, 'review_revision': context['revision']}
+        state.setdefault('cleaning_review_revision_by_finding', {})[fid] = context['revision']
+        state.cleaning_review_statuses[fid] = 'Visual flag preview ready'
+        thread.append({'role': 'assistant', 'content': 'Gemma reviewed the annotation of ' + visual_scope_label(plan) + '. ' + assessment['reason'] + ' Review the exact Before → After below; no data have been changed.', 'controls_expired': True, 'assigned_agent': pending.get('assigned_agent', 'C')})
+    except (ValueError, PermissionError, KeyError, OSError, TypeError, RuntimeError, csv.Error) as exc:
+        state.cleaning_review_statuses[fid] = 'Discussion open'
+        thread.append({'role': 'assistant', 'content': 'Annotation review did not complete: ' + str(exc) + '. No data were changed. Refine the request or retry.', 'controls_expired': True, 'proposal_preparation_failed': True})
 
 
 def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: list,
@@ -4985,6 +6263,7 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
     from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
     from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
     fid = finding["id"]
+    _assert_sequential_owner(fid)
     # An explicit direct discussion is valid even when Agent B's background
     # recommendation is missing or failed. Treat the finding's verified source
     # evidence as context; NEVER fabricate an Agent B suggestion to pass a gate.
@@ -4994,6 +6273,26 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
                 != "alternative"):
         raise ValueError("Choose an Agent B suggestion or start a direct Agent C discussion")
     if fid in st.session_state.cleaning_pending_gemma_b:
+        return
+    if (automatic and _waiting_for_new_discussion(st.session_state, fid)
+            and st.session_state.get('cleaning_messages_by_finding', {}).get(fid)):
+        return
+    if automatic and _latest_user_wants_visual_flag(st.session_state.get("cleaning_messages_by_finding", {}).get(fid, [])) and not require_gemma_review:
+        # Do not overwrite a pending styling preview with hidden generic retries.
+        return
+    from healthcare_data_quality.cleaning.review_closure import requests_review_closure
+    if not automatic and requests_review_closure(question):
+        # A closure request is not an instruction to transform values. Keep the
+        # exact human message in the transcript, but never pretend that a
+        # natural-language "done" completed a named final approval.
+        thread = st.session_state.setdefault('cleaning_messages_by_finding', {}).setdefault(fid, [])
+        thread.append({'role': 'user', 'content': question})
+        thread.append({'role': 'assistant', 'content':
+            'Choose Mark reviewed to close this finding/check with no new edits. '
+            'Previously approved changes are retained; unresolved issues are accepted '
+            'unchanged, not represented as corrected.'})
+        st.session_state.setdefault('cleaning_close_request_by_finding', {})[fid] = True
+        st.session_state.setdefault('cleaning_review_statuses', {})[fid] = 'Discussion updated'
         return
     from healthcare_data_quality.cleaning.previous_approval_resolution import (
         requests_close_resolved_finding,
@@ -5022,9 +6321,9 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
     if requests_no_change(question):
         if source is None:
             raise ValueError('Original source unavailable for no-change assessment')
-        _gemma_preflight_explicit_reviewer_plan(
-            finding, source, question, {'decision': 'no_change'})
-        _complete_reviewer_no_change(finding, source, question)
+        _next_agent_c_ui_generation(fid)
+        _prepare_finding_discussion(finding, source, uploaded, dataset_paths, question)
+        _queue_explicit_review(finding, source, question, {'decision': 'no_change'})
         return
     st.session_state.setdefault("cleaning_completed_gemma", {}).pop(fid, None)
     st.session_state.setdefault("cleaning_agent_c_completion_notified", set()).discard(fid)
@@ -5032,6 +6331,12 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
     fid, thread, old_thread, scoped, metadata = _prepare_finding_discussion(
         finding, source, uploaded, dataset_paths, question, automatic=automatic)
     try:
+        if not automatic and source is not None:
+            from healthcare_data_quality.cleaning.current_review_evidence import current_evidence_question
+            if current_evidence_question(question) and scoped.get('current_finding_evidence'):
+                st.session_state.setdefault('cleaning_show_current_evidence', {})[fid] = True
+                thread.append({'role': 'assistant', 'content': 'See Current evidence for exact values and approval IDs.', 'controls_expired': True})
+                return
         # An explicit request to VERIFY taxonomy hierarchy is an inspection,
         # not permission to proceed with the previously proposed separator edit.
         # Return actual source ranks before inviting a reviewer to change data.
@@ -5046,6 +6351,24 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
         # finding's immutable source evidence. No Gemma queue/GPU time is
         # needed; _record_gemma_b_response still enforces scoped validation
         # and the independent R / human-approval workflow.
+        # Canonicalize explicit annotation follow-ups using the prior scope and style;
+        # Gemma independently assesses this exact host-resolved proposal before display.
+        from healthcare_data_quality.cleaning.visual_flags import contextual_visual_request, requested_visual_flag
+        visual_context = st.session_state.setdefault('cleaning_visual_context_by_finding', {})
+        canonical = contextual_visual_request(question, visual_context.get(fid, '')) if not automatic else None
+        if canonical is not None:
+            thread[-1]['visual_request'] = True
+            if source is None:
+                raise ValueError('Select the original dataset first')
+            flag_plan = requested_visual_flag(canonical, finding, source)
+            if not flag_plan:
+                raise ValueError('No exact visual targets')
+            _validate_pending_visual_scope(fid, finding, source, flag_plan)
+            visual_context[fid] = canonical
+            _submit_visual_review(finding, source, {**flag_plan, 'request': canonical}, question)
+            return
+        if not automatic:
+            visual_context.pop(fid, None)
         if not require_gemma_review:
             # Whole-column commands are authoritative reviewer instructions.
             # Validate ORIGINAL physical column coordinates deterministically,
@@ -5054,36 +6377,7 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
                 from healthcare_data_quality.cleaning.direct_actions import propose_explicit_column_deletions
                 column_plan = propose_explicit_column_deletions(question, finding, source)
                 if column_plan is not None:
-                    _gemma_preflight_explicit_reviewer_plan(finding, source, question, column_plan)
-                    st.session_state.setdefault(
-                        'cleaning_explicit_column_deletions_by_finding', {})[fid] = column_plan['explicit_columns']
-                    _record_gemma_b_response(fid, finding, source, column_plan)
-                    return
-            # Flagging is read-only PREPARATION at message submission time:
-            # a reviewer cannot see the exact Before -> After until the UI
-            # displays it. Do not mark the finding completed from a chat turn.
-            # A single displayed option (above) is the actual authorization.
-            if source:
-                from healthcare_data_quality.cleaning.visual_flags import requested_visual_flag
-                try:
-                    flag_plan = requested_visual_flag(question, finding, source)
-                except ValueError as exc:
-                    thread.append({"role": "assistant", "content": f"Flag not prepared: {exc}"})
-                    st.session_state.cleaning_review_statuses[fid] = "Discussion open"
-                    return
-                if flag_plan is not None:
-                    _gemma_preflight_explicit_reviewer_plan(finding, source, question, flag_plan)
-                    st.session_state.cleaning_pending_visual_flags_by_finding[fid] = {
-                        **flag_plan, "request": question,
-                    }
-                    st.session_state.cleaning_review_statuses[fid] = (
-                        "Visual flag preview ready" if not automatic
-                        else "Visual flag proposal only"
-                    )
-                    thread.append({"role": "assistant", "content":
-                                   f"Prepared {len(flag_plan['flags'])} source-verified "
-                                   "red/bold flag(s). Review the Before → After below; "
-                                   "no changes have been applied yet."})
+                    _queue_explicit_review(finding, source, question + " (explicit optional full-column deletion; show exact columns for named approval, not automatic execution)", column_plan)
                     return
             from healthcare_data_quality.cleaning.finding_cleaning import (
                 propose_explicit_user_row_deletion, propose_bulk_blank_row_deletion,
@@ -5101,19 +6395,37 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
                 from healthcare_data_quality.cleaning.direct_actions import draft_format_correction
                 combined = draft_format_correction(finding, source)
                 if combined is not None:
-                    _gemma_preflight_explicit_reviewer_plan(finding, source, question, combined)
-                    _record_gemma_b_response(fid, finding, source, combined)
+                    from healthcare_data_quality.cleaning.direct_actions import surviving_taxonomy_proposal
+                    combined = surviving_taxonomy_proposal(combined, finding, source,
+                        st.session_state.get("cleaning_approved_rows_by_dataset", {}).get(finding["dataset_id"], []))
+                    if combined.get("operation") == "replace_cells" and not combined.get("changes"):
+                        st.session_state.cleaning_messages_by_finding.setdefault(fid, []).append({"role":"assistant", "content":"The requested rows were already removed by earlier approvals. No further edit is needed."})
+                        return
+                    _queue_explicit_review(finding, source, question, combined)
                     return
             if (source and question.strip().casefold() in {
-                    "fix", "fix it", "ok", "yes", "correct it", "standardize", "standardise"}):
+                    "fix", "fix it", "fix this", "ok", "yes", "correct it", "correct this", "standardize", "standardise"}):
                 from healthcare_data_quality.cleaning.direct_actions import (
                     draft_format_correction, draft_identical_column_removal)
                 direct = (draft_identical_column_removal(finding, source)
                           if finding.get("check_key") == "compare_repeated_headers"
                           else draft_format_correction(finding, source))
                 if direct is not None:
-                    _gemma_preflight_explicit_reviewer_plan(finding, source, question, direct)
-                    _record_gemma_b_response(fid, finding, source, direct)
+                    from healthcare_data_quality.cleaning.direct_actions import surviving_taxonomy_proposal
+                    direct = surviving_taxonomy_proposal(direct, finding, source,
+                        st.session_state.get("cleaning_approved_rows_by_dataset", {}).get(finding["dataset_id"], []))
+                    if direct.get("operation") == "replace_cells" and not direct.get("changes"):
+                        st.session_state.cleaning_messages_by_finding.setdefault(fid, []).append({"role":"assistant", "content":"The requested rows were already removed by earlier approvals. No further edit is needed."})
+                        return
+                    if direct.get('operation') == 'replace_cells':
+                        from healthcare_data_quality.cleaning.in_memory_cleaning import _records
+                        working = _records(st.session_state.get('cleaning_staged_bytes_by_dataset', {}).get(finding['dataset_id'], source.read_bytes()))
+                        direct['changes'] = [c for c in direct['changes'] if working[c['row']-1][c['column']-1] != c['after']]
+                        if not direct['changes']:
+                            st.session_state.setdefault('cleaning_show_current_evidence', {})[fid] = True
+                            thread.append({'role':'assistant','content':'Current surviving values match the proposed format. See Current evidence.', 'controls_expired':True})
+                            return
+                    _queue_explicit_review(finding, source, question, direct)
                     return
             # A global user-specified condition must be evaluated over the whole
             # original CSV by Python, not guessed from the selected finding's
@@ -5128,14 +6440,18 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             taxonomy_plan = (propose_explicit_taxonomy_padding(
                 question, finding, source) if source else None)
             if taxonomy_plan is not None:
-                _gemma_preflight_explicit_reviewer_plan(finding, source, question, taxonomy_plan)
-                _record_gemma_b_response(fid, finding, source, taxonomy_plan)
+                from healthcare_data_quality.cleaning.direct_actions import surviving_taxonomy_proposal
+                taxonomy_plan = surviving_taxonomy_proposal(taxonomy_plan, finding, source,
+                    st.session_state.get("cleaning_approved_rows_by_dataset", {}).get(finding["dataset_id"], []))
+                if taxonomy_plan.get("operation") == "replace_cells" and not taxonomy_plan.get("changes"):
+                    st.session_state.cleaning_messages_by_finding.setdefault(fid, []).append({"role":"assistant", "content":"The requested rows were already removed by earlier approvals. No further edit is needed."})
+                    return
+                _queue_explicit_review(finding, source, question + " (append literal NA placeholders only; retain any existing visual annotations on surviving coordinates)", taxonomy_plan)
                 return
             bulk_row_plan = (propose_bulk_blank_row_deletion(question, finding, source)
                              if source else None)
             if bulk_row_plan is not None:
-                _gemma_preflight_explicit_reviewer_plan(finding, source, question, bulk_row_plan)
-                _record_gemma_b_response(fid, finding, source, bulk_row_plan)
+                _queue_explicit_review(finding, source, question, bulk_row_plan)
                 return
             # Typed 'approval' is not authorization: the prepared proposal always
             # has a dedicated form button after full validation.
@@ -5148,8 +6464,7 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             user_row_plan = (propose_explicit_user_row_deletion(question, finding, source)
                              if source else None)
             if user_row_plan is not None:
-                _gemma_preflight_explicit_reviewer_plan(finding, source, question, user_row_plan)
-                _record_gemma_b_response(fid, finding, source, user_row_plan)
+                _queue_explicit_review(finding, source, question, user_row_plan)
                 return
             # The reviewer supplies the desired operation, not extra scientific
             # evidence. Match unambiguous numeric Before -> After requests to
@@ -5161,13 +6476,12 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             explicit_cells = (propose_reviewer_cell_replacements(
                 question, finding, source) if source else None)
             if explicit_cells is not None:
-                _gemma_preflight_explicit_reviewer_plan(finding, source, question, explicit_cells)
-                _record_gemma_b_response(fid, finding, source, explicit_cells)
+                _queue_explicit_review(finding, source, question, explicit_cells)
                 return
             from healthcare_data_quality.cleaning.cleaning_workspace import _draft_evidenced_absolute_values
             absolute_plan = _draft_evidenced_absolute_values(question, scoped)
             if absolute_plan is not None:
-                _record_gemma_b_response(fid, finding, source, absolute_plan)
+                _queue_explicit_review(finding, source, question, absolute_plan)
                 return
             # For large, uniform, evidence-backed edits, never ask Gemma to emit
             # hundreds of per-cell JSON changes. Host expands the explicit user's
@@ -5183,40 +6497,14 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
                 ),
             ) if source else None)
             if bulk is not None:
-                _record_gemma_b_response(fid, finding, source, bulk)
+                _queue_explicit_review(finding, source, question, bulk)
                 return
         manager = interactive_chat_manager()
-        # Explicit Yes/No conversations enter one C lane. A queued job may
-        # borrow a newly idle A/B later, not only at click time. This is
-        # important when B finishes its recommendations while C is replying.
-        mode = st.session_state.cleaning_discussion_mode_by_finding.get(fid)
-        user_initiated = (mode in {"accepted", "alternative"} and not automatic)
-        if user_initiated and hasattr(manager, "submit_routed"):
-            audit = st.session_state.get("audit_result") or {}
-            context_key = st.session_state.get("audit_cache_key")
-            run_id = (audit.get("cleaning_recommendation_run_id")
-                      or st.session_state.get("registered_investigation_run_id"))
-            if not context_key or not run_id:
-                # The cleaning workspace can be rendered directly in unit
-                # tests without the top-level investigation session state.
-                context_key = st.session_state.get("cleaning_context_key", "").split(":")[0]
-                run_id = audit.get("cleaning_recommendation_run_id")
-            idle_probe = (lambda context_key=context_key, run_id=run_id:
-                          _background_agents_idle_for_run(context_key, run_id))
-            a_idle, b_idle = idle_probe()
-            job_id, agent = manager.submit_routed(
-                ask_gemma_about_cleaning, question, old_thread, [scoped], metadata,
-                selected_finding=scoped, force_model=require_gemma_review,
-                agent_a_idle=a_idle, agent_b_idle=b_idle,
-                idle_probe=idle_probe,
-            )
-        else:
-            # Automatic retries retain C ownership and are never handed to
-            # another role without a new explicit user request.
-            job_id = manager.submit(
-                ask_gemma_about_cleaning, question, old_thread, [scoped], metadata,
-                selected_finding=scoped, force_model=require_gemma_review)
-            agent = "C"
+        job_id = manager.submit_role('C', ask_gemma_about_cleaning, question, old_thread, [scoped], metadata,
+            selected_finding=scoped, force_model=True) if hasattr(manager, 'submit_role') else manager.submit(
+            ask_gemma_about_cleaning, question, old_thread, [scoped], metadata,
+            selected_finding=scoped, force_model=True)
+        agent = 'C'
         from healthcare_data_quality.cleaning.in_memory_cleaning import sha256_bytes
         ds_id = finding.get("dataset_id", "")
         original = source.read_bytes() if source else b""
@@ -5226,16 +6514,20 @@ def _queue_agent_c_for_finding(finding: dict, source: Path | None, uploaded: lis
             "staged_sha256": sha256_bytes(staged),
             "ui_generation": _active_agent_c_control_generation(fid),
             "assigned_agent": agent,
+            "review_revision": scoped['cross_finding_review_context']['revision'],
+            "automatic": automatic,
         }
         st.session_state.cleaning_review_statuses[fid] = f"Agent {agent} replying"
     except (ValueError, PermissionError, csv.Error) as exc:
         st.session_state.cleaning_review_statuses[fid] = "Bulk proposal validation failed"
         thread.append({"role": "assistant", "content":
                        f"The requested bulk action was not prepared: {exc}. "
-                       "No data were changed. Check this finding's exact source evidence."})
+                       "No data were changed. Check this finding's exact source evidence.",
+                       "controls_expired": True, "proposal_preparation_failed": True})
     except Exception as exc:
         thread.append({"role": "assistant", "content":
-                       f"Could not submit your question: {exc}. No changes were made."})
+                       f"Could not submit your question: {exc}. No changes were made.",
+                       "controls_expired": True, "proposal_preparation_failed": True})
 
 
 def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
@@ -5243,6 +6535,8 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
     from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
     from healthcare_data_quality.cleaning.cleaning_authorization import file_sha256
     fid = finding["id"]
+    if not _sequential_owner_matches(fid):
+        return
     manager = interactive_chat_manager()
     pending_b = st.session_state.cleaning_pending_gemma_b.get(fid)
     if pending_b:
@@ -5258,6 +6552,47 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
             outcome = manager.take(pending_b["job_id"])
         if outcome["status"] != "running":
             st.session_state.cleaning_pending_gemma_b.pop(fid, None)
+            if _waiting_for_new_discussion(st.session_state, fid):
+                return
+            if pending_b.get('kind') == 'exact_option_recovery':
+                from healthcare_data_quality.services.model_plan_review import dataset_review_context
+                if (source and pending_b.get('source_sha256') == file_sha256(source)
+                        and pending_b.get('review_revision') == dataset_review_context(st.session_state, finding['dataset_id'], fid)['revision']
+                        and pending_b.get('ui_generation') == _active_agent_c_control_generation(fid)
+                        and not _finding_review_completed(fid)):
+                    suggestion = dict(pending_b['suggestion'])
+                    result = outcome.get('result') if outcome.get('status') == 'done' else None
+                    if pending_b.get('regenerate'):
+                        if isinstance(result, dict):
+                            # A new draft must be scoped and assessed before display.
+                            # Retain terminal assessments for exact rejected candidates.
+                            previous_reviews = suggestion.get('gemma_option_reviews') or []
+                            retained = suggestion.pop('_retained_ready_options', [])
+                            suggestion.update(result)
+                            # Searching for a second alternative must not erase
+                            # the already assessed first choice. Revalidate the
+                            # combined candidates on the next publication pass.
+                            if retained:
+                                fresh = suggestion.get('choices') or []
+                                suggestion['choices'] = [*retained, *fresh][:5]
+                            suggestion['gemma_option_reviews'] = previous_reviews
+                            # A fresh draft may recover an identical operation whose
+                            # previous review was unavailable (not scope-rejected).
+                            st.session_state.setdefault('cleaning_exact_option_attempts', {}).pop(fid, None)
+                    elif isinstance(result, list):
+                        by_fp = {r['fingerprint']:r for r in suggestion.get('gemma_option_reviews', []) if r.get('fingerprint')}
+                        by_fp.update({r['fingerprint']:r for r in result if isinstance(r,dict) and r.get('fingerprint')})
+                        suggestion['gemma_option_reviews'] = list(by_fp.values())
+                    suggestion['_review_revision'] = pending_b['review_revision']
+                    suggestion['_source'] = 'exact_option_recovery'
+                    st.session_state.cleaning_recommendations[fid] = suggestion
+                return
+            if pending_b.get('kind') in {'explicit_review', 'prior_closure', 'local_choice', 'local_r_preview', 'local_compound_preview'}:
+                _consume_review_worker(finding, source, pending_b, outcome)
+                return
+            if pending_b.get('kind') == 'visual_review':
+                _consume_visual_review(finding, source, pending_b, outcome)
+                return
             if outcome["status"] == "done":
                 try:
                     response = outcome["result"]
@@ -5282,8 +6617,11 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
                             and all(len(a) == len(b) for a, b in
                                     zip(before_records, latest_records))
                         )
+                    from healthcare_data_quality.services.model_plan_review import dataset_review_context
+                    latest_revision = dataset_review_context(st.session_state, ds_id, fid)['revision']
                     obsolete = (
-                        pending_b.get("ui_generation") != _active_agent_c_control_generation(fid)
+                        (pending_b.get('review_revision') is not None and pending_b['review_revision'] != latest_revision)
+                        or pending_b.get("ui_generation") != _active_agent_c_control_generation(fid)
                         or not coordinate_compatible
                         or (source and file_sha256(source) != pending_b.get("source_sha256"))
                         or st.session_state.cleaning_review_statuses.get(fid) in {
@@ -5294,6 +6632,11 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
                         }
                     )
                     if obsolete:
+                        if (pending_b.get('review_revision') is not None
+                                and pending_b['review_revision'] != latest_revision
+                                and pending_b.get('ui_generation') == _active_agent_c_control_generation(fid)
+                                and not _finding_review_completed(fid)):
+                            st.session_state.setdefault('cleaning_reassess_context_by_finding', {})[fid] = True
                         # Preserve terminal approval state, and never revive an old widget.
                         if st.session_state.cleaning_review_statuses.get(fid) not in {
                             "Applied and verified", "Resolved by earlier approved edit",
@@ -5307,10 +6650,11 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
                             "role": "assistant", "content":
                             "This reply became outdated after a review or staged-data change. "
                             "Submit a new request against the current state. "
-                            "No cleaning plan was approved or executed."})
+                            "No cleaning plan was approved or executed.", "background_diagnostic": True, "controls_expired": True})
                     else:
                         message_count = len(st.session_state.cleaning_messages_by_finding.get(fid, []))
                         _record_gemma_b_response(fid, finding, source, response)
+                        st.session_state.setdefault('cleaning_review_revision_by_finding', {})[fid] = latest_revision
                         cross_review = st.session_state.setdefault(
                             "cleaning_cross_source_review_by_finding", {}).get(fid)
                         if cross_review and cross_review.get("source_sha256") == file_sha256(source):
@@ -5323,7 +6667,9 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
                         messages = st.session_state.cleaning_messages_by_finding.get(fid, [])
                         if (len(messages) > message_count and messages[-1].get("role") == "assistant"):
                             messages[-1]["assigned_agent"] = pending_b.get("assigned_agent", "C")
-                except (KeyError, ValueError, OSError, csv.Error) as exc:
+                            if pending_b.get('automatic'):
+                                messages[-1]['background_diagnostic'] = True
+                except (KeyError, ValueError, OSError, TypeError, csv.Error) as exc:
                     st.session_state.cleaning_messages_by_finding[fid].append({
                         "role": "assistant", "content": f"Could not validate Agent C's response: {exc}"})
             else:
@@ -5339,6 +6685,45 @@ def _sync_gemma_conversations(finding: dict, source: Path | None) -> None:
                     "role": "assistant", "content":
                     f"Agent C's response was interrupted ({outcome.get('error', 'worker unavailable')}). "
                     "Your question is preserved above; no data were changed."})
+
+
+
+def render_model_reconnect_gate(run_state: dict | None) -> bool:
+    """Pause editable review during a transient Gemma outage, not the run.
+
+    The background HTTP worker retries the *same* read-only request. This UI
+    gate never starts another run or replays an approved cleaning operation.
+    The fragment polls process-local status; it performs no network I/O.
+    """
+    if not run_state or run_state.get("status") not in {"running", "completed"}:
+        return False
+    connection = model_connection_snapshot()
+    if not connection["offline"]:
+        return False
+
+    def show_status():
+        latest = model_connection_snapshot()
+        if not latest["offline"]:
+            # The model worker resumed, so unlock in one ordinary app render.
+            st.rerun()
+            return
+        interval = os.environ.get("HDQ_GEMMA_RECONNECT_SECONDS", "5")
+        st.warning(
+            "**Gemma server unavailable — investigation paused, not failed.** "
+            f"Automatically retrying the same model request (interval: {interval}s). "
+            "Do not restart the investigation or re-upload the dataset."
+        )
+        st.caption(
+            f"Waiting model request(s): {latest['waiting_requests']} · "
+            f"Reconnect attempts: {latest['attempts']}. "
+            "Verified QC findings and approved changes are retained. "
+            "Cleaning decisions and downloads remain locked until recovery."
+        )
+    if hasattr(st, "fragment"):
+        st.fragment(run_every="2s")(show_status)()
+    else:
+        show_status()
+    return True
 
 
 def prepare_exploration_state(baseline_key: str) -> str:
@@ -5454,9 +6839,8 @@ class InvestigationProgressView:
             # A self-ticking, local iframe updates every second even while a
             # synchronous Gemma/vLLM HTTP call blocks the Streamlit script.
             # No patient/CSV data is passed into the HTML; no network requests.
-            import streamlit.components.v1 as components
             with self.timer_slot:
-                components.html(live_timer_html(self.started_epoch_ms), height=40)
+                st.iframe(live_timer_html(self.started_epoch_ms), height=40)
             self.round_slot = st.empty()
             self.activity_slot = st.empty()
             st.caption("The progress bar shows workflow phases, not an estimated percentage or time remaining. "
@@ -5469,15 +6853,14 @@ class InvestigationProgressView:
     def _refresh(self) -> None:
         # A local iframe timer continues ticking during long blocking model
         # calls; live status is refreshed whenever the backend emits an event.
-        import streamlit.components.v1 as components
         with self.hero_slot:
-            components.html(render_investigation_phase_banner_html(
+            st.iframe(render_investigation_phase_banner_html(
                 phase=self.tracker.phase,
                 phase_count=self.tracker.phase_count,
                 activity=self.tracker.last_activity,
                 started_epoch_ms=self.started_epoch_ms,
                 verified_rounds=self.tracker.verified_rounds,
-            ), height=170, scrolling=False)
+            ), height=170)
         self.phase_bar.progress(self.tracker.fraction, text=self.tracker.phase_label)
         self.activity_slot.caption("Current activity: " + self.tracker.last_activity)
         self.round_slot.caption(
@@ -5696,6 +7079,17 @@ def gemma_completed_check_title(index: int, run: dict) -> str:
     return f"Check {index}: {title}"
 
 
+def render_exploratory_method(run: dict) -> None:
+    with st.expander("Check method and verification", expanded=False):
+        proposal = run.get("proposal") or {}
+        st.write("**Hypothesis:**", proposal.get("hypothesis") or "Not recorded")
+        st.write("**Method:**", proposal.get("method") or "Not recorded")
+        if proposal.get("assumptions"):
+            st.write("**Assumptions:**", proposal["assumptions"])
+        st.code(str(proposal.get("code") or "# Code not recorded"), language="python")
+        st.json(run.get("verification") or {})
+
+
 def render_exploratory_findings(
     dataset_paths: list[Path], baseline_key: str, audit: dict,
 ) -> None:
@@ -5746,7 +7140,12 @@ def render_exploratory_findings(
             for finding in result.get("findings") or []:
                 st.markdown("**Candidate finding: " + str(finding.get("title", "")) + "**")
                 st.write(finding.get("description", ""))
-                st.caption("How Gemma obtained this result and the supporting source-cell evidence are in Supporting evidence.")
+                refs = finding.get("evidence") or []
+                if refs:
+                    st.dataframe(pd.DataFrame(refs), hide_index=True, width="stretch")
+                else:
+                    st.caption("No individual source-cell references were saved.")
+            render_exploratory_method(run)
     # Completed checks are valuable evidence of what Gemma actually examined,
     # even when they produced no novel issue. Do not label them as findings.
     if checked_runs:
@@ -5761,26 +7160,21 @@ def render_exploratory_findings(
             verification = run.get("verification") or {}
             summary = str(result.get("summary") or "Exploratory check completed").strip()
             with st.expander(f"{gemma_completed_check_title(index, run)} — no additional issue", expanded=False):
-                st.markdown("**Hypothesis examined**")
-                st.write(run.get("proposal", {}).get("hypothesis", "Additional analysis"))
-                st.markdown("**Result**")
+                from healthcare_data_quality.ui.gemma_check_evidence import observed_check_data
+                try:
+                    observed = observed_check_data({"gemma_check_details": run}, dataset_paths[0]) if len(dataset_paths) == 1 else []
+                except (OSError, ValueError, csv.Error, UnicodeError):
+                    observed = []
+                if observed:
+                    st.dataframe(pd.DataFrame(observed), hide_index=True, width="stretch")
                 st.write(summary)
                 removed = verification.get("already_reported_findings_suppressed", 0)
                 if removed:
                     st.caption(f"{removed} already-reported finding(s) were omitted.")
-                st.markdown("**Method and verification (advanced)**")
-                st.write("**Method:**", run.get("proposal", {}).get("method", ""))
-                st.write("**Assumptions:**", run.get("proposal", {}).get("assumptions", ""))
-                st.code(run.get("proposal", {}).get("code", ""), language="python")
-                st.json(verification)
-    if stopped:
-        # Explain the end state once, under the overall investigation status.
-        # A controller retry-limit is NOT evidence that the model found the
-        # dataset clean, and another exploratory run is never required.
-        st.caption("Gemma's exploratory run has ended. Technical stopping details are available in Investigation run status above.")
-    elif len(runs) >= MAX_ROUNDS:
+                render_exploratory_method(run)
+    if not stopped and len(runs) >= MAX_ROUNDS:
         st.caption("The exploratory safety limit was reached. Coverage may be incomplete.")
-    elif not runs and not error:
+    elif not stopped and not runs and not error:
         from healthcare_data_quality.jobs.exploration_jobs import exploration_manager
         live = exploration_manager().snapshot(audit.get("cleaning_recommendation_run_id", ""))
         if live and live["status"] == "running":
@@ -5871,10 +7265,11 @@ def _agent_c_status_counts(recommendation_state: dict | None) -> tuple[int, int,
         if isinstance(entry, dict) and entry.get("status") == "ready"
     }
     pending = st.session_state.get("cleaning_pending_gemma_b") or {}
-    active = sum(
-        1 for fid, meta in pending.items()
-        if fid in ready_ids and isinstance(meta, dict) and meta.get("job_id")
-    )
+    if (recommendation_state or {}).get('sequential'):
+        active_id = recommendation_state.get('active_id')
+        active = int(bool(active_id and (pending.get(active_id) or {}).get('assigned_agent') == 'C'))
+        return max(counts['ready'], active), counts['total'], active
+    active = sum(1 for fid, meta in pending.items() if fid in ready_ids and isinstance(meta, dict) and meta.get('job_id'))
     return counts["ready"], counts["total"], active
 
 
@@ -5891,8 +7286,6 @@ def render_live_investigation_status(
                 # Publish the full result; the next ordinary page render uses it.
                 audit = snapshot_for_update["audit"]
                 st.session_state.audit_result = audit
-        objective_ledger = audit.get("investigation_objectives") or {}
-        status = audit.get("status", "unknown")
         header_problems = any(
             bool(report.get("duplicate_headers") or report.get("blank_header_positions")
                  or report.get("ragged_records"))
@@ -5907,21 +7300,10 @@ def render_live_investigation_status(
             gemma_error=st.session_state.get("exploration_error"),
             exploration_enabled=include_exploration,
         )
-        # Render Agent A, Agent B, and Agent C read-only statuses in the SAME floating host.
-        # A completed investigation remains visible while the once-only Agent B
-        # queue continues; all three cards retain their own live status.
-        from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, job_fingerprint
-        import streamlit.components.v1 as components
         run_id = audit.get("cleaning_recommendation_run_id")
-        recommendation_state = None
-        if isinstance(run_id, str) and run_id:
-            try:
-                recommendation_key = job_fingerprint(cache_key, [], run_id=run_id)
-                recommendation_state = recommendation_manager().snapshot(recommendation_key)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                # Display an honest unavailable/not-scheduled state rather
-                # than block the findings or repeat any model requests.
-                recommendation_state = None
+        recommendation_state = st.session_state.get('cleaning_sequential_status')
+        if (recommendation_state or {}).get('context') != (f'{cache_key}:{run_id}' if run_id else cache_key):
+            recommendation_state = None
         registered = investigation_manager().snapshot(run_id) if run_id else None
         registered_running = bool(registered and registered["status"] == "running")
         if registered_running:
@@ -5952,7 +7334,7 @@ def render_live_investigation_status(
         # B's terminal state is independent of A's exploration: finished B
         # may disappear while A is still running, and reappears if new work
         # joins its recommendation queue.
-        recommendations_complete = recommendation_is_complete(recommendation_state)
+        recommendations_complete = (recommendation_is_complete(recommendation_state) and investigation_complete)
         ready, total, responding = _agent_c_status_counts(recommendation_state)
         show_a = _status_card_auto_visible(
             "investigation", run_identity, finished=investigation_complete,
@@ -5971,7 +7353,7 @@ def render_live_investigation_status(
         def show_status_cards() -> None:
             if show_a:
                 with st.container(key="hdq_investigation_status_card"):
-                    components.html(investigation_html, height=170, scrolling=False)
+                    st.iframe(investigation_html, height=170)
                     if investigation_complete:
                         # The keyed overlay is positioned relative to THIS card,
                         # not the scrolling page or the iframe's content box.
@@ -5984,8 +7366,8 @@ def render_live_investigation_status(
                             )
             if show_b:
                 with st.container(key="hdq_recommendation_status_card"):
-                    components.html(render_recommendation_banner_html(recommendation_state),
-                                    height=151, scrolling=False)
+                    st.iframe(render_recommendation_banner_html(recommendation_state),
+                                    height=151)
                     if recommendations_complete:
                         with st.container(key="hdq_recommendation_close_overlay"):
                             st.button(
@@ -5999,60 +7381,26 @@ def render_live_investigation_status(
             # dismissed; the next conversation animates this third card.
             if show_c:
                 with st.container(key="hdq_agent_c_status_card"):
-                    components.html(
+                    st.iframe(
                         render_agent_c_banner_html(
                             ready_findings=ready, total_findings=total,
                             active_conversations=responding, idle=not bool(ready),
                             assisting_findings=assisting_c,
                         ),
-                        height=151, scrolling=False,
+                        height=151,
                     )
 
-        if banner_slot is not None:
-            with banner_slot.container():
-                show_status_cards()
-        else:
+        with st.container(key="hdq_investigation_banner_live"):
+            # Keep the stylesheet and a direct host marker in this fragment's
+            # own render tree. A fragment refresh must not depend on a style
+            # element emitted by an earlier full-page render.
+            st.html(sticky_banner_css() + '<span class="hdq-status-live-anchor" hidden></span>')
             show_status_cards()
         if not (registered_running or (live and live["status"] == "running")):
             if outcome["state"] == "limited_clear":
                 st.info("**" + outcome["headline"] + "** — " + outcome["details"])
             else:
                 st.warning("**" + outcome["headline"] + "** — " + outcome["details"])
-        # These are THREE distinct lifecycle states. In particular, an
-        # old reviewed solution is never counted as a currently staged edit.
-        current_review_context = (f"{cache_key}:{run_id}" if run_id else cache_key)
-        if st.session_state.get("cleaning_context_key") == current_review_context:
-            staged_events = st.session_state.get("cleaning_history") or []
-            review_statuses = st.session_state.get("cleaning_review_statuses") or {}
-            no_change_reviews = sum(v == "Reviewed — no change" for v in review_statuses.values())
-            clean_summary = (f"{len(staged_events)} approved actions staged in this session"
-                             if staged_events else "No changes staged in this session")
-            if no_change_reviews:
-                clean_summary += f"; {no_change_reviews} no-change reviews"
-        else:
-            clean_summary = "No changes staged in this session"
-        if recommendation_state and (recommendation_state.get("entries") or {}):
-            count_info = recommendation_progress_counts(recommendation_state)
-            rec_summary = f"{count_info['ready']}/{count_info['total']} ready"
-        else:
-            rec_summary = "No matching recommendation status"
-        coverage_summary = ("Running" if registered_running or (live and live["status"] == "running")
-                            else "Incomplete coverage" if outcome["state"] == "partial"
-                            else "Completed checks recorded")
-        st.caption(f"Investigation: {coverage_summary}  ·  "
-                   f"Recommendations: {rec_summary}  ·  Cleaning: {clean_summary}")
-        with st.expander("Investigation run status (advanced)"):
-            st.write("Agent stop reason:", status)
-            st.write("Objective assessment:", objective_ledger.get("completion", "unknown"))
-            stop = st.session_state.get("exploration_stop")
-            if stop:
-                st.write("Gemma exploration stop source:", stop.get("stop_source", "model_decision"))
-                st.write("Why Gemma exploration ended:", stop.get("reason", "No explanation recorded."))
-                if stop.get("remaining_questions"):
-                    st.write("Remaining questions:", stop["remaining_questions"])
-            elif include_exploration:
-                st.write("Gemma exploration:", "In progress" if live and live["status"] == "running"
-                         else "No final stopping decision is available.")
         if audit.get("proposal_generation_error"):
             st.error("Gemma could not complete proposal generation; see the downloaded audit for details.")
 
@@ -6063,14 +7411,13 @@ def render_pre_investigation_status(banner_slot, *, state: str = "ready") -> Non
     This renders only local HTML; no model is called and no stale saved
     conversation is shown as if it belonged to the uploaded dataset.
     """
-    import streamlit.components.v1 as components
     with banner_slot.container():
-        components.html(render_idle_investigation_banner_html(state=state),
-                        height=170, scrolling=False)
-        components.html(render_recommendation_banner_html(None, idle=True),
-                        height=151, scrolling=False)
-        components.html(render_agent_c_banner_html(idle=True),
-                        height=151, scrolling=False)
+        st.iframe(render_idle_investigation_banner_html(state=state),
+                        height=170)
+        st.iframe(render_recommendation_banner_html(None, idle=True),
+                        height=151)
+        st.iframe(render_agent_c_banner_html(idle=True),
+                        height=151)
 
 
 def _toggle_full_dataset_preview(state_key: str) -> None:
@@ -6144,21 +7491,25 @@ def render_full_dataset_section(
     return True
 
 
-def _poll_agent_c_completion() -> None:
+def _poll_agent_c_completion() -> bool | None:
     """Auto-deliver an Agent C answer without periodically remounting its form.
 
-    Agent A/B status is updated by its own fragment. This poller does not
-    perform Gemma inference or apply a cleaning operation. An app rerun occurs
-    only once, when a submitted Agent C job actually finishes; the active tab
-    is preserved by the stateful tab key on supported Streamlit releases.
+    Collect outcomes only; the owning review fragment renders them in the
+    same pass. No full-app or cross-fragment rerun is requested here.
     """
     from healthcare_data_quality.jobs.interactive_chat_jobs import interactive_chat_manager
 
     pending = st.session_state.get("cleaning_pending_gemma_b") or {}
     ready = st.session_state.setdefault("cleaning_completed_gemma", {})
-    if not pending:
+    retired = st.session_state.setdefault('cleaning_retired_chat_jobs', set())
+    if not pending and not retired:
         return
     manager = interactive_chat_manager()
+    for job_id in list(retired):
+        if manager.take(job_id).get('status') != 'running':
+            retired.discard(job_id)
+    if not pending:
+        return
     notified = st.session_state.setdefault("cleaning_agent_c_completion_notified", set())
     newly_ready = False
     for fid, info in list(pending.items()):
@@ -6174,37 +7525,19 @@ def _poll_agent_c_completion() -> None:
             if fid not in notified:
                 notified.add(fid)
                 newly_ready = True
-    # One full refresh per finished request, not every 3 seconds while its
-    # result awaits the owning review fragment. Repeated app reruns were
-    # remounting chat inputs and making the whole page flash/dim.
-    if newly_ready:
-        st.rerun()
+    return newly_ready
 
 
 def _agent_b_first_suggestion_ready(audit: dict, context_key: str) -> bool:
-    """Only a fresh model-generated recommendation from THIS run unlocks Agent C.
-
-    Historical review-memory markers, pending and failed queue records are not
-    valid suggestions. Agent A can continue exploring while C is unlocked.
-    """
-    from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, job_fingerprint
-
-    run_id = audit.get("cleaning_recommendation_run_id")
-    if not isinstance(run_id, str) or not run_id:
-        return False
-    try:
-        key = job_fingerprint(context_key, [], run_id=run_id)
-        snapshot = recommendation_manager().snapshot(key) or {}
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-        return False
-    return any(isinstance(entry, dict) and entry.get("status") == "ready"
-               and entry.get("origin") != "review_memory"
-               and bool(entry.get("suggestion"))
-               for entry in (snapshot.get("entries") or {}).values())
+    """Read actual sequential publication, not the historical background queue."""
+    snap = st.session_state.get('cleaning_sequential_status') or {}
+    run_id = audit.get('cleaning_recommendation_run_id')
+    expected = f'{context_key}:{run_id}' if run_id else context_key
+    return snap.get('context') == expected and any(e.get('status') == 'ready' for e in snap.get('entries', {}).values())
 
 
 
-_RESULTS_PAGES = frozenset({"clean", "memory", "findings", "evidence"})
+_RESULTS_PAGES = frozenset({"clean", "memory", "findings"})
 
 
 def _resolve_results_page(context: str, suggestions_ready: bool) -> str:
@@ -6213,6 +7546,8 @@ def _resolve_results_page(context: str, suggestions_ready: bool) -> str:
         st.session_state["hdq_results_nav_context"] = context
         st.session_state["hdq_results_nav_page"] = "clean"
     page = st.session_state.get("hdq_results_nav_page")
+    if page == "evidence":  # Migrate sessions from the former separate page.
+        page = "findings"
     if page not in _RESULTS_PAGES:
         page = "clean"
     st.session_state["hdq_results_nav_page"] = page
@@ -6222,6 +7557,8 @@ def _resolve_results_page(context: str, suggestions_ready: bool) -> str:
 
 def _select_results_page(page: str) -> None:
     """Switch views only after validating a requested route."""
+    if page == "evidence":
+        page = "findings"
     if page not in _RESULTS_PAGES:
         return
     st.session_state["hdq_results_nav_page"] = page
@@ -6232,8 +7569,7 @@ def _render_results_navigation(page: str, suggestions_ready: bool) -> None:
     st.markdown("""
     <style>
     /* Keep secondary navigation compact without altering the approval buttons. */
-    .st-key-hdq_results_nav_findings button,
-    .st-key-hdq_results_nav_evidence button {
+    .st-key-hdq_results_nav_findings button {
         font-size: 0.80rem !important;
         padding: 0.35rem 0.45rem !important;
         min-height: 2.3rem !important;
@@ -6242,14 +7578,10 @@ def _render_results_navigation(page: str, suggestions_ready: bool) -> None:
         font-weight: 800 !important;
         min-height: 3.6rem !important;
         font-size: 1.08rem !important;
-        background-color: #15803d !important;
-        border-color: #15803d !important;
-        color: #ffffff !important;
     }
     .st-key-hdq_results_nav_clean button:disabled {opacity: .55 !important;}
     .st-key-hdq_results_nav_memory button,
-    .st-key-hdq_results_nav_findings button,
-    .st-key-hdq_results_nav_evidence button {
+    .st-key-hdq_results_nav_findings button {
         font-size: .73rem !important;
         min-height: 2.1rem !important;
         padding: .26rem .35rem !important;
@@ -6257,21 +7589,20 @@ def _render_results_navigation(page: str, suggestions_ready: bool) -> None:
     </style>
     """, unsafe_allow_html=True)
     # A visible gap separates the main task from quiet, optional references.
-    clean_col, gap_col, memory_col, findings_col, evidence_col = st.columns(
-        [5.2, .65, 1.25, 1.15, 1.15], gap="small"
+    clean_col, gap_col, memory_col, findings_col = st.columns(
+        [5.2, .65, 1.25, 1.5], gap="small"
     )
     nav = (
         (clean_col, "clean", "Clean data with LM model"),
         (memory_col, "memory", "Manage skills & memory"),
         (findings_col, "findings", "Data quality findings"),
-        (evidence_col, "evidence", "Supporting evidence"),
     )
     for col, route, label in nav:
         with col:
             st.button(
                 label,
                 key=f"hdq_results_nav_{route}",
-                type="primary" if route == "clean" else "secondary",
+                type="secondary",
                 disabled=False,
                 use_container_width=True,
                 on_click=_select_results_page,
@@ -6387,6 +7718,14 @@ def render_ui() -> None:
         help="One local CSV file (maximum 20 MiB) per investigation.",
     )
     uploaded = [uploaded_file] if uploaded_file is not None else []
+    if uploaded:
+        st.markdown("""<style>
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] button,
+        [data-testid="stFileUploader"] button[aria-label="Browse files"],
+        [data-testid="stFileUploader"] button[aria-label="Add files"],
+        [data-testid="stFileUploader"] button[aria-label="Add file"],
+        [data-testid="stFileUploader"] button[title="Add files"] {display:none !important;}
+        </style>""", unsafe_allow_html=True)
     if not uploaded:
         render_pre_investigation_status(live_banner_slot, state="no_dataset")
         st.info("Upload a CSV dataset to inspect its structure and start the investigation.")
@@ -6418,7 +7757,9 @@ def render_ui() -> None:
             entered_reviewer = st.text_input(
                 "Reviewer identifier", max_chars=120,
                 key=f"hdq_reviewer_name_{fingerprint[:16]}",
-                help="Required before investigation. This name will authorize all future approved edits.",
+                help=("Required before investigation. Starting runs local QC and Gemma-generated "
+                      "read-only Python in the no-network sandbox. Use authorized data only. "
+                      "This name identifies the reviewer for future approved edits."),
             )
             start_with_reviewer = st.form_submit_button(
                 "Start investigation", type="primary",
@@ -6457,22 +7798,14 @@ def render_ui() -> None:
 
     if not render_full_dataset_section(paths, uploaded, header_reports, fingerprint):
         return
-    st.divider()
-    st.subheader("Investigate data quality")
-    st.caption("Investigations run locally and do not change your uploaded CSV files.")
-    st.caption("A full run also automatically executes generated read-only Python in a no-network sandbox, without per-hypothesis approval. Use only with authorized data.")
 
     # Check the on-disk cache *before* offering another Gemma run. The key
     # includes all CSV bytes, their order, and the current analysis signature.
     cache_key = investigation_cache_key(uploaded)
     prepare_exploration_state(cache_key)
-    include_exploration = st.checkbox(
-        "Include Gemma's automatic exploratory analyses (isolated read-only Python)",
-        value=True, key="enable_unified_exploration",
-        help=("The full-run button explicitly authorizes Gemma-generated standard-library "
-              "analysis code to execute in the no-network Bubblewrap sandbox, with up to "
-              f"{MAX_ROUNDS} verified investigations. It cannot clean or modify CSV files."),
-    )
+    # The unified investigation always includes Gemma's read-only exploration.
+    # No separate switch or duplicate status dashboard is rendered.
+    include_exploration = True
     if include_exploration and not sandbox_available():
         st.warning("Bubblewrap (`bwrap`) is not available; baseline QC can run, but "
                    "automatic generated-code investigation will be skipped.")
@@ -6496,7 +7829,12 @@ def render_ui() -> None:
     run_requested = first_run_for_registered_reviewer
     selected_run = None
 
-    if previous_runs:
+    active_investigation = (st.session_state.get('registered_investigation_context') == (cache_key, fingerprint)
+                            and bool(st.session_state.get('registered_investigation_run_id')))
+    if active_investigation or current_matches:
+        # Once investigation is selected, no repeated previous-results action row.
+        pass
+    elif previous_runs:
         selected_run = previous_runs[0]
         st.info(
             f"Found {len(previous_runs)} saved investigation(s) with matching dataset "
@@ -6530,18 +7868,14 @@ def render_ui() -> None:
             run_requested = st.button(
                 "Run full investigation again", key="rerun_audit"
             )
-    elif current_matches:
-        st.info("An investigation is already available in this browser session.")
-        load_column, rerun_column, manager_column = st.columns([1, 1.15, 1])
-        with rerun_column:
-            run_requested = st.button("Run full investigation again", key="rerun_audit")
     else:
         st.caption("No matching saved investigation was found for this dataset and analysis version.")
         load_column, rerun_column, manager_column = st.columns([1, 1.15, 1])
         with rerun_column:
             run_requested = st.button("Run full investigation", type="primary")
-    with manager_column:
-        render_saved_file_manager(cache_key)
+    if not (active_investigation or current_matches):
+        with manager_column:
+            render_saved_file_manager(cache_key)
     # An active investigation is idempotent: refuse a second run until this
     # run reaches a terminal status, even if a button rerun slips through.
     current_run_id = st.session_state.get("registered_investigation_run_id")
@@ -6612,10 +7946,12 @@ def render_ui() -> None:
 
         def run_background(*args, **kwargs):
             with model_request_priority("investigation"):
-                return run_initial_audit(*args, **kwargs)
+                with model_reconnect_mode():
+                    return run_initial_audit(*args, **kwargs)
 
         investigation_manager().start(run_id, paths, runner=run_background,
                                       on_baseline=on_baseline, on_finished=on_finished)
+        st.rerun()
 
     # A worker-owned snapshot is read on the UI thread. The first available
     # baseline reveals the results navigation; the full audit replaces it later.
@@ -6624,6 +7960,12 @@ def render_ui() -> None:
     if (registered_run and
             st.session_state.get("registered_investigation_context") == (cache_key, fingerprint)):
         registered_state = investigation_manager().snapshot(registered_run)
+    # Before rendering findings/review/downloads, lock them while the model
+    # worker is reconnecting. Transient HTTP errors are NOT terminal runs.
+    # This also works before the first deterministic QC snapshot arrives.
+    if not st.session_state.get("audit_result") and render_model_reconnect_gate(registered_state):
+        return
+
     if registered_state:
         best_audit = registered_state.get("audit") or registered_state.get("partial_audit")
         current_snapshot = st.session_state.get("audit_result")
@@ -6650,30 +7992,29 @@ def render_ui() -> None:
             or st.session_state.get("audit_cache_key") != cache_key
             or st.session_state.get("audit_fingerprint") != fingerprint):
         if registered_state and registered_state["status"] == "running":
-            import streamlit.components.v1 as components
             from datetime import datetime
             with live_banner_slot.container():
-                components.html(render_investigation_phase_banner_html(
+                st.iframe(render_investigation_phase_banner_html(
                     phase=registered_state["phase"],
                     phase_count=3 if include_exploration else 2,
                     activity=registered_state["activity"],
                     started_epoch_ms=int(datetime.fromisoformat(
                         registered_state["started_at"]).timestamp() * 1000),
-                ), height=170, scrolling=False)
+                ), height=170)
                 from healthcare_data_quality.jobs.cleaning_jobs import recommendation_manager, job_fingerprint
                 snapshot = recommendation_manager().snapshot(job_fingerprint(
                     cache_key, [], run_id=registered_run))
-                components.html(render_recommendation_banner_html(snapshot, idle=not bool(snapshot)),
-                                height=151, scrolling=False)
+                st.iframe(render_recommendation_banner_html(snapshot, idle=not bool(snapshot)),
+                                height=151)
                 ready, total, responding = _agent_c_status_counts(snapshot)
-                components.html(render_agent_c_banner_html(
+                st.iframe(render_agent_c_banner_html(
                     ready_findings=ready, total_findings=total,
                     active_conversations=responding, idle=not bool(ready),
                     assisting_findings=sum(
                         1 for entry in (snapshot or {}).get("entries", {}).values()
                         if isinstance(entry, dict) and entry.get("status") == "running"
                         and entry.get("worker_role") == "agent_c_idle_assist"),
-                ), height=151, scrolling=False)
+                ), height=151)
             st.info("Agent A is investigating. QC findings and Agent C will become available as soon as verified results and Agent B advice arrive.")
             if hasattr(st, "fragment"):
                 @st.fragment(run_every="3s")
@@ -6702,10 +8043,10 @@ def render_ui() -> None:
     # Its Streamlit key must not be mounted twice; refreshing fragments update
     # the existing slot without changing the viewport-following CSS.
     if hasattr(st, "fragment"):
-        live_status = st.fragment(run_every="2s")(render_live_investigation_status)
-        live_status(audit, cache_key, header_reports, include_exploration, live_banner_slot)
+        live_status = st.fragment(run_every="5s", key="hdq_agent_status")(render_live_investigation_status)
+        live_status(audit, cache_key, header_reports, include_exploration)
     else:
-        render_live_investigation_status(audit, cache_key, header_reports, include_exploration, live_banner_slot)
+        render_live_investigation_status(audit, cache_key, header_reports, include_exploration)
 
     # Cleaning is the primary workflow. Unlike st.tabs (which renders and
     # permits entry into every panel), these routes do not render inactive
@@ -6720,83 +8061,53 @@ def render_ui() -> None:
     active_page = _resolve_results_page(nav_context, suggestions_ready)
     _render_results_navigation(active_page, suggestions_ready)
 
-    if not suggestions_ready:
-        def _unlock_results_when_suggestion_ready():
-            # The only full-page refresh needed for the lock: one transition
-            # from no suggestions to the first ready, verified Agent B entry.
-            current = st.session_state.get("audit_result") or audit
-            if _agent_b_first_suggestion_ready(current, cache_key):
-                st.rerun()
-        if hasattr(st, "fragment"):
-            st.fragment(run_every="3s")(_unlock_results_when_suggestion_ready)()
-
     if active_page == "waiting":
         # HDQ_AGENT_B_JOGGER_V1
         from healthcare_data_quality.ui.running_indicator import show_waiting_runner
         show_waiting_runner(st, "Waiting for Agent B's first verified suggestion. Cleaning will open automatically when it is ready.")
     elif active_page == "findings":
-        for dataset_id, baseline in (audit.get("dataset_baselines") or {"dataset_1": audit.get("baseline") or {}}).items():
-            label_index = int(dataset_id.rsplit("_", 1)[-1]) - 1
-            dataset_name = uploaded[label_index].name if label_index < len(uploaded) else dataset_id
-            st.subheader(f"Dataset {label_index + 1}: {dataset_name}")
-            displayed_findings = render_baseline(dataset_id, baseline, source_path=paths[label_index])
-            render_header_findings(paths[label_index], header_reports[label_index],
-                                   start_index=displayed_findings + 1)
+        render_combined_findings(audit, paths, [file.name for file in uploaded], header_reports)
         if len(uploaded) > 1:
             st.warning("Full cross-dataset identifier reconciliation is not yet implemented as an investigation tool.")
-        # No separate exploratory page: render novel, verified Gemma findings
-        # alongside deterministic findings in the same results tab.
         st.divider()
-        if hasattr(st, "fragment"):
-            def refresh_explorations():
-                sync_live_exploration(audit, cache_key)
-                render_exploratory_findings(paths, cache_key, audit)
-            st.fragment(run_every="3s")(refresh_explorations)()
-        else:
-            sync_live_exploration(audit, cache_key)
-            render_exploratory_findings(paths, cache_key, audit)
-    elif active_page == "evidence":
-        def refresh_evidence():
-            sync_live_exploration(audit, cache_key)
-            render_finding_evidence(
-                audit, paths, [file.name for file in uploaded], header_reports,
-                st.session_state.get("exploration_runs") or [],
-            )
-        if hasattr(st, "fragment"):
-            st.fragment(run_every="3s")(refresh_evidence)()
-        else:
-            refresh_evidence()
-        def refresh_export():
-            live = sync_live_exploration(audit, cache_key)
+        def refresh_explorations():
+            current = st.session_state.get("audit_result") or audit
+            live = sync_live_exploration(current, cache_key)
+            render_exploratory_findings(paths, cache_key, current)
             unfinished = bool(live and live["status"] == "running")
             st.download_button(
                 "Download partial audit JSON" if unfinished else
-                "Download complete audit JSON (may contain confidential data)",
-                data=json.dumps(combined_audit_export(audit, cache_key), ensure_ascii=False, indent=2, default=str),
+                "Download audit JSON (may contain confidential data)",
+                data=json.dumps(combined_audit_export(current, cache_key), ensure_ascii=False, indent=2, default=str),
                 file_name=("healthcare_data_quality_partial_investigation.json" if unfinished
                            else "healthcare_data_quality_combined_investigation.json"),
                 mime="application/json",
             )
             if unfinished:
-                st.caption("This is a partial snapshot. Gemma exploratory work is still running.")
+                st.caption("Partial snapshot: Gemma exploration is still running.")
+            st.caption("Store downloaded audits securely; they may contain source observations and identifiers.")
         if hasattr(st, "fragment"):
-            st.fragment(run_every="3s")(refresh_export)()
+            st.fragment(run_every="3s")(refresh_explorations)()
         else:
-            refresh_export()
-        st.caption("Keep downloaded audits in approved secure storage. They may contain sample identifiers and detailed source observations.")
+            refresh_explorations()
     elif active_page == "memory":
         render_skills_memory_page()
     elif active_page == "clean":
         def refresh_cleaning():
-            # Render the editable review only when it is selected and unlocked.
-            # Background Agent B polling must not remount the review controls.
+            # One owner for the entire review tree and its completion polling.
+            # Stable widget keys retain the review state; no sibling poller can
+            # invalidate this fragment while it is handling a user interaction.
+            _flush_declined_review_tree()
+            if model_connection_snapshot()["offline"]:
+                st.warning("Gemma server unavailable — waiting for recovery. "
+                           "Your review and approved changes are retained.")
+            _poll_agent_c_completion()
             current = st.session_state.get("audit_result") or audit
             sync_live_exploration(current, cache_key)
             render_cleaning_workspace(paths, uploaded, current, cache_key)
 
         if hasattr(st, "fragment"):
-            st.fragment(refresh_cleaning)()
-            st.fragment(run_every="3s")(_poll_agent_c_completion)()
+            st.fragment(run_every="5s", key="hdq_cleaning_review")(refresh_cleaning)()
         else:
             refresh_cleaning()
 

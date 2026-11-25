@@ -134,7 +134,7 @@ def test_fresh_run_context_isolated_from_previous_session(monkeypatch, tmp_path)
     assert st.session_state.cleaning_recovery_dismissed is True
 
 
-def test_existing_run_can_start_missing_agent_b_job_without_rerunning_agent_a(
+def test_existing_run_automatically_restores_missing_agent_b_job_without_rerunning_agent_a(
     monkeypatch, tmp_path,
 ):
     st = AuditUI()
@@ -154,8 +154,8 @@ def test_existing_run_can_start_missing_agent_b_job_without_rerunning_agent_a(
 
     monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager", lambda: LostJob())
     run_id = "already-finished-run"
-    st.buttons_on.add(f"cleaning_start_missing_agent_b_same-csv-key:{run_id}")
-    with pytest.raises(StopIteration, match="streamlit rerun"):
+    # No click: a missing queue is restored once for the existing run.
+    for _ in range(2):
         app.render_cleaning_workspace(
             [path], [SimpleNamespace(name=path.name)],
             {"cleaning_recommendation_run_id": run_id}, "same-csv-key", [],

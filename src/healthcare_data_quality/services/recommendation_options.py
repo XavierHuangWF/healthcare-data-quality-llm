@@ -27,6 +27,16 @@ def _rows(source: Path) -> list[list[str]]:
     return result
 
 
+def _named_blank_positions(finding: dict, rows: list[list[str]]) -> list[int]:
+    details = finding.get('gemma_check_details') or {}
+    proposal = details.get('proposal') or {}
+    text = ' '.join(str(x or '') for x in (proposal.get('hypothesis'), proposal.get('method'), finding.get('title'), finding.get('method')))
+    if not re.search(r'\b(?:blank|negative.control)\b', text, re.I):
+        return []
+    return [i for i,h in enumerate(rows[0],1) if i>1 and 'blank' in h.casefold()
+            and re.search(r'(?<![\w])'+re.escape(h)+r'(?![\w])',text,re.I)]
+
+
 def _verified(operations: list[dict], rows: list[list[str]], finding: dict) -> list[dict] | None:
     """No hallucinated coordinates, stale before values, or source-independent edits."""
     if not isinstance(operations, list) or not 1 <= len(operations) <= 16:
@@ -65,9 +75,14 @@ def _verified(operations: list[dict], rows: list[list[str]], finding: dict) -> l
                 pos = int(value)
                 if 2 <= pos <= len(rows) and rows[pos - 1][0] == label:
                     duplicate_groups[pos] = label
+    missing_rows = _source_verified_missing_rows(finding, rows)
+    if missing_rows:
+        allowed_rows.update(missing_rows)
+        allowed_cells.update((r,c) for r in missing_rows for c in range(2,len(rows[0])+1)
+                             if not rows[r-1][c-1].strip())
     allowed_cols = {v for e in evidence for v in (e.get('Column'), e.get('Column A'), e.get('Column B'))}
     if finding.get('check_key') == 'gemma_check':
-        allowed_cols.update(i for i, h in enumerate(rows[0], 1) if 'blank' in h.casefold())
+        allowed_cols.update(_named_blank_positions(finding, rows))
     for operation in operations:
         if not isinstance(operation, dict) or operation.get('operation') not in OPERATIONS:
             return None
@@ -250,7 +265,8 @@ def _source_verified_missing_rows(finding: dict, rows: list[list[str]]) -> list[
     evidence = finding.get('evidence') or []
     if not isinstance(evidence, list) or not evidence:
         return []
-    count = finding.get('total_evidence_records', len(evidence))
+    declared = re.match(r'^\s*(\d+)\s+cells?\s+contain\s+missing values', str(finding.get('title') or ''), re.I)
+    count = finding.get('total_evidence_records', int(declared.group(1)) if declared else len(evidence))
     if type(count) is not int or count < len(evidence) or count <= 0:
         return []
     source_missing = {(r, c) for r, values in enumerate(rows[1:], 2)
@@ -293,6 +309,44 @@ def _missing_row_choice(finding: dict, rows: list[list[str]]) -> dict | None:
         'impact': (f'Deletes all values in {len(row_ids)} entire CSV rows, not just '
                    'the empty cells. Other measurements in those rows are lost.'),
         'derived_from_source': True,
+    }
+
+
+
+
+def _fractional_na_reviewer_choice(finding: dict, rows: list[list[str]]) -> dict | None:
+    """A conservative human-*selectable* fallback if Gemma emits only prose.
+
+    All anomalous values must be exactly evidenced fractional source counts;
+    never guess a decimal shift, rounding rule, cell, or absent observation.
+    Marking NA is a potentially lossy option, NOT a scientific conclusion.
+    """
+    if (finding.get('check_key') != 'find_invalid_counts'
+            or not re.search(r'\bfractional\b', str(finding.get('title') or ''), re.I)):
+        return None
+    changes = _replacements_from_evidence(finding, rows, 'NA')
+    if not changes:
+        return None
+    for change in changes:
+        try:
+            value = Decimal(change['before'])
+        except (InvalidOperation, TypeError):
+            return None
+        if not value.is_finite() or value == value.to_integral_value():
+            return None
+    verified = _verified([{'operation': 'replace_cells', 'changes': changes}], rows, finding)
+    if not verified:
+        return None
+    return {
+        'label': f'Mark {len(changes)} fractional count(s) as NA',
+        'operations': verified, 'rows': _display(verified),
+        'derived_from_source': True,
+        'impact': ('This deliberately removes the affected numeric measurements. '
+                   'It does not reconstruct integer counts or establish that a '
+                   'decimal-place correction is appropriate. Compare the same '
+                   'columns or discuss an alternative before choosing.'),
+        'provenance': ('Reviewer option derived from every evidenced source cell; '
+                       'not a model-inferred true count.'),
     }
 
 
@@ -404,7 +458,7 @@ def _matching_approved_memory_choice(finding: dict, source: Path,
 
 def source_backed_choices(finding: dict, source: Path | None,
                           suggestion: dict) -> list[dict]:
-    """Select 1–3 model-proposed controls only when exact CSV proof is available.
+    """Select up to five model-proposed controls only when exact CSV proof is available.
 
     The fallback can ground simple textual replacements. A model's unverified
     title or label is never itself proof that a proposed edit is safe.
@@ -420,8 +474,7 @@ def source_backed_choices(finding: dict, source: Path | None,
     # columns should be removed. Gemma assesses BOTH the preserve choice and
     # an optional whole-column deletion before any Yes button is rendered.
     if finding.get('check_key') == 'gemma_check':
-        controls = [i for i, header in enumerate(rows[0], 1)
-                    if i > 1 and 'blank' in header.casefold()]
+        controls = _named_blank_positions(finding, rows)
         if controls:
             keep = {'label': 'Keep negative-control columns unchanged',
                     'decision': 'no_change', 'operations': [],
@@ -438,6 +491,21 @@ def source_backed_choices(finding: dict, source: Path | None,
                                'impact': ('Optional structural deletion; retained negative controls '
                                           'can be important for contamination assessment.') }]
             return [keep]
+        # A reproduced exploratory check with no candidates can have a genuine
+        # final review decision without inventing a cleaning operation. This is
+        # an exact no-edit option, not an assertion that the dataset is clean.
+        details = finding.get('gemma_check_details') or {}
+        result = details.get('result') or {}
+        verification = details.get('verification') or {}
+        if (finding.get('actionable') is False and not finding.get('evidence')
+                and result.get('findings') == []
+                and verification.get('status') == 'source_cells_verified_and_output_reproduced'):
+            return [{'label': 'Keep data unchanged for this check',
+                     'decision': 'no_change', 'operations': [],
+                     'rows': [{'Location': 'Reproduced exploratory check',
+                               'Before': 'No additional candidate findings reported',
+                               'After': 'Keep data unchanged'}],
+                     'impact': 'No new edit; not a certification of full dataset coverage.'}]
     # A taxonomy-separator finding is also a naming-convention finding if the
     # same row uses minority rank prefixes. Show the *combined* verified repair
     # first, not an incomplete separator-only answer from the model.
@@ -465,7 +533,7 @@ def source_backed_choices(finding: dict, source: Path | None,
     candidates = suggestion.get('choices') or []
     if not isinstance(candidates, list):
         candidates = []
-    for candidate in candidates[:3]:
+    for candidate in candidates[:5]:
         if not isinstance(candidate, dict):
             continue
         label = ' '.join(str(candidate.get('label') or '').split())[:90]
@@ -486,6 +554,55 @@ def source_backed_choices(finding: dict, source: Path | None,
         if grounded:
             output.append({'label': label, 'operations': grounded,
                            'rows': _display(grounded)})
+    # Derive conservative complete options from the original finding; the same
+    # Gemma assessment and independent approval gates apply as for model JSON.
+    extra = []
+    if finding.get('check_key') == 'find_invalid_counts' and 'missing values' in str(finding.get('title') or '').casefold():
+        missing_rows_verified = _source_verified_missing_rows(finding, rows)
+        if missing_rows_verified:
+            changes = [{'row': r, 'column': c, 'before': rows[r-1][c-1], 'after': 'NA'}
+                       for r in missing_rows_verified for c in range(2, len(rows[0])+1)
+                       if not rows[r-1][c-1].strip()]
+            extra.append(('Mark '+str(len(changes))+' missing cells as NA', changes))
+            # A model sometimes enumerates only sampled missing cells, even
+            # though the finding declares a complete source-verified scope.
+            # The complete NA alternative replaces that redundant partial
+            # suggestion. Historical exact choices are added separately below.
+            full = {(c['row'], c['column']) for c in changes}
+            def sampled_na(option):
+                operations = option.get('operations') or []
+                if len(operations) != 1 or operations[0].get('operation') != 'replace_cells':
+                    return False
+                subset = operations[0].get('changes') or []
+                return bool(subset and all(str(c.get('before', '')).strip() == '' and
+                    str(c.get('after', '')).upper() == 'NA' for c in subset) and
+                    {(c['row'], c['column']) for c in subset} < full)
+            output = [option for option in output if not sampled_na(option)]
+    if finding.get('check_key') in {'find_invalid_counts', 'find_negative_counts'} and 'negative' in str(finding.get('title') or '').casefold():
+        from decimal import Decimal, InvalidOperation
+        changes = []
+        for e in finding.get('evidence') or []:
+            r,c = e.get('CSV row'), e.get('Column')
+            if type(r) is not int or type(c) is not int or not 2<=r<=len(rows) or not 2<=c<=len(rows[0]):
+                changes=[]; break
+            before=rows[r-1][c-1]
+            try:
+                val=Decimal(before)
+                if not val.is_finite() or val>=0: raise InvalidOperation
+            except InvalidOperation:
+                changes=[]; break
+            changes.append({'row':r,'column':c,'before':before,'after':format(abs(val),'f')})
+        if changes and len(changes)==finding.get('total_evidence_records',len(finding.get('evidence') or [])):
+            extra.append(('Use absolute values for '+str(len(changes))+' negative counts',changes))
+            extra.append(('Mark '+str(len(changes))+' negative counts as NA',
+                          [{**c, 'after':'NA'} for c in changes]))
+    pads = _taxonomy_na_padding(finding, rows, 'pad missing taxonomy ranks with NA')
+    if pads:
+        extra.append(('Pad to 7 levels with NA',pads))
+    for label, changes in extra:
+        verified = _verified([{'operation':'replace_cells','changes':changes}], rows, finding)
+        if verified and not any(x.get('operations') == verified for x in output):
+            output.insert(0, {'label':label, 'operations':verified, 'rows':_display(verified)})
     missing_rows = _missing_row_choice(finding, rows)
     if missing_rows:
         # The recommendation may only list fill approaches despite a suitable
@@ -509,9 +626,9 @@ def source_backed_choices(finding: dict, source: Path | None,
                 missing_rows['memory_note'] = (
                     'Relevant prior approved row-deletion method considered; '
                     'current row targets independently verified.')
-                output = [missing_rows] + output[:2]
+                output = [missing_rows] + output
             else:
-                output = output[:2] + [missing_rows]
+                output = output + [missing_rows]
     # Memory must be visible in the OPTIONS, not merely in a prose assessment.
     # Reserve one slot for the same verified original/source prior decision.
     remembered = _matching_approved_memory_choice(finding, Path(source), rows, suggestion)
@@ -519,14 +636,42 @@ def source_backed_choices(finding: dict, source: Path | None,
         signature = json.dumps(remembered['operations'], sort_keys=True)
         if not any(json.dumps(option.get('operations') or [], sort_keys=True) == signature
                    for option in output):
-            output = [remembered, *output[:2]]
+            output = [remembered, *output]
         else:
             for option in output:
                 if json.dumps(option.get('operations') or [], sort_keys=True) == signature:
                     option['memory_note'] = remembered['memory_note']
-    output = output[:3]
+    # A remembered approval and the current Gemma proposal may disagree.
+    # Memory ranks the prior action; it must not silently suppress a fully
+    # verified alternative the named researcher might deliberately select.
+    # In particular, preserve both 0.2 → 2 / 0.5 → 5 from an earlier human
+    # decision and 0.2 → NA / 0.5 → NA proposed for the same immutable cells.
+    if finding.get('check_key') == 'find_invalid_counts':
+        advice = str(suggestion.get('suggestion') or '')
+        pairs = _ROW_COL.findall(advice)
+        alternative = None
+        if pairs and all(after.strip().upper() == 'NA' for _, _, _, after in pairs):
+            changes = [{'row': int(r), 'column': int(c), 'before': old, 'after': 'NA'}
+                       for r, c, old, after in pairs]
+            verified_na = _verified([{'operation': 'replace_cells',
+                                     'changes': changes}], rows, finding)
+            if verified_na and not ('missing values' in str(finding.get('title') or '').casefold()
+                                    and _source_verified_missing_rows(finding, rows)):
+                alternative = {
+                    'label': f'Mark {len(changes)} evidenced cell(s) as NA',
+                    'operations': verified_na, 'rows': _display(verified_na),
+                    'explicit_model_alternative': True,
+                    'impact': ('Sets the exact displayed measurements to missing. '
+                               'This does NOT reconstruct or verify raw integer counts.'),
+                    'provenance': 'Current Gemma proposal; original source coordinates reverified.',
+                }
+        if alternative and not any(
+                json.dumps(x.get('operations') or [], sort_keys=True) ==
+                json.dumps(alternative['operations'], sort_keys=True) for x in output):
+            output.append(alternative)
     if output:
-        return output
+        from healthcare_data_quality.ui.human_choice_replay import rank_choices
+        return rank_choices(finding, source, output)
 
     # A same-taxon row merger is supported by the application's validated
     # row-operation path. Ground the two exact rows from THIS finding instead
@@ -580,4 +725,6 @@ def source_backed_choices(finding: dict, source: Path | None,
                 if checked:
                     return [{'label': 'Use suggested replacement', 'operations': checked,
                              'rows': _display(checked)}]
+    # A fractional measurement must not be erased merely to create a button.
+    # The shared candidate pipeline offers a non-destructive annotation instead.
     return []

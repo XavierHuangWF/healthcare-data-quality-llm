@@ -90,8 +90,8 @@ def test_parent_owns_all_finding_controls_and_single_poller_has_no_buttons():
         'def _render_live_agent_b_finding(', 1)[0]
     assert 'st.button(' not in refresher
     assert 'st.dataframe(' not in refresher
-    assert 'cleaning_discussion_mode_by_finding' in refresher
-    assert 'st.rerun(scope="app")' in refresher
+    assert 'st.rerun(' not in refresher
+    assert 'st.fragment(run_every="3s")(refresh_cleaning)()' in code
 
 
 def test_rendered_button_sets_are_isolated_per_finding(monkeypatch):
@@ -120,10 +120,17 @@ def test_rendered_button_sets_are_isolated_per_finding(monkeypatch):
     st.session_state.cleaning_history = []
     st.session_state.cleaning_review_statuses = {}
 
+    from healthcare_data_quality.services.recommendation_options import source_backed_choices
+    from healthcare_data_quality.ui.finding_choice_integrity import scoped_review_choices
+    from healthcare_data_quality.services.model_plan_review import option_fingerprint
+    for finding in (duplicate, taxonomy):
+        suggestion = st.session_state.cleaning_recommendations[finding['id']]
+        options = scoped_review_choices(finding, SOURCE, source_backed_choices(finding, SOURCE, suggestion))
+        suggestion['gemma_option_reviews'] = [{'fingerprint': option_fingerprint(finding,SOURCE,option), 'can_offer': True, 'reason': 'Gemma verified exact scope'} for option in options]
     app._render_live_agent_b_finding(duplicate['id'], duplicate, SOURCE, [], [SOURCE], None, 'dataset_1')
     duplicate_buttons = list(st.rendered)
     assert [x[0] for x in duplicate_buttons] == [
-        'Yes — Merge rows 10 + 12 (sum counts)', 'No — Discuss Another Idea',
+        'Merge rows 10 + 12 (sum counts)', 'No — Discuss Another Idea',
     ]
     assert all(duplicate['id'] in key for _, key in duplicate_buttons)
     assert any('Rows 10 + 12' == item['Location'] for kind, frame in st.comments
@@ -134,7 +141,7 @@ def test_rendered_button_sets_are_isolated_per_finding(monkeypatch):
     app._render_live_agent_b_finding(taxonomy['id'], taxonomy, SOURCE, [], [SOURCE], None, 'dataset_1')
     taxonomy_buttons = list(st.rendered)
     assert [x[0] for x in taxonomy_buttons] == [
-        'Yes — Append NA to reach 7 levels', 'No — Discuss Another Idea',
+        'Append NA to reach 7 levels', 'No — Discuss Another Idea',
     ]
     assert all(taxonomy['id'] in key for _, key in taxonomy_buttons)
     assert all(duplicate['id'] not in key for _, key in taxonomy_buttons)

@@ -12,7 +12,12 @@ import threading
 from uuid import uuid4
 from typing import Callable
 
-from healthcare_data_quality.services.llm_client import model_request_priority
+from healthcare_data_quality.services.llm_client import (model_request_priority, model_reconnect_mode,
+    observe_model_requests, bounded_recommendation_review)
+from contextlib import nullcontext
+from time import monotonic
+from datetime import datetime
+import os
 
 _ROLE_PRIORITY = {"A": "investigation", "B": "recommendation", "C": "interactive"}
 
@@ -25,6 +30,9 @@ class InteractiveChatJobs:
         self._jobs: dict[str, dict] = {}
         self._reserved = {"A": 0, "B": 0, "C": 0}
         self._lanes = {role: threading.Lock() for role in _ROLE_PRIORITY}
+        # CPU / R sandbox work must not consume logical Gemma agent lanes.
+        self._local_slots = threading.BoundedSemaphore(2)
+        self._local_pending = 0
 
     def active_count(self, role: str = "C") -> int:
         if role not in _ROLE_PRIORITY:
@@ -54,10 +62,56 @@ class InteractiveChatJobs:
                 else state.get("status")
             )
 
+    def model_stage_for(self, job_id: str) -> dict:
+        """Read-only stage snapshot, distinct from the job's lifecycle status."""
+        with self._lock:
+            state = self._jobs.get(job_id) or {}
+            return dict(state.get('model_stage') or {})
+
     def submit(self, action: Callable, *args, **kwargs) -> str:
         """Legacy API retained for direct callers/tests."""
         job_id, _ = self._enqueue(action, args, kwargs, allow_helpers=False)
         return job_id
+
+    def submit_local(self, action: Callable, *args, **kwargs) -> str:
+        """Bounded non-model work, delivered through the same take() contract."""
+        if not callable(action):
+            raise TypeError('Local review action must be callable')
+        with self._lock:
+            if self._local_pending >= 24:
+                raise RuntimeError('Too many pending local verification jobs')
+            if len(self._jobs) >= 256:
+                for key in list(self._jobs):
+                    if self._jobs[key]['status'] != 'running':
+                        self._jobs.pop(key)
+                    if len(self._jobs) < 128:
+                        break
+            self._local_pending += 1
+            job = uuid4().hex
+            self._jobs[job] = {'status':'running','phase':'queued','agent':'local'}
+        def run():
+            try:
+                with self._local_slots:
+                    with self._lock:
+                        self._jobs[job]['phase'] = 'generating'
+                    result = action(*args, **kwargs)
+                    if not isinstance(result, dict):
+                        raise ValueError('Local verification returned an unsupported response')
+                outcome = {'status':'done','phase':'done','result':result,'agent':'local'}
+            except Exception as exc:
+                outcome = {'status':'failed','phase':'failed','error':f'{type(exc).__name__}: {str(exc)[:350]}','agent':'local'}
+            finally:
+                with self._lock:
+                    self._local_pending -= 1
+                    self._jobs[job] = outcome
+        try:
+            threading.Thread(target=run, name='hdq-local-review-' + job[:8], daemon=True).start()
+        except Exception:
+            with self._lock:
+                self._local_pending -= 1
+                self._jobs.pop(job, None)
+            raise
+        return job
 
     def submit_routed(
         self, action: Callable, *args, agent_a_idle: bool = False,
@@ -77,9 +131,16 @@ class InteractiveChatJobs:
             idle_probe=idle_probe,
         )
 
+    def submit_role(self, role: str, action: Callable, *args, **kwargs) -> str:
+        """Fixed ownership for the sequential UI; never borrow A/B/C lanes."""
+        if role not in _ROLE_PRIORITY:
+            raise ValueError('Unknown agent role')
+        job, _ = self._enqueue(action, args, kwargs, allow_helpers=False, fixed_role=role)
+        return job
+
     def _enqueue(
         self, action: Callable, args: tuple, kwargs: dict, *,
-        allow_helpers: bool, agent_a_idle: bool = False,
+        allow_helpers: bool, fixed_role: str | None = None, agent_a_idle: bool = False,
         agent_b_idle: bool = False,
         idle_probe: Callable[[], tuple[bool, bool]] | None = None,
     ) -> tuple[str, str]:
@@ -88,7 +149,7 @@ class InteractiveChatJobs:
         with self._lock:
             if sum(self._reserved.values()) >= 24:
                 raise RuntimeError("Too many pending interactive requests")
-            role = "C"
+            role = fixed_role or "C"
             if allow_helpers and self._reserved["C"]:
                 if agent_a_idle and not self._reserved["A"]:
                     role = "A"
@@ -107,9 +168,21 @@ class InteractiveChatJobs:
 
         def run() -> None:
             effective_role = role
+            def observe(stage, metrics):
+                with self._lock:
+                    if job_id in self._jobs:
+                        self._jobs[job_id]['model_stage'] = {'stage':stage, 'since':monotonic(), **metrics}
+                # Log only timings/counts/status, never source values or prompts.
+                if effective_role == 'B' and os.getenv('HDQ_REVIEW_TRACE', '1') != '0':
+                    fields = ' '.join(f'{k}={v}' for k,v in metrics.items() if v is not None)
+                    print(f'{datetime.now().isoformat(timespec="seconds")} [HDQ B {job_id[:8]}] {stage} {fields}', flush=True)
+
             held_lane: threading.Lock | None = None
             try:
-                if allow_helpers:
+                if fixed_role is not None:
+                    self._lanes[role].acquire()
+                    held_lane = self._lanes[role]
+                elif allow_helpers:
                     if role == "C":
                         # Only one C request generates at a time. While queued,
                         # recheck the background agents; a newly idle A/B can
@@ -141,19 +214,23 @@ class InteractiveChatJobs:
                     else:
                         self._lanes[role].acquire()
                         held_lane = self._lanes[role]
-                with model_request_priority(_ROLE_PRIORITY[effective_role]):
-                    # The model admission gate has been acquired; show active
-                    # generation only now. UI polls this under its own small
-                    # fragment and never remounts the researcher's text input.
+                with (model_request_priority(_ROLE_PRIORITY[effective_role]), model_reconnect_mode(),
+                      observe_model_requests(observe),
+                      bounded_recommendation_review() if effective_role == 'B' else nullcontext()):
+                    # Role lane acquired; the HTTP gate is acquired later by
+                    # query_local_model. Expose those stages separately.
                     with self._lock:
                         if job_id in self._jobs:
                             self._jobs[job_id]["phase"] = "generating"
+                    observe('preparing_context', {})
                     result = action(*args, **kwargs)
-                if not isinstance(result, (dict, str)):
+                    observe('worker_finished', {})
+                if not isinstance(result, (dict, str, list)):
                     raise ValueError("Gemma returned an unsupported response")
                 outcome = {"status": "done", "phase": "done",
                            "result": result, "agent": effective_role}
             except Exception as exc:
+                observe('worker_failed', {'error_type':type(exc).__name__})
                 outcome = {"status": "failed", "phase": "failed", "error":
                            f"{type(exc).__name__}: {str(exc)[:350]}",
                            "agent": effective_role}

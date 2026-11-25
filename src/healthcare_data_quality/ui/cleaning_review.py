@@ -74,7 +74,7 @@ RECOMMENDATION_SCHEMA = {
                     "action_type": {"type": "string", "enum": list(_ACTION_TYPES)},
                     "action": {"type": "string", "minLength": 12},
                     "rationale": {"type": "string", "minLength": 12},
-                    "choices": {"type": "array", "minItems": 1, "maxItems": 3, "items": _CHOICE_SCHEMA},
+                    "choices": {"type": "array", "minItems": 1, "maxItems": 5, "items": _CHOICE_SCHEMA},
                     "memory_assessment": {"type": "object", "properties": {
                         "decision": {"type": "string", "enum": ["reused", "adapted", "rejected", "not_applicable"]},
                         "reason": {"type": "string", "maxLength": 200},
@@ -176,8 +176,18 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
     results: dict[str, dict] = {}
     from jsonschema import validate
     # Chunk long reports rather than silently omitting findings.
-    for offset in range(0, len(catalog), 18):
-        chunk = catalog[offset:offset + 18]
+    from healthcare_data_quality.services.prompt_budget import compact_data
+    chunks, chunk, size = [], [], 0
+    for entry in catalog:
+        entry_size = len(json.dumps(entry, ensure_ascii=False, default=str).encode('utf-8'))
+        if chunk and (len(chunk) >= 18 or size + entry_size > 10000):
+            chunks.append(chunk)
+            chunk, size = [], 0
+        chunk.append(entry)
+        size += entry_size
+    if chunk:
+        chunks.append(chunk)
+    for chunk in chunks:
         payload = [
             {
                 "finding_id": item["id"], "type": item["source"],
@@ -194,10 +204,18 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
                 "source_pattern_summary": item.get("source_pattern_summary"),
                 "exact_prior_no_change": bool(item.get("exact_prior_no_change")),
                 "recent_failure_patterns": item.get('recent_failure_patterns') or [],
+                "related_findings": item.get('related_findings') or [],
+                "current_review_context": item.get("current_review_context") or {},
                 "check_key": str(item.get("check_key") or ""),
             }
             for item in chunk
         ]
+        for item in payload:
+            for field in ('previously_approved_methods','learned_skills','recent_failure_patterns','related_findings','verified_evidence_registry','current_review_context'):
+                if field == 'current_review_context' and item.get(field):
+                    item[field] = {k: compact_data(v, chars=1800, max_items=5) for k,v in item[field].items()}
+                elif item.get(field):
+                    item[field] = compact_data(item[field], chars=3500 if field=='current_review_context' else 2500 if field=='previously_approved_methods' else 1200,max_items=8)
         prompt = (
             "You are Agent B, the evidence-based remediation strategist for "
             "biomedical and microbiome datasets. Propose ONE concrete, usable "
@@ -205,6 +223,8 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
             "based on the affected values, data type, scientific context, and "
             "published-style practice for comparable experimental datasets. "
             "Do not apply one universal fix to all anomalies. "
+            "Use current_review_context for the latest surviving data, prior user requests and approvals; never infer that original evidence is still current. Consider related_findings for possible interactions or overlapping issues; "
+            "the current finding alone owns its proposal. Do not assume any related issue was approved or corrected. "
             "Compare the current finding to source_pattern_summary, including "
             "the majority naming convention, taxonomy delimiters, and observed "
             "count types BEFORE proposing transformations. Do not treat the "
@@ -307,8 +327,8 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
             "Replace, Standardize, Pad, Rename, Merge, Recalculate, etc.). "
             "Rationale must explain why the repair is reasonable for this "
             "kind of research data and its assumptions, not ask the user "
-            "For each recommendation, design 1–3 distinct, concise action "
-            "buttons in choices, appropriate for the actual current finding. "
+            "For each recommendation, design 2–5 distinct, concise action "
+            "buttons in choices, appropriate for the actual current finding. Prefer methods with higher historical human approval counts when relevant. If only one defensible action exists, return one; never fabricate a second. "
             "Each choice has a brief label and exact operations/changes with "
             "row, column or position, and the original before and new after. "
             "Do not enumerate a long list of identical cell replacements in JSON. "
@@ -325,7 +345,7 @@ def ask_gemma_for_review_options(catalog: list[dict]) -> dict[str, dict]:
             + json.dumps(payload, ensure_ascii=False)
         )
         response = json.loads(query_local_model(prompt, json_schema=RECOMMENDATION_SCHEMA,
-                                                max_tokens=1500 if len(chunk) == 1 else 4500))
+                                                max_tokens=2400 if len(chunk) == 1 else 6000))
         validate(instance=response, schema=RECOMMENDATION_SCHEMA)
         items_by_id = {item["id"]: item for item in chunk}
         for entry in response["recommendations"]:

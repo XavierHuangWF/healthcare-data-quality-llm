@@ -201,7 +201,7 @@ def test_agent_b_worker_assesses_every_offered_option_before_ready(tmp_path):
     assert entry['gemma_option_reviews'][0]['can_offer']
 
 
-def test_local_gemma_review_failure_is_never_silent_ready(tmp_path):
+def test_local_gemma_review_failure_is_reported_not_silently_endorsed(tmp_path):
     from healthcare_data_quality.jobs.cleaning_jobs import CleaningRecommendationJobs
     finding8={**finding(),'source':'QC','method':'Review duplicated header'}
     def recommender(_item):
@@ -215,14 +215,16 @@ def test_local_gemma_review_failure_is_never_silent_ready(tmp_path):
                    source_paths_by_finding={finding8['id']:CSV})
     jobs._workers[key].join(4)
     entry=jobs.snapshot(key)['entries'][finding8['id']]
-    assert entry['status']=='failed'
-    assert 'local model unavailable' in entry['error']
+    assert entry['status']=='ready'
+    assert entry['gemma_option_reviews'][0]['decision'] == 'unavailable'
+    assert not entry['gemma_option_reviews'][0]['can_offer']
+    assert 'ConnectionError' in entry['gemma_option_reviews'][0]['reason']
 
 
 def test_blank_control_options_are_both_reviewable_with_exact_before_after():
     from healthcare_data_quality.services.recommendation_options import source_backed_choices
     item={'id':'gemma:check1','dataset_id':'dataset_1','check_key':'gemma_check',
-          'source':'Gemma check', 'title':'Investigate negative controls',
+          'source':'Gemma check', 'title':'Investigate negative controls Rep_Blank, P7_Blank, P6_Blank',
           'actionable':False, 'evidence':[]}
     opts=source_backed_choices(item,CSV,{'suggestion':'Control columns are negative controls'})
     assert len(opts)==2

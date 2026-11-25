@@ -58,6 +58,7 @@ def build_review_zip_bundle(
     agent_b_suggestions: dict[str, Any] | None = None,
     excel_attachment: tuple[str, bytes] | None = None,
     dataset_id: str = "dataset_1",
+    gemma_final_review: dict | None = None,
 ) -> tuple[str, bytes]:
     """Produce one independently verifiable ZIP; fail closed on contradictions.
 
@@ -86,6 +87,12 @@ def build_review_zip_bundle(
         completed_audits=completed_audits, finding_titles=finding_titles,
         dataset_id=dataset_id,
     )
+    if gemma_final_review is not None:
+        if (gemma_final_review.get('verified') is not True or
+                gemma_final_review.get('source_sha256') != hashlib.sha256(original_csv).hexdigest() or
+                gemma_final_review.get('final_sha256') != hashlib.sha256(cleaned_csv).hexdigest()):
+            raise PermissionError('Gemma final review does not match the exported source and cleaned CSV')
+        audit['gemma_final_review'] = dict(gemma_final_review)
     audit["source_finding_titles"] = dict(finding_titles)
     audit["agent_b_suggestions_at_export"] = dict(agent_b_suggestions or {})
     audit["review_transcripts_raw"] = dict(conversations or {})

@@ -64,7 +64,7 @@ def test_page_mounts_one_floating_host_before_upload_and_uses_it_for_all_states(
     assert 'state="saved_available" if previous_runs or legacy_session_result else "ready"' in window
     assert 'live_status(audit, cache_key, header_reports, include_exploration, live_banner_slot)' in window
     assert 'with banner_slot.container():' in source
-    assert 'components.html(render_recommendation_banner_html(None, idle=True)' in source
+    assert 'st.iframe(render_recommendation_banner_html(None, idle=True)' in source
     # Pre-run state is just HTML: starting Agent A requires a real audit.
     idle_func = source[source.index("def render_pre_investigation_status("):
                        source.index("def _toggle_full_dataset_preview(")]

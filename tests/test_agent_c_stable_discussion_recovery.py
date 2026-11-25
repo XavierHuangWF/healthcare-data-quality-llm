@@ -91,7 +91,7 @@ def test_fallback_rejects_different_values_even_when_header_matches(tmp_path):
                                                source, {'status': 'failed'}) is None
 
 
-def test_agent_c_poll_restarts_app_only_once_for_same_completed_request(monkeypatch):
+def test_agent_c_poll_collects_completed_request_without_app_rerun(monkeypatch):
     from test_cleaning_review_cards import StubUI, _app
     ui = StubUI()
     app = _app(monkeypatch, ui)
@@ -117,7 +117,7 @@ def test_agent_c_poll_restarts_app_only_once_for_same_completed_request(monkeypa
     monkeypatch.setattr(job_mod, 'interactive_chat_manager', lambda: worker)
     app._poll_agent_c_completion()
     app._poll_agent_c_completion()
-    assert len(count) == 1
+    assert len(count) == 0
     assert worker.takes == 1
     assert ui.session_state['cleaning_completed_gemma']['finding9']['status'] == 'done'
 
@@ -126,5 +126,5 @@ def test_pending_discussion_keeps_chat_widget_identity_in_source():
     code = (ROOT / 'app.py').read_text(encoding='utf-8')
     assert '"discussion", "processing"}' in code
     assert 'disabled=b_pending)' in code
-    assert 'if newly_ready:\n        st.rerun()' in code
+    assert 'if newly_ready:\n        st.rerun()' not in code
     assert 'cleaning_agent_c_completion_notified' in code

@@ -161,7 +161,7 @@ def build_styled_excel_download(
         if (type(row) is not int or type(col) is not int or
                 not 2 <= row <= len(original_rows) or
                 not 1 <= col <= len(original_rows[0]) or
-                flag.get("style") != "bold_red" or
+                flag.get("style") != "bold_red" or type(flag.get("fill", True)) is not bool or
                 flag.get("before") != original_rows[row-1][col-1]):
             raise PermissionError("A visual flag no longer matches the immutable original CSV")
         if row not in row_map or col not in col_map:
@@ -172,7 +172,8 @@ def build_styled_excel_download(
         flagged_positions.add(position)
         cell = sheet.cell(*position)
         cell.font = Font(bold=True, color="FFDC2626")
-        cell.fill = PatternFill(fill_type="solid", fgColor="FFFFE699")
+        if flag.get("fill", True):
+            cell.fill = PatternFill(fill_type="solid", fgColor="FFFFE699")
         cell.alignment = Alignment(vertical="top", wrap_text=True)
     output = io.BytesIO()
     workbook.save(output)

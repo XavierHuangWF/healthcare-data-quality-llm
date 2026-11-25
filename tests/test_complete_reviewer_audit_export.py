@@ -128,8 +128,15 @@ def test_installer_idempotent_with_latest_app_source():
     source = (Path(__file__).resolve().parents[1] / 'app.py').read_text()
     # The current app's export has evolved since the legacy installer.
     # Verify audit support remains wired without invoking obsolete source rewrites.
-    assert 'audit_tables(' in source and 'embed_audit_sheets(' in source
-    assert 'Download cleaned dataset' in source
+    from healthcare_data_quality.cleaning.final_export_integrity import prepare_verified_workbook, seal_verified_workbook
+    import inspect
+    assert 'manager.submit_local(prepare_verified_workbook' in source
+    assert 'manager.submit_local(seal_verified_workbook' in source
+    for worker in (prepare_verified_workbook, seal_verified_workbook):
+        worker_source = inspect.getsource(worker)
+        assert 'audit_tables(' in worker_source and 'embed_audit_sheets(' in worker_source
+        assert 'verified_workbook_evidence(' in worker_source
+    assert 'Download cleaned Excel + audit (.xlsx)' in source
     assert 'value=True, key=f"review_completed_audit_{fid}"' in source
 
 

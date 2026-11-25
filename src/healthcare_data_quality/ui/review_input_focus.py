@@ -56,3 +56,32 @@ def focus_reviewer_chat(streamlit_module, finding_id: str) -> bool:
         # to an untrusted/iframe script or alter the review interaction.
         return False
     return True
+
+
+def review_viewport_html(finding_id: str, completed: bool = False) -> str:
+    """Bounded one-shot scroll to the selected card, including prior header.
+
+    No iframe/parent DOM access, no observer left running, and no periodic scroll.
+    """
+    digest = hashlib.sha256(str(finding_id).encode()).hexdigest()[:16]
+    return f'''<script>(() => {{
+      const selector = '.st-key-hdq_review_card_{digest}';
+      let attempts = 0;
+      const restore = () => {{
+        const card = document.querySelector(selector);
+        if (!card || !card.querySelector('details')) {{
+          if (++attempts < 12) setTimeout(restore, 80);
+          return;
+        }}
+        // Expansion is owned by Streamlit, not this script. Only scroll.
+        requestAnimationFrame(() => {{
+          card.scrollIntoView({{block:'start',behavior:'instant'}});
+          // Offset inside the actual scrolling ancestor to keep preceding context.
+          let parent = card.parentElement;
+          while (parent && !(parent.scrollHeight > parent.clientHeight && /auto|scroll/.test(getComputedStyle(parent).overflowY))) parent = parent.parentElement;
+          if (parent) parent.scrollTop = Math.max(0, parent.scrollTop - 96);
+          else window.scrollBy(0,-96);
+        }});
+      }};
+      requestAnimationFrame(restore);
+    }})();</script>'''

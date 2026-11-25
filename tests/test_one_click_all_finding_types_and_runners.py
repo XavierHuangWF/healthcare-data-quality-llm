@@ -61,8 +61,12 @@ def test_verified_option_click_is_final_and_never_prepares_another_yes(
         'healthcare_data_quality.ui.human_choice_replay.prioritize_verified_human_choices',
         lambda finding, source, choices: choices,
     )
+    from healthcare_data_quality.ui.finding_choice_integrity import scoped_review_choices
+    from healthcare_data_quality.services.model_plan_review import option_fingerprint
+    reviewed = scoped_review_choices(finding, source, [option])
     st.session_state.cleaning_recommendations = {
-        finding['id']: {'suggestion': 'Replace count', 'memory_assessed': True}
+        finding['id']: {'suggestion': 'Replace count', 'memory_assessed': True,
+                        'gemma_option_reviews': [{'fingerprint':option_fingerprint(finding,source,c), 'can_offer': True, 'reason':'Exact scope reviewed'} for c in reviewed]}
     }
     for key in ('cleaning_plans_by_finding', 'cleaning_batch_queue_by_finding',
                 'cleaning_pending_gemma_b', 'cleaning_discussion_mode_by_finding',
@@ -72,14 +76,13 @@ def test_verified_option_click_is_final_and_never_prepares_another_yes(
     st.session_state.cleaning_approved_reviewer = 'Named Reviewer'
     executed = []
 
-    def apply(state, selected, original, action):
+    def apply(selected, original, action):
         executed.append(action)
-        state.cleaning_review_statuses[selected['id']] = 'Applied and verified'
-        state.cleaning_history.append({'finding_id': selected['id']})
-        return {'warning': None}
+        st.session_state.cleaning_pending_gemma_b[selected['id']] = {'kind':'local_choice'}
+        return True
 
-    monkeypatch.setattr('healthcare_data_quality.ui.one_click_choice.execute_verified_choice', apply)
-    st.buttons_on.add(f"review_yes_{finding['id']}_0_option_0")
+    monkeypatch.setattr(app, '_queue_local_choice', apply)
+    st.buttons_on.add(f"review_yes_{finding['id']}_0_option_{option_fingerprint(finding, source, reviewed[0])[:20]}")
     with pytest.raises(StopIteration, match='rerun'):
         app._render_live_agent_b_finding(finding['id'], finding, source, [], [source],
                                           None, 'dataset_1')
@@ -89,7 +92,8 @@ def test_verified_option_click_is_final_and_never_prepares_another_yes(
     assert executed[0]['operations'][0]['dataset_id'] == finding['dataset_id']
     assert executed[0]['finding_id'] == finding['id']
     assert st.session_state.cleaning_plans_by_finding == {}
-    assert st.session_state.cleaning_history == [{'finding_id': finding['id']}]
+    assert st.session_state.cleaning_history == []
+    assert st.session_state.cleaning_pending_gemma_b[finding['id']]['kind'] == 'local_choice'
     assert source.read_bytes() == b'Taxon,Count\na,0.2\n'
 
 
@@ -98,7 +102,8 @@ def test_no_second_prepare_step_remains_in_the_active_source():
     code = (root / 'app.py').read_text(encoding='utf-8')
     block = code.split('def _render_live_agent_b_finding(', 1)[1].split(
         'def _', 1)[0]
-    assert 'execute_verified_choice(' in block
+    assert '_queue_local_choice(' in block
+    assert 'execute_verified_choice(' not in block
     assert '_record_gemma_b_response(' not in block
     assert '"Yes — Prepare Changes"' not in code
     assert 'HDQ_PER_FINDING_READY_GATE_V2' in code

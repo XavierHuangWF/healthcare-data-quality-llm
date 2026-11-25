@@ -23,7 +23,7 @@ LEGACY_PATH = (Path.home() / ".local" / "share" /
 DEFAULT_PATH = Path(__file__).resolve().parents[3] / "memory" / "approved_decisions.jsonl"
 _VERSION = 1
 _LOCK = threading.RLock()
-_ALLOWED_OPERATIONS = {"replace_cells", "rename_headers", "drop_column", "drop_rows", "merge_rows"}
+_ALLOWED_OPERATIONS = {"replace_cells", "rename_headers", "drop_column", "drop_rows", "merge_rows", "flag_cells"}
 
 
 def _location(path: Path | str | None = None) -> Path:
@@ -74,6 +74,7 @@ def save_reviewed_solution(
     finding: dict, source: Path, *, operations: list[dict] | None = None,
     decision: str = "approved_edit", user_request: str = "",
     agent_response: str = "", path: Path | str | None = None,
+    button_label: str | None = None,
 ) -> dict:
     """Persist only a human-approved result; caller owns the approval gate."""
     if decision not in {"approved_edit", "reviewed_no_change"}:
@@ -96,6 +97,10 @@ def save_reviewed_solution(
         "operations": operations or [],
         "execution_authorized": False,
     }
+    if button_label is not None:
+        from healthcare_data_quality.ui.clear_review_actions import reflected_action_label
+        record["button_label"] = reflected_action_label(operations, finding, button_label,
+            decision="no_change" if decision == "reviewed_no_change" else None)
     serialized = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
     if len(serialized.encode("utf-8")) > 1_000_000:
         raise ValueError("Review too large to store in interaction memory")
@@ -229,6 +234,10 @@ def _change_description(operation: str, change: dict) -> str:
     if operation == "merge_rows":
         return (f"CSV rows {change.get('row', '?')} + {change.get('source_row', '?')} "
                 "— sum counts; retain first row")
+    if operation == "flag_cells":
+        return (f"CSV row {change.get('row', '?')}, column {change.get('column', '?')} — "
+                + ("bold red and yellow fill" if change.get('fill', True) else "bold red font only")
+                + "; value unchanged")
     return "Unsupported operation"
 
 
@@ -253,7 +262,9 @@ def exact_change_rows(record: dict) -> list[dict]:
                 "CSV column": change.get("column", change.get("position")),
                 "Source row": change.get("source_row"),
                 "Before": change.get("before") if "before" in change else "(not saved)",
-                "After": change.get("after") if "after" in change else "(not saved)",
+                "After": (change.get("before") if op == "flag_cells" else
+                          change.get("after") if "after" in change else "(not saved)"),
+                **({"Style": "Bold red + yellow fill" if change.get("fill", True) else "Bold red font only"} if op == "flag_cells" else {}),
             })
     return result
 
@@ -283,6 +294,7 @@ def short_description(record: dict) -> str:
             "drop_column": f"Delete {count} column{'s' if count != 1 else ''}",
             "drop_rows": f"Delete {count} row{'s' if count != 1 else ''}",
             "merge_rows": f"Merge {count} row group{'s' if count != 1 else ''}",
+            "flag_cells": f"Highlight {count} cell{'s' if count != 1 else ''} (values unchanged)",
         }[name]
         # Keep the banner brief for large operations, without hiding the exact
         # before/after values of a small (e.g., two-cell) change.

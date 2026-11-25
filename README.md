@@ -2,111 +2,140 @@
 
 **Local-first, evidence-grounded, human-governed quality control and remediation for scientific and biomedical tabular data.**
 
-> **Current design and operating contract — 22 November 2026.** This section consolidates the latest review, scheduling, memory, user-interface, and export designs. The later **Historical engineering reference** records earlier CLI and research prototypes; its old UI and approval descriptions are not current requirements. This README revision is based on the supplied README and PyCharm/Streamlit screenshots, **not a source-code audit or a new end-to-end test**. Features should be regarded as implemented only after their corresponding integration tests and live model/UI tests pass. The application remains a research prototype, not a clinically validated system or a HIPAA compliance guarantee.
+> **Current operating contract — 24 November 2026.** Updated against the supplied README, the `194131` source snapshot, and the subsequent ordered-review/context/export, verified-options unlock, and memory-first recommendation patches. This section supersedes earlier UI, approval, scheduling, and export requirements. The historical benchmark and engineering reference remain for provenance. The rules below describe the intended cumulative patched application; targeted regression results from earlier patches do not establish full integration or live browser/GPU validation. This remains a research prototype, not a clinically validated system or a HIPAA compliance guarantee.
 
-## 1. Architecture: evidence → model deliberation → authorization → verification
+## 1. Architecture: evidence → memory → model assessment → authorization → verification
 
-The system uses **three asynchronous logical agents sharing one locally hosted Gemma model** through a vLLM-compatible inference endpoint. Deterministic Python services, not model text, control source facts, permissions, modifications, and final acceptance. A single model process does not imply three dedicated GPUs or guaranteed simultaneous completions.
+The system uses **three asynchronous logical agents sharing one locally hosted Gemma model** through a vLLM-compatible endpoint. Python owns authoritative source facts, permissions, transformations and final integrity checks. Gemma provides advisory reasoning, assessment and interactive planning. One model server does not imply three dedicated GPUs or guaranteed simultaneous completions.
 
-| Agent | Operational responsibility | Authority boundary |
+| Agent | Responsibility | Authority boundary |
 | --- | --- | --- |
-| **A — Investigation** | Dataset profiling, deterministic QC, read-only exploratory hypotheses, evidence and coverage tracking | May inspect authorized data; cannot alter it |
-| **B — Recommendation synthesis** | Source-aware retrieval, alternative cleaning strategies, Gemma assessment/critique, actionable Before → After proposals | May recommend; cannot authorize execution |
-| **C — Interactive review** | Respond to reviewer instructions, incorporate dialogue context, formulate/refine competing proposals, resolve ambiguity, and record decisions | Executes only an explicitly selected, validated action; may assist B on a different finding when idle |
+| **A — Investigation** | Deterministic QC, read-only exploratory hypotheses, evidence and coverage tracking | May inspect authorized data; cannot change it |
+| **B — Recommendation** | Memory-first candidate retrieval, synthesis, Gemma assessment and ranked Before → After proposals | May recommend; cannot authorize execution |
+| **C — Interactive review** | Contextual discussion, exact action preparation, cross-finding reconciliation; assists B when idle | May prepare an action; only the named reviewer authorizes it |
 
-**Trust boundary.** Source bytes and fingerprints, immutable original coordinates, evidence registry, reviewed intent, staged changes, exported output, and an append-only decision history are separate artifacts. Model suggestions and retrieved memory are *untrusted advisory inputs*. They cannot override scope, invent source values, silently mutate the original, or confer reviewer authorization. The default CLI investigation remains read-only; the reviewer-controlled Streamlit cleaning path is a distinct mode.
+**Trust boundary:** Immutable source bytes and fingerprints, original coordinates, evidence, review intent, approved operation ledger, staged output and audit history are separate artifacts. Model text, source cells and retrieved memory are untrusted advisory inputs. Neither frequency nor model endorsement grants execution permission. Default CLI investigation is read-only; the reviewer-controlled Streamlit cleaning path is distinct. Generated exploratory Python and supported R verification use the applicable isolated, no-network execution policies; no unapproved modification of the original file is permitted.
 
-### 1.1 Multi-agent scheduling and workload balancing
+### 1.1 Concurrent work, ordered publication and revision ownership
 
-- **Concurrency:** `HDQ_LLM_MAX_ACTIVE=3` governs admitted model requests in the application; `HDQ_MAX_NUM_SEQS=3` is the intended vLLM scheduling limit. These are separate constraints. Use a single model endpoint, with bounded queues, deadlines, cancellation, and per-role telemetry.
-- **Finding-level ownership:** The scheduler should allocate work by `(source_hash, investigation_id, finding_id, revision)`. Agent B and an idle Agent C must **not synthesize the same finding/revision simultaneously**. A claim/lease, idempotency key, and stale-result rejection prevent duplicate cards, duplicate edits, or late writes. Any source or reviewer change invalidates the old revision.
-- **Work conservation:** Agent C gives **interactive reviewer requests preemptive priority**. When no interactive work is pending, its spare lane can assist B with a **different unclaimed finding**; an idle A lane may also assist if investigation work permits. B retains responsibility for proposal ownership and published readiness. Work stealing does not authorize execution or increase the three-request limit.
-- **Incremental results:** Publish each independently verified finding as soon as it is ready, with statuses `queued`, `model-reviewing`, `validating`, `ready`, `needs-retry`, `superseded`, or `resolved`. Failures must show an actionable reason and offer bounded retry; they must not silently disappear or repeatedly regenerate successful results.
-- **Progress visibility:** Show a small running/jogging indicator **before each waiting finding/check label**, plus the role, current phase, completed/total counts, and elapsed time where available. Keep progress polling isolated from editable Streamlit fragments to prevent flashing, focus loss, or scroll jumps. A running animation signals activity, **not verified success**.
+- **Concurrency:** Retain `HDQ_LLM_MAX_ACTIVE=3` (application request admission) and `HDQ_MAX_NUM_SEQS=3` (vLLM scheduling). Agent C prioritizes interactive requests and assists B on a different unclaimed finding when idle. An idle A lane may assist when investigation permits. Do not duplicate ownership of the same finding/revision.
+- **Ownership:** Bind jobs and results to source fingerprint, investigation, finding, and current revision. Reviewer identity and the exact proposal also bind execution. Reject obsolete worker results, duplicate clicks and invalidated proposals; never replay an approved edit as part of inference recovery.
+- **Ordered release:** Inference remains parallel, but findings appear in ascending finding index, followed by Gemma checks. Finding 6 cannot publish before Finding 5 is reviewable, even if its worker finishes first. Earlier findings need not be approved before later verified suggestions appear.
+- **Publication gate:** A completed draft, cached response or failed job is not readiness. An ordinary finding unlocks only when at least one current, source-verified and Gemma-assessed executable option exists. A new publication epoch opens the card automatically once; later refreshes respect deliberate collapse. If the option set becomes empty or stale, relock it. Red Discuss and blue Mark reviewed are not evidence of a ready recommendation. Independently proven no-edit resolutions and zero-anomaly checks may offer a valid closure instead of inventing a mutation. An explicitly entered discussion remains a separate review state.
+- **Recovery:** Assess and repair candidates automatically in background workers. No routine reassess, retry-candidate or preparation buttons. Empty-option recovery has bounded delayed attempts (30/60/120 seconds in the current gate); exhaustion leaves an unresolved finding locked and blocks later publication until recovery or a valid state transition. Retain a concise failure status rather than claiming success.
+- **Downstream revisions:** After an earlier approved change, determine the first potentially affected later finding using the approval delta and dependency scope. Lock that finding and every subsequent finding/check pending fresh preparation; indicate `Revising after Finding X`. Preserve existing named approvals and their audit history. Reconcile completed items and their evidence, rather than silently reversing approvals. The current dependency logic is conservative, not a proof of all possible scientific relationships.
 
-### 1.2 Deliberative planning, reflection, and learning
+### 1.2 Memory-first recommendation pipeline
 
-Recommendation generation follows **retrieval-augmented case-based reasoning** and a **generate → critique → verify → present** pipeline:
+The system uses persistent case-based decision memory, generated advisory skills and inference-time reflection, not model-weight fine-tuning.
 
-1. **Ground:** Fetch original source evidence, complete affected scope, schema conventions, adjacent normal examples, past user decisions, and relevant generated skills. Explicitly distinguish source facts from context or inference.
-2. **Generate:** Ask Gemma for feasible alternatives, including compound row/column operations, replacements, rounding, missing-value handling, unchanged/ignore choices, and non-destructive visual annotations. One finding may legitimately have several valid strategies.
-3. **Reflect / self-critique:** Have Gemma assess consistency with the dataset's dominant pattern, reviewer intent, prior interactions, scientific plausibility, potential side effects, and overlap with other findings. The model should reason about indirect patterns (e.g., a user's earlier `0.2 → 2` and `0.5 → 5` decisions), but **must not infer an executable multiply-by-ten rule without current evidence and approval**.
-4. **Verify deterministically:** Validate typed operations, exact one-based original CSV positions, source `before` values, target coverage, no unapproved mutations, and interaction-specific scope. Reject unsupported, stale, contradictory, or ungrounded plans. Where model review is required, **do not show actionable buttons until both model assessment and deterministic validation complete**.
-5. **Learn from outcomes:** Record reviewer-approved, declined, no-change, superseded, and failed cases with provenance. Feed relevant error patterns and counterexamples back into later prompts and tests. This is **inference-time reflection and memory-based adaptation**, *not* autonomous model weight updates, automatic code repair, or evidence of self-improvement without evaluation.
+1. **Ground:** Load immutable source evidence, full affected scope, current staged values, prior approvals and relevant schema/column comparisons. Evidence samples for prompts are not the execution scope.
+2. **Retrieve memory first:** Reconstruct eligible previously approved exact actions and source-derived alternatives before asking Gemma for a new draft. A failed drafting request must not prevent assessment of remembered methods. Where sufficient candidates exist, assess them directly; otherwise generate additional feasible alternatives.
+3. **Rank:** Consolidate duplicate exact operations while retaining historical approval counts. Rank eligible alternatives by descending user-approval frequency; use the current source and finding type to scope counts. Historical records, including superseded approvals, are not counts of independent users or scientific replications. Revoked decisions are not automatically replayable. New candidates may supplement the remembered set.
+4. **Assess:** Gemma reviews the exact candidate, latest reviewer intent, applicable memory and cross-finding state. A cached rejection or obsolete assessment should be recovered/reassessed automatically when appropriate. Do not expose an executable option without the matching current assessment and deterministic checks.
+5. **Verify:** Validate complete typed operations, original one-based CSV coordinates, exact before values, surviving target scope, and authorization boundaries. Retain impact warnings for destructive operations. Require independent complete-source checks even when the prompt uses compressed evidence.
+6. **Present:** Aim for **2–5 distinct actionable alternatives**, most frequently approved eligible option first, with its exact Before → After and prior approval count where available. Never invent an unsafe second action; one defensible action is acceptable, and a no-edit closure must be supported by evidence. Zero valid recommendations must not unlock an ordinary finding.
+7. **Learn:** Persist approved edits, no-change decisions, rejections, revisions and failure feedback with provenance. Learn from relevant outcomes and skills, but never turn a past preference into new authorization.
 
-**Memory provenance:** Same-source/same-finding methods may be reused only after current evidence and scope revalidation. Cross-source, cross-finding, or generated `skills/` advice requires fresh Gemma applicability assessment and independent checks. Report *which* earlier decision influenced an option, how it was adapted, and why it remains applicable. Source data, reviewer logs, and local generated memories should remain outside Git.
+**Memory scope and limitations**
+
+| Layer | Current behavior / boundary |
+| --- | --- |
+| Exact approval replay | Same-source, same-issue verified operations; historical coordinates must never be transferred to another CSV. |
+| Frequency ranking | Canonical exact action signatures aggregate historical approved-edit events before deduplication; revocation is handled separately from counting. Current reader considers a bounded recent history (up to 2,500 eligible-length log lines). |
+| Advisory methods and skills | Relevant historical methods, cross-source hints and generated skills may guide Gemma; fresh assessment and independent validation are mandatory. |
+| Working context | Current finding dialogue, current staged data, rejected alternatives and approval lineage inform interactive review; latest intent takes precedence. |
+| Remaining work | Persistent full conversation retrieval, reasoning/preference consolidation, unified memory across all A/B/C inference paths, and generalized semantic frequency across different datasets are not established. |
+
+For example, if the reviewer repeatedly approves deleting rows containing missing count cells, prepare the deletion using the **current verified affected rows** before synthesizing a new strategy. Frequency determines presentation priority, not scientific correctness. Preserve the competing NA option if defensible. Repeated rejection of a proposal in the current discussion must prevent it from resurfacing unless explicitly revisited. Keep source data, private decision logs and generated skills outside Git.
+
+### 1.3 Responsive UI and bounded inference context
+
+- Queue expensive Gemma assessments and supported isolated verification in background workers; acknowledge a click immediately with a local processing state. A green selection authorizes the exact action, but do not mark it completed before verified staging succeeds. Other findings should remain interactive.
+- Use a stable review-rendering owner, state-driven checkpoint saves, non-blocking snapshots and stable widget identities. Keep late background responses from overwriting active discussion or approved state. Do not emit UI elements from callbacks; keep browser-side helpers limited to viewport restoration rather than manipulating expander state.
+- Maintain the configured **12,288-token minimum context** and three-sequence default. Preflight larger prompts with the local vLLM tokenizer when available; reserve output capacity, compact optional history/evidence, preserve the latest instruction and retry bounded context-overflow failures with reduced advisory context. Full execution data and audit history remain intact. If the tokenizer endpoint is unavailable, server-side errors must still be handled.
+- An optional wider context can be tested with `HDQ_MAX_MODEL_LEN=16384 bash scripts/serve_gemma4.sh`. It is not the default and may increase KV-cache pressure on a 16 GB GPU; benchmark before adopting it. No context budget can guarantee arbitrarily long prompts will succeed.
+- Handle `EngineDeadError` and relevant HTTP 500/503 failures using local health checks and bounded read-only inference recovery. Keep the review workspace accessible while Gemma is unavailable. A white screen or slow interaction is not considered resolved until verified in a real browser; preserve console and server traces for investigation.
 
 ## 2. Reviewer journey and human–AI interaction
 
-1. **Intake:** Upload the dataset and collect the named **reviewer identifier before initiating investigation or cleaning**. Bind review state to the exact source fingerprint; never overwrite original uploads.
-2. **Investigate:** Agent A exposes evidence and checks; B/C synthesize independently scheduled, case-aware recommendations. The **Clean data with LM model** page remains visible and primary. **Manage skills & memory**, **Data quality findings**, and **Supporting evidence** are smaller secondary navigation controls on the right.
-3. **Reveal progressively:** A finding's title/count and waiting indicator appear immediately. Lock **only that finding's expandable review/actions** while its verified recommendation is pending; never lock the entire cleaning page. Auto-expand actionable findings as verified options arrive, without destabilizing the active review.
-4. **Present an actionable choice:** Every final action has an explicit verb, source scope, short rationale, and exact **Location | Before | After** (or an expandable complete bulk table). Use green for actionable choices, red for **No — Discuss Another Idea**. Never use ambiguous `Approve & Execute` text without stating the exact operation.
-5. **One-click informed authorization:** The **single click on a green, already source-verified option** is the reviewer's authorization **and** stages/executes the specified action on the derived working copy atomically. **Do not show a second “Yes — Approve & Execute” for the same choice.** A chat message, model recommendation, or scope-clarifying button is not authorization; if the complete Before → After is not yet available, first prepare it and only then expose the executable choice. Require distinct authorization again for any materially changed proposal.
-6. **Discuss without friction:** `No — Discuss Another Idea` opens the current finding's Agent C discussion and **focuses the message box immediately**, without sending a premature model request. Support Enter-to-send where configured. Subsequent options must incorporate the **entire conversation**, not only the latest sentence, and be checked against original data before rendering.
-7. **Complete accurately:** `Keep as is` / `Mark reviewed (no change)` is a valid terminal review decision, including an intentionally blank taxonomy header. `Mark reviewed — resolved by earlier approvals` is valid only after complete lineage reconciliation. Close/collapse **only** that resolved finding, keep its green header in place, and retain a reopenable audit view.
-8. **Release:** Enable the selected downloadable artifact only when its scope, authorization, data, styling, and audit invariants pass independent verification. If a *complete review package* is requested, block release until required review items are terminal and explain every blocker clearly.
+1. **Intake:** Accept one CSV at a time (no add-another-file control). Obtain a named reviewer before investigation/cleaning and bind the session to the source hash. Never overwrite the upload.
+2. **Investigate:** Run deterministic QC and automatic read-only Gemma exploration. Keep the cleaning page primary, with neutral **Clean data with LM model**, **Manage skills & memory**, and merged **Data quality findings** controls. The merged findings page shows evidence once, with detection details folded and audit download available. Remove redundant investigation headings, status rows, exploration toggles and previous-result controls during active investigation. Retain genuine warnings and incomplete-coverage status.
+3. **Progress:** Compact, narrow floating A/B/C cards show role and status with no internal scrollbars. Waiting finding headers show preparing, locked, or revising state. Publish and auto-expand in order according to section 1.1.
+4. **Evidence first:** Display current affected data, original coordinates, current issue status and prior approval attribution. Show original evidence as needed. For numeric proposals, automatically show same-column comparison statistics (positive count, zeros, median, sample SD, P95, maximum and candidate percentile where defined). Compare taxonomy naming/separators against surviving dataset patterns. Do not confuse statistical plausibility with true measurement recovery.
+5. **Action choice:** Show the exact **Location | Before | After** (or complete inspectable bulk scope) next to each green direct-action button. The action name is the label; do not repeat it as a separate `Yes —` button. Use concise impact warnings where needed. No standalone recommendation-details panel; keep necessary diagnostics and memory/assessment details folded. Show 2–5 distinct choices where feasible, ranked by approval frequency.
+6. **One-click authorization:** Clicking the green action is the single named-reviewer authorization for that exact verified operation. Queue any remaining verification and stage atomically on success. No duplicate confirmation for an unchanged choice. Chat text or a clarification button is not authorization; a materially revised operation requires a fresh preview and approval.
+7. **Discussion:** Clicking red **No — Discuss Another Idea** rejects all current unapproved options (including retrieved memory choices), retires old controls and opens Agent C discussion without sending a premature model request. Hide rejected recommendations and their tables. Preserve the visible user dialogue and relevant responses; do not flood the page with automatic drafting messages or internal diagnostics. While waiting for input, show only evidence, conversation, chatbox and the blue review footer. Newly assessed proposals may restore their own preview/action controls; do not resurrect rejected alternatives automatically. Prefer clickable final choices to repeated typing, asking for clarification only when required.
+8. **Closure:** **Mark reviewed** is blue and always the final control of a reviewable card. A no-change decision is valid; a resolved-by-earlier-approval closure requires complete lineage verification. Collapse only the completed card, retain its green header and reopenable audit. Keep the viewport near the chosen finding and preceding context after No, approval and completion; do not scroll users away during background updates.
+9. **Release:** Once all required findings/checks are terminal, show the reconstructed **Cleaned dataset** preview with actual final record/column counts and repeated headers. Default to Excel with audit; release only after the verification gates in section 4.
 
-**Human-factors contract:** Minimize repetitive text entry. Maintain consistent single-purpose buttons across baseline QC findings and exploratory Gemma checks; prevent duplicate controls and repeated model messages. Keep navigation, focus, scroll position, and card identity stable across independent background updates. For large findings, summarize total affected items and offer the full verification table on demand.
+**Global UI rule:** Data first, exact final action second, diagnostics on demand. No duplicate controls, redundant tables, unexplained internal IDs, manual reassessment buttons or phantom approval buttons. Apply these rules to deterministic findings and exploratory Gemma checks, including remembered and interactive proposals. Zero-anomaly checks should show measured data (e.g., control-column zero/nonzero/missing counts), not lengthy model explanations. Explicitly requested operations on verified check scope can be prepared even when no anomaly was found; they are not implied by a zero-anomaly result.
 
-## 3. Cross-finding causality, reconciliation, and transaction semantics
+## 3. Cross-finding causality, reconciliation and transaction semantics
 
-A finding may overlap with previously approved row deletions, column deletions, cell replacements, or annotations. **The original CSV's physical coordinates are the immutable reference frame**; mapping to surviving final coordinates is derived after applying authorized operations. The application must never silently reinterpret shifted row/column numbers as original positions.
+The original CSV's physical coordinates are immutable. Map them to final surviving positions after applying authorized operations; never reinterpret shifted indices as original coordinates.
 
-- **Scope resolution:** Compute candidate effects against the original source, current approved operation ledger, and the latest reviewer intent. A request such as `delete columns 7 and 11` is **one compound operation** on *both original columns*, not two competing partial choices. Row deletion and merging must likewise use source-verified identities and explicit aggregation semantics.
-- **Conflict analysis:** Detect overlapping or mutually exclusive actions before presentation and before commit. A deleted row/column **supersedes** earlier edits or highlights within it; these remain in history but must not reappear in the final dataset or be counted as surviving changes.
-- **No double application:** A previously executed cleaning method may resolve another finding without any new mutation. Show the earlier action ID and exact original → final evidence. If *all* targets are resolved, expose a **single close/mark-reviewed option**. If *some* survive, re-plan only the live remainder; never claim the entire finding has been fixed.
-- **Correct sequencing:** Later approvals must be checked against the staged state and dependency graph. Reopening/reversing an earlier approval requires conflict-aware rollback/replay or an explicitly blocked explanation with dependent action IDs.
-- **Transaction properties:** For a compound reviewer choice, validate the complete batch first, apply all-or-nothing to a derived copy, and record an idempotent event. A repeated UI click, delayed model response, or retry must not duplicate the operation. A failed validation must leave the staged dataset unchanged.
-
-**Illustrative failure:** If row 7 has already been deleted, Agent C must not claim the row was “standardized” solely because a stale proposal says so. The accurate outcome is “target removed by approved deletion,” with the deletion's audit record, and closure permitted only if the finding has no remaining unresolved scope.
+- **Current evidence:** Show original → current value, status, originating human-readable finding/check name and actual approved action. Derive attribution from the ledger, not Gemma's assertions. Earlier deletions are `removed on export`, not “corrected” values. If a previous action is revised or revoked, recalculate the relevant evidence and proposal state.
+- **Partial vs complete resolution:** If all targets are removed or otherwise independently resolved, offer a no-new-edit closure. If some survive, replan only the unresolved live scope. Do not confuse a separator correction with naming standardization or taxonomy padding.
+- **Dependency management:** A structural deletion or merge can affect global comparisons; cell changes can affect column distributions, duplicates and taxonomy checks. Conservative downstream invalidation is appropriate when independence cannot be established. The earliest affected later card and all following cards must wait for current reviewed alternatives; stale job delivery must not unlock them.
+- **Value vs annotation:** Formatting is not a lock on the cell value. Later compatible corrections may preserve earlier approved formatting. Highlighting an entire row means every surviving cell in the intended original row, not only taxonomy or flagged counts. Style-only refinements retain the previously agreed target scope; `red and bold only` must not add a yellow fill. Deletion supersedes edits and annotations within removed targets, preserving their historical records but not exporting them as surviving changes.
+- **Scope and atomicity:** A request to delete multiple original columns or rows is one explicitly scoped compound action where appropriate. Validate every target and before value, preserve unrelated cells, stage all-or-nothing and record idempotent approval lineage. Conflicting value changes require reconciliation; rollback/revision must not silently invalidate dependent approvals.
+- **Scientific policies:** Seven-rank taxonomy counts `NA` as a valid rank in any position. Pad missing ranks with explicit NA when that is the requested structural treatment, retaining existing labels; prepare the exact resulting strings for one approval rather than asking redundant questions. Normalize separators or prefixes using actual dataset conventions; never invent biological identities. Missing count cells are not equivalent to zero or taxonomy NA. Deleting control columns is optional unless scientific evidence establishes a reason; explicit verified deletion still needs approval.
 
 ## 4. Verified export and reviewer-oriented provenance
 
-The primary deliverable is a **complete review package (`.zip`)** containing the **original CSV**, **cleaned CSV**, and **review workbook (`.xlsx`)**; deliver standalone CSV/XLSX only when that release mode is selected and validated. The workbook provides four reviewable sheets:
+**Default deliverable: Excel (`.xlsx`) with cleaned data and reviewer audit.** CSV (cleaned values only) and complete review ZIP (original CSV, cleaned CSV, workbook and audit) remain selectable alternatives. A cleaned dataset preview appears after review completion; CSV does not preserve font/fill annotations.
 
-| Sheet | Required evidence for a human reviewer |
+| Workbook evidence | Purpose |
 | --- | --- |
-| **Cleaned dataset** | Final surviving values, original order/labels where applicable, and approved red/bold/highlight annotations. **CSV cannot store font colors or fills**. |
-| **Audit trail** | Group by finding/check, not one unexplained flat operation list: reviewer, decision, timestamp, exact original row/column, before/after, operation scope, status, supersession/dependency and final location or deletion. |
-| **Interaction log** | Concise, chronological, attributable reviewer–Agent C dialogue and consequential proposed/approved actions; omit duplicated assistant boilerplate without losing decision context. |
-| **Verification** | Source and final SHA-256; schema and row/column counts; complete approved-operation inventory; **every original → approved → final outcome**, survivor mapping, suppressed annotations, independent comparison results, and any unresolved exceptions. |
+| Cleaned dataset | Actual surviving values and approved annotation styles |
+| Review overview | Finding/check decisions and final status |
+| Audit trail | Named reviewer, timestamp, original locations, exact actions and supersession |
+| Source-to-final checks | Exact differences, structural effects and survivor mapping |
+| Interaction log | Relevant reviewer dialogue and consequential decisions |
+| Verification | Source/final hashes, independent replay checks and final Gemma review |
 
-**Independent release gate:** Reconstruct the final CSV from the original bytes plus **only** accepted actions and compare it with the delivered CSV/XLSX. Check all surviving cells, header decisions (including intentionally blank), row/column remapping, visual flags on surviving locations, counts, approval scope, and review/interaction ledger completeness. Verify the XLSX is readable and that no unintended edits occurred; fail closed with a specific discrepancy if not. A SHA-256 and a “verified” label alone do **not** prove semantic or clinical correctness.
+### 4.1 Mandatory release gates
 
-**Scientific data policy:** In seven-rank taxonomy strings, `NA` counts as a rank and can appear in any position. Missing count cells are distinct from taxonomy `NA`. The model must not fabricate biological identities or generalize a sample into a whole-dataset count. Formatting changes (separators, prefixes) and taxonomic substitutions are different classes of operation, each requiring an explicit, inspectable outcome.
+1. Reconstruct the final output from the immutable original and **only** named approvals, including row/column removal, merges, header changes, exact replacements and annotation styles. Independently compare every surviving cell and structural effect with the expected replay. Fail closed for unauthorized or unexplained differences.
+2. Run a separate local Gemma verification of actual original-to-final differences and their approval lineage, in bounded batches. Homogeneous changes may be grouped losslessly (all coordinates retained); structural and superseded operations remain represented. Gemma must return a valid positive assessment for every batch. A negative, missing or malformed response blocks release, rather than being interpreted as approval.
+3. Verify the output workbook/selected artifact, including final data, surviving formatting and audit consistency. Bind the successful verification to the original and final fingerprints/current review state; invalidate it when approvals change. Only then expose the download.
+
+The model review is an additional check, **not independent proof of scientific truth**. Deterministic replay is the authority for exact values and unchanged cells. An approved NA, sign correction or aggregation can be authorized without being scientifically established. A hash or model endorsement alone cannot certify absence of fabricated values or unauthorized changes.
 
 ## 5. Implementation map and regression strategy
 
-The following are **module responsibilities inferred from the supplied file tree and design notes**; file presence does not establish that every path is wired into the live application.
+The following module paths are relative to `src/healthcare_data_quality/`; `app.py` is the Streamlit entry point. This map includes the latest supplied patch modules and existing design references, not a claim that every runtime path has passed a live integration test.
 
-| Concern | Relevant source modules / tests |
+| Concern | Relevant implementation |
 | --- | --- |
-| Source-aware planning and review | `services/model_plan_review.py`, `services/recommendation_options.py`, `services/source_patterns.py`; `tests/test_cross_finding_gemma_review_gate_20261122.py` |
-| Reviewer choice semantics and UI | `ui/one_click_choice.py`, `ui/finding_choice_integrity.py`, `ui/clear_review_actions.py`, `ui/review_input_focus.py`, `ui/single_selection_flow.py`; `tests/test_one_click_all_finding_types_and_runners.py` |
-| Reconciliation and authorized changes | `cleaning/previous_approval_resolution.py`, `cleaning/proposal_conflicts.py`, `cleaning/review_reconciliation.py`, `cleaning/compound_approval.py`; `tests/test_prior_approval_resolution_review_20261123.py` |
-| Memory and failure feedback | `learning/model_failure_patterns.py`, `ui/recommendation_memory_trace.py`, `ui/recommendation_failure_recovery.py`; `tests/test_model_review_feedback_and_retry_20261122.py` |
-| Background readiness and scheduling | `jobs/cleaning_jobs.py`, `ui/finding_wait_gate.py`, `ui/running_indicator.py`, `ui/recommendation_wait.py`; `tests/test_agent_c_idle_assists_agent_b_20261123.py`, `tests/test_waiting_jogger_before_title_20261123.py` |
-| Export integrity and audit | `cleaning/final_export_integrity.py`, `cleaning/reviewer_audit_workbook.py`, `cleaning/review_zip_bundle.py`, `cleaning/one_click_visual_flag.py`; `tests/test_full_review_scope_audit_verification_20261122.py` |
-
-Full module paths above are relative to `src/healthcare_data_quality/`. Main Streamlit entry point: `app.py`. **All new imported modules and tests under `Unversioned Files` must be added to version control**, not just the modified files displayed above them.
+| Memory-first candidates and frequency | `ui/human_choice_replay.py`, `learning/interaction_memory.py`, `jobs/cleaning_jobs.py`, `services/recommendation_options.py` |
+| Exact model assessment / recovery | `services/model_plan_review.py`, `ui/finding_choice_integrity.py`, `ui/ordered_review.py` |
+| Ordered publication and revision gates | `ui/ordered_review.py`, `ui/finding_wait_gate.py`, `ui/cleaning_review.py`, `app.py` |
+| Async UI and viewport | `jobs/interactive_chat_jobs.py`, `ui/review_refresh.py`, `ui/review_input_focus.py`, `ui/one_click_choice.py`, `ui/exploration_banner.py` |
+| Context and local inference | `services/prompt_budget.py`, `services/llm_client.py` |
+| Current evidence and conflicts | `cleaning/current_review_evidence.py`, `cleaning/previous_approval_resolution.py`, `cleaning/proposal_conflicts.py`, `cleaning/cleaning_workspace.py` |
+| Final integrity and export | `cleaning/final_export_integrity.py`, `cleaning/final_model_verification.py`, `cleaning/reviewer_audit_workbook.py`, `cleaning/review_zip_bundle.py` |
 
 ### 5.1 Acceptance and adversarial regression matrix
 
-A passing unit suite is necessary but insufficient. Exercise the following *across every finding/check category*, with both default recommendations and free-text Agent C requests:
+Exercise these invariants for every applicable finding/check type and both default and interactive proposals.
 
 | Scenario | Required invariant |
 | --- | --- |
-| Same-finding B/C concurrency; delayed completions | At most one owner for each finding/revision; stale response discarded; no duplicate cards or operations |
-| Previously approved deletion vs. later formatting/replacement | Correct supersession; survivor-only proposals; accurate mark-reviewed closure |
-| Partial overlap across multiple findings | Only unresolved targets receive new proposals; no unintended extra edits |
-| Multi-target request (`delete 7 and 11`) | Atomic full batch, clear Before → After, one click, no silent narrowing or expanding |
-| Reviewer changes direction during discussion | Latest intent and complete prior context respected; stale buttons invalidated |
-| Keep header blank / no change | Terminal reviewed state; unchanged header preserved; export remains eligible |
-| Negative/fractional/missing counts; taxonomy/separator/prefix combinations | Action matches source conditions; unrelated cells unchanged; scientific assumptions not invented |
-| Visual flag followed by deletion | No orphaned style; audit records supersession; surviving styles in XLSX verified |
-| Gemma timeout, malformed JSON, model review rejection | Specific failure reason, bounded retry, no fabricated fallback approval; other findings unaffected |
-| UI rerender and download | No focus/scroll flash, no duplicate buttons; independent reconstructed output matches artifacts |
+| Later job finishes first | No publication past an earlier locked finding; auto-expand only after real readiness |
+| Draft ready but zero verified options | Remain locked; bounded automatic recovery; no two-button-only ordinary finding |
+| Earlier approval affects later findings | Lock earliest affected suffix, preserve approvals, reject stale results and refresh current evidence |
+| Frequent historical method and failed new drafting | Retrieve, reconstruct and assess eligible remembered action; approval counts survive deduplication |
+| Revoked action / new CSV | No unsafe replay of old coordinates or revoked decision; fresh applicability checks |
+| 2–5 alternatives | Distinct, ranked, complete scope and exact preview; no invented option to meet a quota |
+| Click No / refine instruction / late worker | Exclusive discussion, retained user dialogue, no old buttons; context-aware new proposal |
+| Button click with busy agents | Immediate acknowledgement; background verification; stable viewport, no duplicate commit |
+| Missing, fractional, negative values | Full source scope and appropriate comparison statistics; no fabricated scientific correction |
+| Taxonomy and annotations | Seven ranks incl. NA; preserve scope/style, compatible corrections and surviving annotations |
+| Earlier deletion / partial overlap | Readable approval origin; only live unresolved targets replanned; valid no-edit closure |
+| Context overflow / engine crash | Bounded retry or truthful blocked state; no loss of source or approval history |
+| Export mismatch / Gemma rejection / approval change | Download blocked until exact replay, model review and artifact verification pass for current state |
 
 Run from the repository root in the project environment:
 
@@ -118,17 +147,19 @@ PYTHONPATH=src:scripts python -m compileall -q app.py src/healthcare_data_qualit
 # Use the complete suite: new tests must be collected, not just selected older tests.
 PYTHONPATH=src:scripts python -m pytest -q --tb=short
 
-# Focused cross-finding, concurrency, review, and export contracts.
+# Focused latest-patch contracts (after applying the cumulative patches).
 PYTHONPATH=src:scripts python -m pytest -q \
-  tests/test_cross_finding_gemma_review_gate_20261122.py \
-  tests/test_model_review_feedback_and_retry_20261122.py \
-  tests/test_prior_approval_resolution_review_20261123.py \
-  tests/test_agent_c_idle_assists_agent_b_20261123.py \
-  tests/test_full_review_scope_audit_verification_20261122.py \
+  tests/test_approval_frequency_ranking_20261124.py \
+  tests/test_automatic_final_actions_20261124.py \
+  tests/test_ordered_review_and_final_model_20261124.py \
+  tests/test_exact_publication_gate_20261124.py \
+  tests/test_memory_first_recommendations_20261124.py \
+  tests/test_responsive_review_workers_20261124.py \
+  tests/test_readable_approval_origin_20261124.py \
   --tb=short
 ```
 
-**Do not publish a pass count until it is observed on the *current* code revision.** The maintainer previously reported **478 passing tests** before some of the newest patches; that count must not be presented as evidence for the latest changes. Also perform a live Streamlit/Gemma smoke test and replay a source CSV plus a non-confidential synthetic fixture. Test for import errors, hidden regressions, real output correctness, conflict handling, and UI responsiveness; do not treat LLM self-assessment as independent validation.
+**Validation status (24 November):** The latest memory-first patch was reported to pass 60 targeted tests with six previously reproduced failures. The immediately preceding verified-options publication patch reported 61 passing tests and one pre-existing failure in its selected suite. These are separate historical test selections, not additive or a current full-suite result. This README update does not rerun them. The complete cumulative suite, live Streamlit interaction, vLLM/Gemma inference, actual latency and GPU memory behavior remain to be validated. Do not claim full regression clearance or guaranteed white-screen elimination. Run the full suite and a live end-to-end review/export using a non-confidential fixture before merging into `main`.
 
 ## 6. Local development, security, and Git delivery
 
@@ -165,7 +196,7 @@ Verify `curl -fsS http://127.0.0.1:8000/v1/models` and open `http://127.0.0.1:85
 
 **Public-repository review:** The historical appendix retains a maintainer email address and machine-specific Windows/WSL paths. Check that you intend to publish those details before pushing to a public remote.
 
-**Privacy and reproducibility:** Keep healthcare/customer datasets, derived CSV/XLSX/ZIP packages, `memory/`, `skills/generated/`, `models/`, `.venv/`, caches, raw conversations, credentials, and local logs out of commits. Preserve prompt/model version, validation implementation version, source fingerprint, and reviewer decision lineage to support reproducibility. Local inference alone does not satisfy regulatory security requirements.
+**Privacy and reproducibility:** Keep healthcare/customer datasets, derived CSV/XLSX/ZIP packages, `memory/`, `skills/generated/`, `models/`, `.venv/`, caches, raw conversations, credentials, and local logs out of commits. Preserve prompt/model version, validation implementation version, source fingerprint, and reviewer decision lineage to support reproducibility. Local inference alone does not satisfy regulatory security requirements. To retain the generated-skills directory marker while excluding local learned content, use `skills/generated/*` and `!skills/generated/.gitkeep` in `.gitignore`. Review all new runtime imports and regression tests before committing; do not commit learned reviewer records.
 
 ---
 
@@ -226,6 +257,27 @@ grep -Ei 'enforce_eager|CompilationMode|CUDAGraphMode|Capturing CUDA graphs|Grap
   ~/gemma_server.log | tail -n 12
 ```
 
+### Recovering from a vLLM engine crash
+
+`EngineDeadError` indicates that the vLLM engine exited, not that Streamlit itself caused the GPU failure. Keep the earlier engine-core traceback: the API shutdown traceback is usually secondary. The application waits for a confirmed engine outage to clear via the local `/health` endpoint before retrying a pending **read-only** inference request; it never replays a cleaning approval. Restart the model server manually while the Streamlit process remains running if you need to retain in-memory review state. The current UI performs bounded automatic recommendation recovery; persistent failures remain blocked rather than exposing routine reassessment buttons.
+
+Capture a complete local server log (logs may contain source-derived diagnostic details; review before sharing):
+
+```bash
+bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_server.log
+```
+
+If the engine crashes again, inspect the first engine-core exception above the `EngineDeadError` shutdown message. Optional diagnostic switches leave the normal three-sequence, 12,288-token, compiled/async profile unchanged:
+
+```bash
+# Isolate CUDA Graph/compiled execution; preserve three sequences.
+HDQ_ENFORCE_EAGER=1 bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_eager.log
+# Separately isolate asynchronous scheduling (default CUDA Graph profile).
+HDQ_ASYNC_SCHEDULING=0 bash scripts/serve_gemma4.sh 2>&1 | tee ~/gemma_sync.log
+```
+
+`HDQ_GPU_MEMORY_UTILIZATION` can override the default `0.90` if the original traceback identifies GPU memory pressure. Lowering it may also leave insufficient KV cache to start the model; it is not a universal crash fix. Do not lower context or sequence limits by default. These switches are diagnostic options, not proof that CUDA graphs, scheduling, or memory caused the failure.
+
 For a controlled A/B comparison, benchmark **both** eager and compiled configurations with the same GPU, checkpoint, precision, three-sequence limit, 12,288-token context, representative prompt/output settings, warm-up policy, and multiple repetitions. Inspect response completion status, generated-token counts, VRAM, KV-cache preemptions, timeouts, structured JSON validity, and actual A/B/C source-grounded edit proposals. Do not use synthetic completion time as a substitute for application correctness or long-context reliability.
 
 **Hardware and rollback notes:** On the RTX 3080 (compute capability 8.6), `--kv-cache-dtype fp8` failed during initialization because vLLM's selected Triton attention backend required SM89+ for native FP8; `--kv-cache-dtype bfloat16` started successfully. This does not determine FP8 support on the RTX 5080 or with another backend. There is no need to install an extra system-wide CUDA Toolkit or cuDNN merely to enable graph capture in the already-working vLLM environment. If graph compilation/capture fails or causes memory pressure, temporarily restore `--enforce-eager` as a diagnostic rollback, retaining the required **three concurrent sequences** and context.
@@ -234,7 +286,7 @@ For a controlled A/B comparison, benchmark **both** eager and compiled configura
 
 ## Historical engineering reference (7–13 November 2026)
 
-> **Archived engineering design, CLI examples, and roadmap.** These older passages intentionally preserve development provenance. Their descriptions of UI readiness, separate approval buttons, source paths, and agent concurrency can predate the 22 November contract above. **Do not use archived statements as current implementation claims.** The source tree and current tests take precedence.
+> **Archived engineering design, CLI examples, and roadmap.** These older passages intentionally preserve development provenance. Their descriptions of UI readiness, separate approval buttons, source paths, and agent concurrency can predate the 24 November contract above. **Do not use archived statements as current implementation claims.** The source tree and current tests take precedence.
 
 **Local-first, evidence-driven, human-governed data-quality investigation and remediation for healthcare and scientific research.** Earlier project aims included deterministic QC, an agent harness, evidence-backed reports, R-sandbox prototypes, and source-preserving transformation experiments.
 
@@ -1606,3 +1658,26 @@ This README expands the project's original five objectives and development appro
 **Contact:** william.techlover@gmail.com
 
 When updating this document, prefer **verified functionality and exact commands** over aspirational claims. Distinguish tested, partially implemented, and planned features; never include confidential dataset names, contents, private paths, patient information, model credentials, or customer evidence in public documentation.
+
+### Historical UI regression: source-bound review closure styling (November 2026)
+
+The terminal **Mark reviewed** action is created from the runtime `close_label` inside
+`_render_bottom_review_closure`, with widget key `review_close_any_{finding_id}`.
+It is **blue** (`#2563EB`) and uses Streamlit `type="secondary"` so the app's red
+primary theme cannot incorrectly style a no-change review as rejection. The
+same blue style is applied to the source-verified prior-approval fallback
+(`review_resolution_model_fallback_...`). The stylesheet is emitted inside the
+review rendering path to survive fragment rerenders. **Yes** actions remain
+green; **No — Discuss** actions remain red. Regression coverage checks the
+actual dynamic widget keys and button types rather than a synthetic old label.
+
+A saved recovery checkpoint that fails lineage or finding-ID verification is
+**not** restored, even if the source CSV has the same filename. The UI now
+explains that a changed investigation/version can invalidate old checkpoints
+and offers an explicit fresh-review action that **retains the old checkpoint**.
+No historical reviewer approval is silently replayed. This is an audit
+integrity invariant, not permission to overwrite previous decisions.
+
+Developer cleanup: the project excludes Python caches, local source/reviewer
+memories, and obsolete blue-button patch installers. The empty `__init__.py`
+files remain: they are package markers, not redundant application modules.

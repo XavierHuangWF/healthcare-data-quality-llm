@@ -31,16 +31,16 @@ def test_deictic_and_direct_taxonomy_flag_sentences(tmp_path):
                [{"CSV row": n} for n in (2, 3, 4, 5)]}
     for instruction in (
         "flag these four rows make the taxonomy bold and red",
-        "highlight these rows", "mark all rows", "highlight all of them",
-        "make these taxonomy names bold red", "make the font of these four rows column 1 bold and red",
-        "highline these four rows", "highlight", "flag",
+        "highlight all of them", "make these taxonomy names bold red",
+        "make the font of these four rows column 1 bold and red", "highlight", "flag",
     ):
         proposal = requested_visual_flag(instruction, finding, source)
-        assert [item["row"] for item in proposal["flags"]] == [2, 3, 4, 5]
-    assert [item["row"] for item in requested_visual_flag(
-        "flag rows 2, 4 and 5", finding, source)["flags"]] == [2, 4, 5]
-    assert [item["row"] for item in requested_visual_flag(
-        "highlight row 2, row 3 and row 5", finding, source)["flags"]] == [2, 3, 5]
+        assert [(item["row"], item["column"]) for item in proposal["flags"]] == [(r, 1) for r in (2,3,4,5)]
+    for instruction in ("highlight these rows", "mark all rows", "highline these four rows"):
+        proposal = requested_visual_flag(instruction, finding, source)
+        assert [(item["row"], item["column"]) for item in proposal["flags"]] == [(r,c) for r in (2,3,4,5) for c in (1,2)]
+    for instruction, rows in (("flag rows 2, 4 and 5", (2,4,5)), ("highlight row 2, row 3 and row 5", (2,3,5))):
+        assert [(item["row"], item["column"]) for item in requested_visual_flag(instruction, finding, source)["flags"]] == [(r,c) for r in rows for c in (1,2)]
     assert source.read_bytes() == raw
 
 

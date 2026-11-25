@@ -28,7 +28,7 @@ def independently_reconcile(*, original_csv: bytes, final_csv: bytes,
                             history: list[dict], review_statuses: dict,
                             findings: dict[str, str], approved_rows: list[dict],
                             approved_columns: list[dict],
-                            discussions: dict | None = None) -> dict:
+                            discussions: dict | None = None, reviewer: str = "") -> dict:
     original, final = _records(original_csv), _records(final_csv)
     row_map, col_map = _exported_positions(original, final, approved_rows, approved_columns)
     edits = defaultdict(list)
@@ -132,6 +132,32 @@ def independently_reconcile(*, original_csv: bytes, final_csv: bytes,
             'Deleted from final file',
             'Original entire column retained in this audit; full CSV is in the ZIP', '',
         ])
+    # Formatting is an approved action even when it changes no CSV values.
+    # Preserve each historical flag in the source-to-final proof, with the
+    # later structural approval that superseded it (if any).
+    row_owners = {ch.get('row') if a.get('operation') == 'drop_rows' else ch.get('source_row'): a.get('finding_id')
+                  for a in approved_rows for ch in a.get('changes', [])}
+    col_owners = {a.get('position'): a.get('finding_id') for a in approved_columns}
+    flag_events = [e for e in history if e.get('dataset_id') == 'dataset_1' and e.get('operation') == 'flag_cells']
+    latest = {(f['row'],f['column']): (i,j) for i,e in enumerate(flag_events) for j,f in enumerate(e.get('flags', []))}
+    for i,event in enumerate(flag_events):
+        fid = str(event.get('finding_id') or '')
+        for j,flag in enumerate(event.get('flags') or []):
+            r,c=flag['row'],flag['column']
+            if flag.get('before') != original[r-1][c-1] or flag.get('style') != 'bold_red':
+                raise PermissionError('Annotation audit differs from original evidence')
+            survives = r in row_map and c in col_map
+            owners = [findings.get(str(x),str(x)) for x in dict.fromkeys([row_owners.get(r),col_owners.get(c)]) if x]
+            if not survives:
+                outcome, proof = 'Superseded by approved deletion', 'Deleted by: ' + '; '.join(owners)
+            elif latest[(r,c)] != (i,j):
+                outcome, proof = 'Superseded by later annotation', 'Later approved style replaces this annotation'
+            else:
+                outcome, proof = 'Annotation survives', 'Verify bold/red and approved fill in actual workbook'
+            changes.append([findings.get(fid,fid),str(event.get('reviewer') or ''),'flag_cells',f'R{r}:C{c}',original[0][c-1],flag['before'],
+                'Bold red + yellow highlight' if flag.get('fill',True) else 'Bold red font only',
+                final[row_map[r]-1][col_map[c]-1] if survives else '(absent)',
+                f'R{row_map[r]}:C{col_map[c]}' if survives else '(deleted)',outcome,proof,str(event.get('approval_group') or '')])
     counts = defaultdict(lambda: {'changes': 0, 'actions': set(), 'reviewer': set()})
     for event in history:
         if event.get('dataset_id') != 'dataset_1':
@@ -153,9 +179,10 @@ def independently_reconcile(*, original_csv: bytes, final_csv: bytes,
         status = str(review_statuses.get(fid) or 'Not reviewed')
         info = counts[fid]
         result = ('Kept unchanged' if status == 'Reviewed — no change'
+                  else 'Resolved by earlier approvals; no new edits' if status == 'Resolved by earlier approved edit'
                   else 'Approved; see source-to-final checks' if info['actions']
                   else 'Pending — export should be locked')
-        summary.append([title, status, ', '.join(sorted(info['reviewer'])),
+        summary.append([title, status, ', '.join(sorted(info['reviewer'])) or (reviewer if status in {'Resolved by earlier approved edit', 'Reviewed — no change'} else ''),
                         len(info['actions']), info['changes'], chat_counts.get(fid, 0), result])
     digest = hashlib.sha256(final_csv).hexdigest()
     return {'summary': summary, 'details': changes,

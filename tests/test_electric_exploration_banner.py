@@ -122,7 +122,7 @@ def test_streamlit_phase_two_banner_rendered_before_long_model_call():
     app = (ROOT / "app.py").read_text()
     assert 'self.hero_slot = st.empty()' in app
     assert 'self.hero_container = st.container(key="hdq_investigation_banner_blocking")' in app
-    assert 'components.html(render_investigation_phase_banner_html(' in app
+    assert 'st.iframe(render_investigation_phase_banner_html(' in app
     assert 'baseline_ready_callback=publish_baseline' in (ROOT / "src/healthcare_data_quality/jobs/investigation_jobs.py").read_text()
     assert 'render_investigation_phase_banner_html(' in app
     assert 'self.hero_slot.empty()' in app
@@ -134,7 +134,7 @@ def test_banner_is_compact_and_keeps_live_state():
         "status": "running", "started_at": "2026-11-16T16:15:00+00:00",
         "activity": "Generating verified exploration 2", "runs": [{}, {}],
     })
-    assert "min-height:142px" in html
+    assert "min-height:122px" in html
     assert "max-height:122px" in html
     assert "Verified exploratory checks: <b>2</b>" in html
     assert "Generating verified exploration 2" in html
@@ -148,7 +148,7 @@ def test_full_banner_floats_at_viewport_level_not_inside_iframe():
     assert ".st-key-hdq_investigation_banner_blocking" in css
     assert "position: fixed !important" in css
     assert "right: 1.1rem !important" in css
-    assert "width: min(390px" in css
+    assert "width: min(300px" in css
     assert "position: sticky" not in css
     assert "animation-timeline: --hdq-page-scroll" in css
     assert "@keyframes hdq-follow-scroll-thumb" in css
@@ -159,7 +159,7 @@ def test_full_banner_floats_at_viewport_level_not_inside_iframe():
     assert "with banner_slot.container():" in app
     assert "render_recommendation_banner_html(recommendation_state)" in app
     assert "render_finished_investigation_banner_html(" in app
-    assert "height=170, scrolling=False" in app
+    assert "height=170" in app
 
 
 def test_larger_floating_card_keeps_scroll_tracking_and_mobile_fit():
@@ -167,8 +167,8 @@ def test_larger_floating_card_keeps_scroll_tracking_and_mobile_fit():
     html = render_investigation_phase_banner_html(
         phase=2, phase_count=3, activity="Exploring", started_epoch_ms=1795000000000
     )
-    assert "width: min(390px" in css
-    assert "width: min(390px" in css
+    assert "width: min(300px" in css
+    assert "width: min(300px" in css
     assert "position: fixed !important" in css
     assert "animation-timeline: --hdq-page-scroll" in css
     assert "grid-template-columns:minmax(0,1fr) 144px" in html
@@ -176,4 +176,4 @@ def test_larger_floating_card_keeps_scroll_tracking_and_mobile_fit():
     assert "max-height:122px" in html
     app = (ROOT / "app.py").read_text()
     # Synchronous, live, fallback, and parked-before-run investigation cards.
-    assert app.count("height=170, scrolling=False") >= 3
+    assert app.count("height=170") >= 3

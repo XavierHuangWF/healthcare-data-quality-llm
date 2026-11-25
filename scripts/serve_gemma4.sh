@@ -28,20 +28,38 @@ if [[ ! "$MAX_SEQS" =~ ^[123]$ ]]; then
     exit 2
 fi
 
+# Stability profile: keep CUDA graphs but disable async scheduling by default.
+# Explicit HDQ_ASYNC_SCHEDULING=1 restores the previous fast profile.
+GPU_UTIL="${HDQ_GPU_MEMORY_UTILIZATION:-0.90}"
+if [[ ! "$GPU_UTIL" =~ ^(0\.[0-9]+|1(\.0+)?)$ ]] || [[ "$GPU_UTIL" =~ ^0\.0+$ ]]; then
+    echo "ERROR: HDQ_GPU_MEMORY_UTILIZATION must be in (0, 1]." >&2
+    exit 2
+fi
+EAGER="${HDQ_ENFORCE_EAGER:-0}"
+ASYNC="${HDQ_ASYNC_SCHEDULING:-0}"
+if [[ ! "$EAGER" =~ ^[01]$ || ! "$ASYNC" =~ ^[01]$ ]]; then
+    echo "ERROR: HDQ_ENFORCE_EAGER and HDQ_ASYNC_SCHEDULING must be 0 or 1." >&2
+    exit 2
+fi
+EXTRA_ARGS=()
+if [[ "$EAGER" == 1 ]]; then EXTRA_ARGS+=(--enforce-eager); fi
+if [[ "$ASYNC" == 1 ]]; then EXTRA_ARGS+=(--async-scheduling); else EXTRA_ARGS+=(--no-async-scheduling); fi
+
 echo "Starting Gemma 4 12B..."
 echo "Model: $MODEL_DIR"
 echo "Server: http://127.0.0.1:8000"
 echo "Model context: $MODEL_LEN tokens (minimum: 12288)"
 echo "vLLM max simultaneous sequences: $MAX_SEQS"
+echo "GPU utilization: $GPU_UTIL; eager: $EAGER; async scheduling: $ASYNC"
 
 exec "$VLLM" serve "$MODEL_DIR" \
     --served-model-name gemma4-12b \
     --host 127.0.0.1 \
     --port 8000 \
     --max-model-len "$MODEL_LEN" \
-    --gpu-memory-utilization 0.90 \
-    --max-num-seqs "${HDQ_MAX_NUM_SEQS:-3}" \
+    --gpu-memory-utilization "$GPU_UTIL" \
+    --max-num-seqs "$MAX_SEQS" \
     --model-impl vllm \
     --kv-cache-dtype bfloat16 \
-    --async-scheduling \
+    "${EXTRA_ARGS[@]}" \
     --language-model-only

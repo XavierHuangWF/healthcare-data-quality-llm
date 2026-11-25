@@ -96,7 +96,7 @@ def test_gemma_model_assesses_the_no_edit_closure_before_showing_button(monkeypa
 def test_app_has_single_explicit_close_action_and_terminal_export_gate():
     src = (Path(__file__).resolve().parents[1] / 'app.py').read_text()
     assert 'if _render_prior_approval_closure(fid, finding, source):' in src
-    assert "st.button('Yes — ' + str(previous['label'])" in src
+    assert "st.button(str(previous['label'])" in src
     assert "st.session_state.cleaning_review_statuses[fid] = 'Resolved by earlier approved edit'" in src
     assert 'resolved_by_prior_approvals' in src
 

@@ -57,6 +57,9 @@ def audit_tables(*, original_csv: bytes, final_csv: bytes, history: list[dict],
         data.append([findings.get(fid, fid), kind, who, location,
                      before, approved, outcome, final_location])
 
+    latest_flag = {(f['row'], f['column']): event for event in history
+                   if isinstance(event,dict) and event.get('dataset_id') == 'dataset_1' and event.get('operation') == 'flag_cells'
+                   for f in event.get('flags', [])}
     for event in history:
         if not isinstance(event, dict) or event.get("dataset_id") != "dataset_1":
             continue
@@ -112,8 +115,9 @@ def audit_tables(*, original_csv: bytes, final_csv: bytes, history: list[dict],
                 r, c = flag["row"], flag["column"]
                 survives = r in row_map and c in col_map
                 add(fid, "flag_cells", who, f"R{r}:C{c}", str(flag.get("before") or ""),
-                    "Bold red + yellow highlight (value unchanged)",
-                    "Flagged in final Excel" if survives else "Superseded by approved deletion",
+                    ("Bold red + yellow highlight (value unchanged)" if flag.get("fill", True) else "Bold red font only (value unchanged)"),
+                    ("Superseded by approved deletion" if not survives else
+                     "Flagged in final Excel" if latest_flag[(r,c)] is event else "Superseded by later annotation"),
                     f"R{row_map[r]}:C{col_map[c]}" if survives else "")
         else:
             raise PermissionError("Unknown approval operation in audit history")
@@ -142,7 +146,7 @@ def audit_tables(*, original_csv: bytes, final_csv: bytes, history: list[dict],
         original_csv=original_csv, final_csv=final_csv,
         history=history, review_statuses=review_statuses,
         findings=findings, approved_rows=approved_rows,
-        approved_columns=approved_columns, discussions=discussions)
+        approved_columns=approved_columns, discussions=discussions, reviewer=named)
     # The overview is deliberately one row per finding/check, instead of a
     # sprawling flat list of technical ledger operations.
     # Group all actions for a finding/check together; keep approval order
@@ -150,6 +154,7 @@ def audit_tables(*, original_csv: bytes, final_csv: bytes, history: list[dict],
     by_title = {title: index for index, title in enumerate(findings.values())}
     data.sort(key=lambda row: by_title.get(row[0], len(by_title)))
     reconciliation['details'].sort(key=lambda row: by_title.get(row[0], len(by_title)))
+    flag_details = [r for r in reconciliation['details'] if r[2] == 'flag_cells']
     verification = [
         ["Reviewer", named],
         ["Exported at (UTC)", datetime.now(timezone.utc).isoformat()],
@@ -161,6 +166,9 @@ def audit_tables(*, original_csv: bytes, final_csv: bytes, history: list[dict],
         ["Reviewed no-change decisions", str(sum(v == "Reviewed — no change" for v in review_statuses.values()))],
         ["Reviews resolved by earlier approvals", str(sum(v == "Resolved by earlier approved edit" for v in review_statuses.values()))],
         ["Audit operation records", str(len(data))],
+        ["Approved annotation records", str(len(flag_details))],
+        ["Annotations surviving in cleaned Excel", str(sum(r[9] == "Annotation survives" for r in flag_details))],
+        ["Annotations superseded by deletion", str(sum(r[9] == "Superseded by approved deletion" for r in flag_details))],
         ["Discussion records", str(len(discussions_out))],
         ["Final CSV independently verified", "Yes" if verified is not None else "No"],
         ["Original data rows", str(reconciliation['original_rows'])],
@@ -175,6 +183,12 @@ def audit_tables(*, original_csv: bytes, final_csv: bytes, history: list[dict],
         ["Note", "All original coordinates are physical CSV coordinates including header row 1."],
         ["Scientific interpretation", "The model is advisory; this verifies approved file operations, not biological taxon correctness."],
     ]
+    if isinstance(verified, dict) and verified.get('gemma_final_review', {}).get('verified') is True:
+        model = verified['gemma_final_review']
+        verification.insert(10, ['Gemma final review', f"Passed · {model['batches']} evidence batches"])
+        verification.insert(11, ['Gemma-reviewed final SHA256', model['final_sha256']])
+        if model.get('workbook_evidence_sha256'):
+            verification.insert(12, ['Gemma-reviewed workbook evidence SHA256', model['workbook_evidence_sha256']])
     # Keep the verification summary at the top for quick sign-off, then include
     # the complete source-to-final proof *on the Verification sheet itself*.
     # Reviewers need not switch tabs to inspect every original/approved/final
@@ -194,6 +208,27 @@ def audit_tables(*, original_csv: bytes, final_csv: bytes, history: list[dict],
             "Source-to-final checks": [DETAIL_HEADERS, *reconciliation['details']],
             "Interaction log": [DISCUSSION_HEADERS, *discussions_out],
             "Verification": [VERIFY_HEADERS, *verification]}
+
+
+def _annotation_audit_targets(name, rows):
+    """Historical evidence only; never put a deleted value into cleaned data."""
+    for i,row in enumerate(rows, 1):
+        if name == 'Audit trail' and len(row) >= 6 and row[1] == 'flag_cells':
+            yield i, 5, 'yellow' in str(row[5]).lower()
+        elif name in {'Source-to-final checks', 'Verification'} and len(row) >= 7 and row[2] == 'flag_cells':
+            yield i, 6, 'yellow' in str(row[6]).lower()
+
+
+def _check_annotation_style(cell, fill):
+    color = cell.font.color
+    rgb = color.rgb if color is not None and color.type == 'rgb' else None
+    if cell.font.bold is not True or rgb != 'FFDC2626':
+        raise PermissionError('Audit lost approved red/bold annotation evidence')
+    if fill:
+        if cell.fill.patternType != 'solid' or cell.fill.fgColor.type != 'rgb' or cell.fill.fgColor.rgb != 'FFFFE699':
+            raise PermissionError('Audit lost approved yellow annotation evidence')
+    elif cell.fill.patternType is not None:
+        raise PermissionError('Audit added unapproved annotation fill')
 
 
 def embed_audit_sheets(xlsx: bytes, tables: dict) -> bytes:
@@ -263,6 +298,10 @@ def embed_audit_sheets(xlsx: bytes, tables: dict) -> bytes:
             for row in sheet.iter_rows(min_row=2):
                 for cell in row:
                     cell.alignment = Alignment(wrap_text=True, vertical="top")
+        for row_i, col_i, fill in _annotation_audit_targets(name, tables[name]):
+            cell = sheet.cell(row_i, col_i)
+            cell.font = Font(bold=True, color="FFDC2626")
+            cell.fill = PatternFill("solid", fgColor="FFFFE699") if fill else PatternFill()
     saved = io.BytesIO()
     workbook.save(saved)
     workbook.close()
@@ -272,7 +311,7 @@ def embed_audit_sheets(xlsx: bytes, tables: dict) -> bytes:
 def verify_audit_sheets(xlsx: bytes, tables: dict) -> None:
     """Fail export if the attached human-readable audit loses or changes an entry."""
     from openpyxl import load_workbook
-    workbook = load_workbook(io.BytesIO(xlsx), read_only=True, data_only=False)
+    workbook = load_workbook(io.BytesIO(xlsx), read_only=False, data_only=False)
     try:
         if workbook.sheetnames != ["Cleaned dataset", "Review overview", "Audit trail",
                                    "Source-to-final checks", "Interaction log", "Verification"]:
@@ -287,5 +326,16 @@ def verify_audit_sheets(xlsx: bytes, tables: dict) -> None:
                         for row in rows]
             if actual != expected:
                 raise PermissionError(f"Audit sheet {name} does not match verified reviewer history")
+            expected_annotations = {(r,c):fill for r,c,fill in _annotation_audit_targets(name, rows)}
+            for (row_i,col_i),fill in expected_annotations.items():
+                _check_annotation_style(workbook[name].cell(row_i, col_i), fill)
+            for cell_row in workbook[name].iter_rows():
+                for cell in cell_row:
+                    if (cell.row,cell.column) in expected_annotations:
+                        continue
+                    rgb = cell.font.color
+                    if ((rgb is not None and rgb.type == 'rgb' and rgb.rgb == 'FFDC2626') or
+                        (cell.fill.patternType == 'solid' and cell.fill.fgColor.type == 'rgb' and cell.fill.fgColor.rgb == 'FFFFE699')):
+                        raise PermissionError('Audit contains an unauthorized annotation')
     finally:
         workbook.close()

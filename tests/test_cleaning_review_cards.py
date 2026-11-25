@@ -228,14 +228,17 @@ def test_accepting_source_backed_suggestion_executes_with_one_click(monkeypatch,
     monkeypatch.setattr("healthcare_data_quality.cleaning.finding_cleaning.allowed_positions",
                         lambda *args: ({(2, 2)}, set()))
 
+    from healthcare_data_quality.services.recommendation_options import source_backed_choices
+    from healthcare_data_quality.ui.finding_choice_integrity import scoped_review_choices
+    from healthcare_data_quality.services.model_plan_review import option_fingerprint
+    suggestion = {"status": "ready", "suggestion": "Replace invalid count 0.2 with 0",
+                  "decision_needed": "", "choices": [{"label": "Replace with zero", "operations": [{
+                    "operation": "replace_cells", "changes": [{"row": 2, "column": 2, "before": "0.2", "after": "0"}]}]}]}
+    choices = scoped_review_choices(finding, file, source_backed_choices(finding, file, suggestion))
+    suggestion['gemma_option_reviews'] = [{'fingerprint': option_fingerprint(finding,file,c), 'can_offer': True, 'reason':'Exact scope reviewed'} for c in choices]
     class SavedAgentB:
         def snapshot(self, key):
-            return {"entries": {finding["id"]: {
-                "status": "ready", "suggestion": "Replace invalid count 0.2 with 0",
-                "decision_needed": "", "choices": [{
-                    "label": "Replace with zero", "operations": [{
-                        "operation": "replace_cells", "changes": [
-                            {"row": 2, "column": 2, "before": "0.2", "after": "0"}]}]}]}}}
+            return {"entries": {finding["id"]: suggestion}}
 
     monkeypatch.setattr("healthcare_data_quality.jobs.cleaning_jobs.recommendation_manager",
                         lambda: SavedAgentB())
@@ -244,20 +247,18 @@ def test_accepting_source_backed_suggestion_executes_with_one_click(monkeypatch,
     assert any(item[0] == "table" for item in st.comments)
     st.session_state.cleaning_approved_reviewer = 'Reviewer X'
     executed = []
-    def commit_once(state, selected_finding, path, choice):
+    def queue_once(selected_finding, path, choice):
         executed.append(choice['operations'])
-        state.cleaning_review_statuses[selected_finding['id']] = 'Applied and verified'
-        state.cleaning_history.append({'finding_id': selected_finding['id']})
-        return {'warning': None}
-    monkeypatch.setattr('healthcare_data_quality.ui.one_click_choice.execute_verified_choice',
-                        commit_once)
-    st.buttons_on.add(f"review_yes_{finding['id']}_0_option_0")
+        st.session_state.cleaning_pending_gemma_b[selected_finding['id']] = {'kind':'local_choice'}
+        return True
+    monkeypatch.setattr(app, '_queue_local_choice', queue_once)
+    st.buttons_on.add(f"review_yes_{finding['id']}_0_option_{option_fingerprint(finding, file, choices[0])[:20]}")
     with pytest.raises(StopIteration, match="rerun"):
         app.render_cleaning_workspace([file], uploaded, {}, "audit-C", [])
     assert len(executed) == 1
     assert file.read_bytes() == original
-    assert st.session_state.cleaning_history == [{'finding_id': finding['id']}]
-    assert st.session_state.cleaning_review_statuses[finding['id']] == 'Applied and verified'
+    assert st.session_state.cleaning_history == []
+    assert st.session_state.cleaning_pending_gemma_b[finding['id']]['kind'] == 'local_choice'
     assert st.session_state.cleaning_plans_by_finding == {}
 
 

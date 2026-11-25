@@ -39,7 +39,7 @@ def apply_explicit_visual_flag_once(
     before_bytes = source.read_bytes()
     verified = requested_visual_flag(request, finding, source)
     if verified is None or not verified.get("flags"):
-        raise ValueError("No exact taxonomy flag targets were found in the request")
+        raise ValueError("No exact visual flag targets were found in the request")
     digest = hashlib.sha256(before_bytes).hexdigest()
     if verified.get("source_sha256") != digest or verified.get("dataset_id") != ds_id:
         raise PermissionError("Original source/dataset changed since flag preparation")
@@ -59,6 +59,18 @@ def apply_explicit_visual_flag_once(
     staged = state.get("cleaning_staged_bytes_by_dataset", {}).get(ds_id, before_bytes)
     if not isinstance(staged, bytes):
         raise PermissionError("Staged CSV bytes unavailable")
+    from healthcare_data_quality.cleaning.active_visual_flags import split_active_visual_flags
+    from healthcare_data_quality.cleaning.in_memory_cleaning import _records
+    _, removed = split_active_visual_flags(verified['flags'],
+        state.get('cleaning_approved_rows_by_dataset', {}).get(ds_id, []),
+        state.get('cleaning_approved_columns_by_dataset', {}).get(ds_id, []))
+    if removed:
+        raise PermissionError("A displayed flag target has been removed by an earlier approval")
+    originals, current = _records(before_bytes), _records(staged)
+    if len(originals) != len(current) or any(len(a) != len(b) for a,b in zip(originals,current)):
+        raise PermissionError("Staged CSV coordinates changed since flag preparation")
+    if any(current[f['row']-1][f['column']-1] != f['before'] for f in verified['flags']):
+        raise PermissionError("A displayed flag target has changed since the original source")
     # No state mutation before every provenance and authorization check passes.
     new_flags = [
         {**flag, "finding_id": fid, "reviewer": reviewer}
@@ -77,6 +89,8 @@ def apply_explicit_visual_flag_once(
         "source_sha256": digest, "staged_sha256": hashlib.sha256(staged).hexdigest(),
         "modified_positions": [], "storage": "session_visual_annotations_no_csv_change",
         "authorization": "explicit_user_instruction_one_click",
+        "gemma_review": dict(previously_displayed.get("gemma_review") or {}),
+        "review_revision": previously_displayed.get("review_revision"),
     })
     state.setdefault("cleaning_review_statuses", {})[fid] = "Applied and verified"
     state.setdefault("cleaning_decisions", []).append({
@@ -92,4 +106,16 @@ def apply_explicit_visual_flag_once(
         "cleaning_discussion_mode_by_finding",
     ):
         state.setdefault(name, {}).pop(fid, None)
+    # Annotation approvals are real user decisions, not value replacements.
+    # Keep them in the same ranking store after successful named approval.
+    try:
+        from healthcare_data_quality.learning.interaction_memory import save_reviewed_solution
+        save_reviewed_solution(finding, source, operations=[{
+            'operation':'flag_cells', 'dataset_id':ds_id, 'changes':verified['flags'],
+            'visual_scope':verified['scope'],
+            'style':'bold red and yellow fill' if verified['flags'][0].get('fill', True) else 'bold red font only'}],
+            user_request=request, button_label=(previously_displayed.get("gemma_review") or {}).get("button_label"))
+    except (OSError, ValueError, TypeError, RuntimeError):
+        # The authorized audit remains authoritative if advisory memory fails.
+        state.setdefault('cleaning_memory_write_errors', []).append(fid)
     return {"approved": len(new_flags), "source_sha256": digest}

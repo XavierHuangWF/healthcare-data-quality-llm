@@ -50,11 +50,22 @@ def build_cleaning_findings(audit: dict, paths: list[Path], names: list[str], ru
             # With exactly one uploaded dataset we can still associate its
             # immutable source for read-only review and explicit UI selection.
             check_ds = "dataset_1" if len(paths) == 1 and "dataset_1" in baselines else ""
+            # Show the specific tested hypothesis on the review card, not an
+            # unhelpful generic "no candidate anomalies" sentence.
+            check_heading = str(proposal.get("hypothesis") or result.get("summary")
+                                or "Completed Gemma check").strip()[:180]
             items.append({"id": f"gemma:{round_number}:check", "dataset_id": check_ds,
                           "name": names[0] if check_ds else "Gemma",
-                          "title": str(result.get("summary") or proposal.get("hypothesis") or "Completed Gemma check"),
+                          "title": check_heading,
                           "source": "Gemma check", "check_key": "gemma_check", "method": proposal.get("method") or "",
-                          "evidence": [], "actionable": False})
+                          "evidence": [], "actionable": False,
+                          "gemma_check_details": {
+                              "proposal": {"hypothesis": proposal.get("hypothesis") or "",
+                                           "method": proposal.get("method") or ""},
+                              "result": {"summary": result.get("summary") or "",
+                                         "findings": []},
+                              "verification": {"status": verification.get("status") or ""},
+                          }})
             continue
         for finding_number, finding in enumerate(findings, 1):
             # Find the dataset from the saved source citations; without an unambiguous
@@ -124,6 +135,13 @@ def allowed_positions(finding: dict, source: Path) -> tuple[set[tuple[int, int]]
             name = record.get("Conflicting field")
             if isinstance(name, str) and header.count(name) == 1:
                 rows.add((csv_row, header.index(name) + 1))
+    if key == 'find_invalid_counts' and 'missing values' in str(finding.get('title') or '').casefold():
+        from healthcare_data_quality.services.recommendation_options import _source_verified_missing_rows, _rows
+        records = _rows(source)
+        complete = _source_verified_missing_rows(finding, records)
+        if complete:
+            rows.update((r,c) for r in complete for c in range(2,len(header)+1)
+                        if not records[r-1][c-1].strip())
     if key == "find_duplicate_taxa":
         # Repeated taxa should be resolved against a biological identifier, not
         # through a guessed label change; offer discussion only.

@@ -32,7 +32,19 @@ def _local_mascot_data_url(path: Path) -> str:
     """
     if path.is_file():
         mime = 'image/webp' if path.suffix.lower() == '.webp' else 'image/png'
-        return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode('ascii')
+        # These mascots occupy ~100 CSS pixels. Shipping full-size artwork in
+        # every periodic iframe update wastes websocket bandwidth and browser memory.
+        try:
+            from io import BytesIO
+            from PIL import Image
+            with Image.open(path) as image:
+                image.thumbnail((220, 220))
+                output = BytesIO()
+                image.save(output, format='WEBP' if mime == 'image/webp' else 'PNG', optimize=True)
+                payload = output.getvalue()
+        except (ImportError, OSError, ValueError):
+            payload = path.read_bytes()
+        return f"data:{mime};base64," + base64.b64encode(payload).decode('ascii')
     placeholder = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
                    b'<circle cx="50" cy="50" r="42" fill="#dbeafe"/>'
                    b'<rect x="24" y="35" width="52" height="36" rx="12" fill="#2563eb"/>'
@@ -208,9 +220,9 @@ def _banner(*, phase: int, phase_count: int, activity: str,
     return f"""<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <style>
 * {{box-sizing:border-box}}
-html,body {{margin:0;padding:0;background:transparent;color:#fff;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif;}}
+html,body {{margin:0;padding:0;overflow:hidden;background:transparent;color:#fff;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif;}}
 .hdq-hero {{position:relative;isolation:isolate;overflow:hidden;display:grid;align-items:center;
- grid-template-columns:minmax(0,1fr) 144px;column-gap:9px;min-height:142px;
+ grid-template-columns:minmax(0,1fr) 144px;column-gap:9px;min-height:122px;
  padding:12px 14px 12px;border:1px solid #24b8ff;border-radius:14px;
  background:linear-gradient(112deg,#0a1d38 0%,#0a2850 63%,#065165 100%);
  box-shadow:0 2px 14px #077ed444,inset 0 0 16px #1059b244;}}
@@ -219,7 +231,7 @@ html,body {{margin:0;padding:0;background:transparent;color:#fff;font-family:ui-
 .hdq-left {{min-width:0;z-index:2;}}
 .hdq-title {{font-size:18px;font-weight:800;letter-spacing:-.025em;line-height:1.25;margin:0 0 5px;}}
 .hdq-title .gold {{color:#ffd34e;}}
-.hdq-sub {{font-size:12px;color:#cbecff;margin:0 0 5px;}}
+.hdq-sub {{display:none;font-size:12px;color:#cbecff;margin:0 0 5px;}}
 .hdq-phase {{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:#cce9ff;}}
 .hdq-pill {{background:#1687ef;border-radius:20px;padding:3px 9px;color:#fff;font-size:10px;font-weight:750;}}
 .hdq-track {{height:5px;border-radius:10px;background:#c8defb36;margin:7px 0;overflow:hidden;}}
@@ -238,9 +250,9 @@ html,body {{margin:0;padding:0;background:transparent;color:#fff;font-family:ui-
  color:#14254a;text-align:center;line-height:1.15;font-size:9px;font-weight:800;
  box-shadow:0 0 10px #dfae3566;}}
 .hdq-footer {{display:none;}}
-@media(max-width:550px) {{.hdq-hero{{grid-template-columns:minmax(0,1fr) 78px;min-height:144px;padding:10px 10px;}}
+@media(max-width:550px) {{.hdq-hero{{grid-template-columns:minmax(0,1fr) 78px;min-height:122px;padding:10px 10px;}}
  .hdq-right{{height:94px}}.hdq-mascot{{max-height:90px}}.hdq-bubble{{display:none}}
- .hdq-title{{font-size:17px}}.hdq-metrics{{font-size:11px;gap:3px 7px}}
+ .hdq-title{{font-size:14px}}.hdq-metrics{{font-size:11px;gap:3px 7px}}
  .hdq-metrics span:nth-child(2){{font-size:0}}
  .hdq-metrics span:nth-child(2)::before{{content:"✓ Checks: ";font-size:10px}}
  .hdq-metrics span:nth-child(2) b{{font-size:10px}}.hdq-footer{{font-size:9px}}}}
@@ -253,7 +265,7 @@ html,body {{margin:0;padding:0;background:transparent;color:#fff;font-family:ui-
    <div class="hdq-phase"><span class="hdq-pill">{'Waiting' if idle_state is not None else 'Run ended' if finished_state is not None else f'Phase {phase} of {phase_count}'}</span>{phase_label}</div>
    <div class="hdq-track" role="img" aria-label="{'Not started' if idle_state is not None else 'Recorded run ended' if finished_state is not None else f'{phase - 1} of {phase_count} workflow phases completed'}"><div class="hdq-fill"></div></div>
    <div class="hdq-metrics"><span>{'○ Not started' if idle_state is not None else '✓ Run ended' if finished_state is not None else f'◷ Elapsed: <b id="hdq-live-clock">{elapsed}</b>'}</span><span>{metric}</span></div>
-   <div class="hdq-activity">Current activity: <b>{activity}</b></div>
+   <div class="hdq-activity"><b>{activity}</b></div>
    <div class="hdq-footnote">Progress shows workflow phases, not estimated completion time.</div>
    <div class="hdq-footer">{footer}</div>
  </div>
@@ -297,13 +309,17 @@ html,
    A genuine viewport-following mini-panel, rather than an in-flow banner.
    The same rule applies to the synchronous phases and async exploration. */
 .st-key-hdq_investigation_banner,
+.st-key-hdq_investigation_banner_live,
+/* Fallback if the live fragment's keyed block class is not propagated.
+   Match only the block directly owning the marker, never its ancestors. */
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .hdq-status-live-anchor),
 .st-key-hdq_investigation_banner_blocking {
     position: fixed !important;
     top: 4.1rem !important;
     right: 1.1rem !important;
     left: auto !important;
-    width: min(390px, calc(100vw - 2.2rem)) !important;
-    max-width: min(390px, calc(100vw - 2.2rem)) !important;
+    width: min(300px, calc(100vw - 2.2rem)) !important;
+    max-width: min(300px, calc(100vw - 2.2rem)) !important;
     z-index: 999 !important;
     pointer-events: none !important;
     margin: 0 !important;
@@ -314,6 +330,15 @@ html,
     animation-fill-mode: both;
     animation-timeline: --hdq-page-scroll;
     animation-range: 0% 100%;
+}
+/* A live status fragment should not animate in response to every page layout change. */
+.st-key-hdq_investigation_banner_live,
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .hdq-status-live-anchor) {
+    animation: none !important;
+}
+/* The marker and its stylesheet must not create a fourth card or a gap. */
+[data-testid="stElementContainer"]:has(.hdq-status-live-anchor) {
+    display: none !important;
 }
 /* Mount terminal-state close buttons as native Streamlit overlays inside
    their OWN cards. The outer floating host is pointer-events:none, but these
@@ -373,17 +398,21 @@ html,
 /* Streamlit's internal block and the component iframe fill the small card,
    not the full page. When cleared, the empty container takes no overlay area. */
 .st-key-hdq_investigation_banner iframe,
+.st-key-hdq_investigation_banner_live iframe,
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .hdq-status-live-anchor) iframe,
 .st-key-hdq_investigation_banner_blocking iframe {
     width: 100% !important;
     max-width: 100% !important;
 }
 @media (max-width: 650px) {
     .st-key-hdq_investigation_banner,
+    .st-key-hdq_investigation_banner_live,
+    [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .hdq-status-live-anchor),
     .st-key-hdq_investigation_banner_blocking {
         top: 3.6rem !important;
         right: 0.5rem !important;
-        width: min(390px, calc(100vw - 1rem)) !important;
-        max-width: min(390px, calc(100vw - 1rem)) !important;
+        width: min(300px, calc(100vw - 1rem)) !important;
+        max-width: min(300px, calc(100vw - 1rem)) !important;
     }
 }
 </style>"""
@@ -477,36 +506,54 @@ def render_recommendation_banner_html(snapshot: dict | None, *, idle: bool = Fal
                                                ("total", "ready", "running", "failed", "pending"))
     pct = 100 * ready / total if total else 0.0
     if idle:
-        headline = "Agent B — waiting for QC findings"
+        headline = "Agent B — waiting"
         details = "Recommendations begin automatically after QC findings; no data are changed"
     elif not total:
         headline = "Agent B — not scheduled"
         details = "No per-finding recommendation jobs are recorded"
     elif running or pending:
-        headline = "Agent B — preparing suggestions…"
+        headline = "Agent B — preparing…"
         details = f"{ready} ready · {running} generating · {pending} queued · {failed} failed"
         if assisted:
             details += f" · Agent C assisting on {assisted}"
     elif failed:
         headline = "Agent B — finished with errors"
-        details = f"{ready} ready · {failed} failed; review individual findings"
+        details = f"{ready} ready · {failed} failed"
     else:
-        headline = "Agent B — recommendations ready"
-        details = f"{ready} saved · Each suggestion needs researcher review"
+        headline = "Agent B — ready"
+        details = f"{ready} saved"
+    sequential = bool((snapshot or {}).get('sequential'))
+    if sequential and not idle:
+        active_label = (snapshot or {}).get('active_label')
+        reviewed = (snapshot or {}).get('completed_reviews', 0)
+        if (snapshot or {}).get('waiting_for_reviewer') and (snapshot or {}).get('lookahead_running'):
+            headline = 'Agent B — preparing ahead…'
+            details = f"{snapshot['lookahead_running']} · locked"
+        elif (snapshot or {}).get('waiting_for_reviewer'):
+            headline = 'Agent B — waiting'
+            ahead = (snapshot or {}).get('lookahead_ready', 0)
+            details = f'{ahead} prepared ahead · locked' if ahead else f'{active_label} · reviewer decision'
+        elif active_label:
+            headline = 'Agent B — preparing…'
+            details = f'{active_label} · current dataset'
+        else:
+            headline = 'Agent B — ready'
+            details = 'All current reviews finished'
+        pct = 100 * reviewed / total if total else 0.0
     # Animate Agent B only while work is active, matching the investigation mascot.
     # Its completed, failed, and unscheduled states remain still.
     # Queued or generating jobs are still active; waiting/terminal states are not.
     # Explicitly select the uploaded working dinosaur instead of always using
     # the green waiting image. Idle, completed, and failed states stop shaking.
-    active = bool(not idle and (running or pending))
+    active = bool(not idle and ((running or (snapshot or {}).get('lookahead_running')) if sequential else (running or pending)))
     mascot = (recommendation_processing_mascot_data_url() if active
               else recommendation_mascot_data_url())
     return f"""<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <style>
-*{{box-sizing:border-box}}html,body{{margin:0;background:transparent;color:#fff;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif}}
-.card{{position:relative;overflow:hidden;display:grid;grid-template-columns:minmax(0,1fr) 107px;gap:6px;align-items:center;min-height:127px;padding:10px 12px;border:1px solid #38dab9;border-radius:14px;background:linear-gradient(110deg,#09253c,#0a3e4c 80%,#0a5d59);box-shadow:0 2px 12px #14a99633}}
+*{{box-sizing:border-box}}html,body{{margin:0;overflow:hidden;background:transparent;color:#fff;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif}}
+.card{{position:relative;overflow:hidden;display:grid;grid-template-columns:minmax(0,1fr) 107px;gap:6px;align-items:center;min-height:108px;padding:10px 12px;border:1px solid #38dab9;border-radius:14px;background:linear-gradient(110deg,#09253c,#0a3e4c 80%,#0a5d59);box-shadow:0 2px 12px #14a99633}}
 .title{{font-size:18px;font-weight:800;letter-spacing:-.025em;line-height:1.25;overflow-wrap:anywhere}}
-.sub{{color:#ccf7ec;font-size:11px;margin:4px 0 8px}}
+.sub{{display:none;color:#ccf7ec;font-size:11px;margin:4px 0 8px}}
 .meter{{color:#eefdf6;font-size:12px;font-variant-numeric:tabular-nums;margin-bottom:7px}}
 .track{{height:6px;border-radius:30px;background:#b4eedc33;overflow:hidden}}
 .fill{{height:100%;background:linear-gradient(90deg,#5fefb1,#c7e746);width:{pct:.2f}%;border-radius:30px}}
@@ -517,12 +564,12 @@ figure img{{width:105px;height:104px;object-fit:cover;object-position:50% 47%;bo
 .card:not(.is-active) figure img{{animation:none!important;transform:none!important}}
 @keyframes hdq-bound{{from{{transform:translateY(3px) rotate(-1deg)}}to{{transform:translateY(-4px) rotate(1deg)}}}}
 @media(prefers-reduced-motion:reduce){{.card.is-active figure img{{animation:none}}}}
-@media(max-width:550px){{.card{{grid-template-columns:minmax(0,1fr) 72px;min-height:122px;padding:9px}}.title{{font-size:15px}}figure{{height:87px}}figure img{{width:70px;height:82px}}.meter{{font-size:11px}}}}
+@media(max-width:550px){{.card{{grid-template-columns:minmax(0,1fr) 72px;min-height:108px;padding:9px}}.title{{font-size:14px}}figure{{height:87px}}figure img{{width:70px;height:82px}}.meter{{font-size:11px}}}}
 </style></head><body>
 <section class="card{' is-active' if active else ''}" role="status" aria-label="Agent B recommendation progress">
 <div><div class="title">{escape(headline)}</div>
-<div class="sub">Read-only cleaning suggestions · once per finding per investigation</div>
-<div class="meter">{'Not started' if idle else f'{ready} of {total} suggestions ready'}</div>
+<div class="sub">Read-only cleaning suggestions · {'one active review' if sequential else 'once per finding per investigation'}</div>
+<div class="meter">{'Not started' if idle else f'{reviewed} of {total} reviewed' if sequential else f'{ready} of {total} suggestions ready'}</div>
 <div class="track" {'role="img" aria-label="Not started"' if idle else f'role="progressbar" aria-valuemin="0" aria-valuemax="{total}" aria-valuenow="{ready}" aria-label="Saved recommendations"'}><div class="fill"></div></div>
 <div class="note">{escape(details)}</div></div><figure aria-hidden="true"><img src="{mascot}" alt=""/></figure>
 </section></body></html>"""
@@ -548,34 +595,34 @@ def render_agent_c_banner_html(*, ready_findings: int = 0, total_findings: int =
     active = (available and active_conversations > 0) or assisting_findings > 0
     if assisting_findings and active_conversations:
         # A borrowed in-flight inference can finish while a human chat queues.
-        headline = "Agent C — user interaction prioritized"
+        headline = "Agent C — queued"
         meter = f"{active_conversations} user request(s) · assisting inference finishing"
-        note = "The current inference cannot be interrupted; your chat runs next"
+        note = "Your request runs next"
     elif assisting_findings:
         headline = "Agent C — assisting Agent B…"
         meter = f"{assisting_findings} recommendation(s) in progress"
-        note = "Unused interactive capacity is reviewing another finding"
+        note = "Preparing a recommendation"
     elif not available:
-        headline = "Agent C — waiting for Agent B"
-        meter = "Idle · No Agent C request running"
-        note = "Agent C becomes available after the first recommendation is saved"
+        headline = "Agent C — waiting"
+        meter = "No active request"
+        note = "Waiting for first recommendation"
     elif active:
         headline = "Agent C — responding…"
         meter = (f"{active_conversations} active request"
                  f"{'s' if active_conversations != 1 else ''}")
-        note = "Processing your selected finding; no automatic cleaning is authorized"
+        note = "Reviewing your request"
     else:
-        headline = "Agent C — waiting for your input"
-        meter = "Idle · No Agent C request running"
-        note = "Select a finding and choose Yes or No to start Agent C"
+        headline = "Agent C — idle"
+        meter = "No active request"
+        note = "Choose an action or discuss"
     mascot = (agent_c_working_mascot_data_url() if active
               else agent_c_idle_mascot_data_url())
     return f"""<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <style>
-*{{box-sizing:border-box}}html,body{{margin:0;background:transparent;color:#fff;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif}}
-.card{{position:relative;overflow:hidden;display:grid;grid-template-columns:minmax(0,1fr) 107px;gap:6px;align-items:center;min-height:127px;padding:10px 12px;border:1px solid #ff8ad6;border-radius:14px;background:linear-gradient(110deg,#2a173d,#3d1948 70%,#4a2470);box-shadow:0 2px 12px #ff75d833}}
+*{{box-sizing:border-box}}html,body{{margin:0;overflow:hidden;background:transparent;color:#fff;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif}}
+.card{{position:relative;overflow:hidden;display:grid;grid-template-columns:minmax(0,1fr) 107px;gap:6px;align-items:center;min-height:108px;padding:10px 12px;border:1px solid #ff8ad6;border-radius:14px;background:linear-gradient(110deg,#2a173d,#3d1948 70%,#4a2470);box-shadow:0 2px 12px #ff75d833}}
 .title{{font-size:18px;font-weight:800;letter-spacing:-.025em;line-height:1.25;overflow-wrap:anywhere}}
-.sub{{color:#ffe2f7;font-size:11px;margin:4px 0 8px}}
+.sub{{display:none;color:#ffe2f7;font-size:11px;margin:4px 0 8px}}
 .meter{{color:#fff0fb;font-size:12px;font-variant-numeric:tabular-nums;margin-bottom:7px}}
 /* Decorative divider, NOT a percentage of Agent B findings. */
 .rule{{height:6px;border-radius:30px;background:#ffd7f233;overflow:hidden;position:relative}}
@@ -588,7 +635,7 @@ figure img{{width:105px;height:104px;object-fit:cover;object-position:center;bor
 .card:not(.is-active) figure img{{animation:none!important;transform:none!important}}
 @keyframes hdq-bound{{from{{transform:translateY(3px) rotate(-1deg)}}to{{transform:translateY(-4px) rotate(1deg)}}}}
 @media(prefers-reduced-motion:reduce){{.card.is-active figure img,.card.is-active .rule:after{{animation:none}}}}
-@media(max-width:550px){{.card{{grid-template-columns:minmax(0,1fr) 72px;min-height:122px;padding:9px}}.title{{font-size:15px}}figure{{height:87px}}figure img{{width:70px;height:82px}}.meter{{font-size:11px}}}}
+@media(max-width:550px){{.card{{grid-template-columns:minmax(0,1fr) 72px;min-height:108px;padding:9px}}.title{{font-size:14px}}figure{{height:87px}}figure img{{width:70px;height:82px}}.meter{{font-size:11px}}}}
 </style></head><body>
 <section class="card{' is-active' if active else ''}" role="status" aria-label="Agent C discussion status">
 <div><div class="title">{escape(headline)}</div>

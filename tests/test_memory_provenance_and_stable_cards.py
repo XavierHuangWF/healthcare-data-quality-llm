@@ -104,4 +104,4 @@ def test_agent_b_background_completion_does_not_force_full_page_rerun():
     portion = app_source.split("def _render_live_agent_b_finding(", 1)[1].split("def _is_blank_control_check(", 1)[0]
     assert "st.rerun()" not in portion.replace("# Do NOT st.rerun()", "")
     assert "_expand_ready_finding_without_rerun(fid)" not in portion
-    assert 'st.fragment(run_every="3s")(_refresh_parent_for_new_agent_b_choices)' in app_source
+    assert 'st.fragment(run_every="3s")(refresh_cleaning)' in app_source

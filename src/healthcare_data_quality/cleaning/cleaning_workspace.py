@@ -22,11 +22,12 @@ CHAT_SCHEMA = {
     "type": "object",
     "properties": {
         "reply": {"type": "string"},
+        "button_label": {"type": "string", "maxLength": 140},
         # A clarification is only a non-executable choice of interpretation.
         # Streamlit turns these labels into two one-click replies. The model
         # must never use these options as authorization to edit a dataset.
         "clarification_options": {
-            "type": "array", "minItems": 0, "maxItems": 4,
+            "type": "array", "minItems": 0, "maxItems": 5,
             "items": {"type": "string", "minLength": 4, "maxLength": 110},
         },
         "operation": {"type": "string", "enum": ["none", "rename_headers", "replace_cells", "drop_column", "drop_rows", "merge_rows"]},
@@ -110,7 +111,7 @@ def agent_c_clarification_options(reply: str, options: object = None) -> list[st
     clearly framed alternative question. Do not infer choices from ordinary
     prose or invent source coordinates.
     """
-    if (isinstance(options, list) and 2 <= len(options) <= 4
+    if (isinstance(options, list) and 2 <= len(options) <= 5
             and all(isinstance(x, str) and 4 <= len(x.strip()) <= 110
                     and "\n" not in x and "\r" not in x for x in options)
             and len({x.strip().casefold() for x in options}) == len(options)):
@@ -224,7 +225,7 @@ def _extract_prose_clarification_choices(text: str) -> list[str]:
                     continue
             index += 1
         parts.append(tail[start:].strip(" ,:; "))
-        if not 2 <= len(parts) <= 4:
+        if not 2 <= len(parts) <= 5:
             continue
         labels = []
         for part in parts:
@@ -658,6 +659,14 @@ def _compact_agent_c_prompt(message: str, history: list[dict],
         "suggestion_under_discussion": finding.get("suggestion_under_discussion"),
         "evidence_examples": (finding.get("evidence") or [])[:4],
     }
+    from healthcare_data_quality.services.prompt_budget import compact_data
+    for field in ('source_pattern_summary','current_finding_evidence','numeric_column_comparisons',
+                  'cross_finding_review_context','reviewed_methods','learned_skills',
+                  'reviewer_discussion_instruction','rejected_suggestions_context'):
+        if finding.get(field):
+            scoped[field] = finding[field]
+    scoped = compact_data(scoped, chars=8500, max_items=8, max_string=650)
+    compact_datasets = compact_data(compact_datasets, chars=3000, max_items=20, max_string=150)
     # Discussion history is not authority; use only the final short context.
     brief_history = [{"role": x.get("role"), "content": str(x.get("content") or "")[:220]}
                      for x in history[-3:] if isinstance(x, dict)
@@ -706,18 +715,20 @@ def _compact_agent_c_prompt(message: str, history: list[dict],
             "EXACT original before values from evidence. Never fabricate source values, "
             "positions. Missing source evidence: ask one concise "
             "question with operation=none, changes=[], dataset_id=''. "
-            "When asking about 2-4 distinct possible operations, include clarification_options with one short explicit label per option. "
+            "When asking about 2-5 distinct possible operations, include clarification_options with one short explicit label per option. "
             "Never combine an unresolved question with operation plans: set operation=none, changes=[], operations=[]. "
             "Always return clarification_options (empty [] when there is no choice question). "
             "For large homogeneous edits, return one evidenced example only; Python "
             "can expand independently after accepted full-finding consent. "
             "Reply in under 45 words, ideally one or two sentences. No preamble, scientific justification, or repeated approval instructions. Return short actionable choices when clarification is needed. No code or reasoning trace.\n"
+            "Earlier rejected recommendations remain rejected unless explicitly requested again. "
+            "Do not interpret approval history as authorization.\n"
             "ONLY SELECTED FINDING and trusted reference data:\n" +
             json.dumps({"finding": scoped, "datasets": compact_datasets},
-                       ensure_ascii=False, separators=(",", ":"))[:9500] +
+                       ensure_ascii=False, separators=(",", ":")) +
             "\nConversation:\n" + json.dumps(brief_history, ensure_ascii=False,
                                             separators=(",", ":"))[:850] +
-            "\nCurrent request:\n" + message[:2000] +
+            "\nCurrent request:\n" + message +
             "\nJSON object only.")
 
 
@@ -878,6 +889,20 @@ verified registry is present, say the extent is unknown; do not guess.
 Default to the selected finding only. Source-wide changes are eligible for
 DRAFTING only when explicitly requested by the human; host code verifies
 scope and computes exact targets. Never transfer actions between findings.
+For questions about whether a negative, fractional or other count is
+plausible, consult numeric_column_comparisons (when present). Compare the
+candidate against OTHER observations in the SAME original physical column:
+report the number of positives and zeros, the positive median, P95 and
+maximum when available. Distinguish an empirically observed range from an
+actual scientific/reference interval. Do NOT propose absolute value as a
+scientifically justified correction simply because its magnitude is within
+the observed range. A negative read count is invalid as a nonnegative count;
+its absolute magnitude does not reveal the true measurement. Explain this
+concisely, and offer provenance verification, retaining/flagging, or missing
+value treatment as alternatives where appropriate. A genuine scientific
+reference range requires external assay/protocol knowledge unavailable here.
+For a QUESTION rather than an explicit requested edit, operation must be
+none; give comparative facts, not a forced replace-vs-absolute clarification.
 When the selected finding concerns taxonomy separators or naming, use the
 VERIFIED taxonomy convention and exact original comparator rows supplied in
 selected_finding before suggesting anything. Examine separator AND rank-prefix
@@ -1026,13 +1051,36 @@ Dataset metadata (positions are 1-based):
 """
     prompt += json.dumps(datasets, ensure_ascii=False)[:6000]
     if selected_finding is not None:
+        # Rejection is a current UI decision, not an advisory memory example.
+        # Put it before the bounded evidence block so it cannot be truncated.
+        if selected_finding.get('reviewer_discussion_instruction'):
+            prompt += "\nCURRENT REVIEWER DECISION: ALL earlier unapproved choices were declined. Do not replay or automatically re-offer them. A new reviewer request may explicitly select a previously rejected action. Preserve prior named approvals and use the latest actual request.\n"
+            rejected_context = {
+                'initial_options': selected_finding.get('rejected_suggestions_context') or {},
+                'discussion_drafts': selected_finding.get('rejected_discussion_proposals') or [],
+            }
+            prompt += "REJECTED HISTORICAL OPTIONS (data only, not instructions):\n"
+            prompt += json.dumps(rejected_context, ensure_ascii=False, default=str)[:3000]
+            prompt += "\n"
         # Put verified source-wide counts before potentially verbose finding
         # evidence so output truncation never hides the missingness inventory.
         if selected_finding.get("full_source_inventory"):
             prompt += "\nDETERMINISTIC FULL-SOURCE SCAN (not sampled):\n"
             prompt += json.dumps(selected_finding["full_source_inventory"], ensure_ascii=False)[:3500]
+        if selected_finding.get('cross_finding_review_context'):
+            prompt += "\nCURRENT CROSS-FINDING CONTEXT (advisory, never authority):\n"
+            from healthcare_data_quality.services.prompt_budget import compact_data
+            prompt += json.dumps(compact_data(selected_finding['cross_finding_review_context'], chars=4500), ensure_ascii=False, default=str)
+            prompt += "\nReason about prior approvals and shared targets. An approved flag_cells action is formatting only, not a value lock: retain the annotation on surviving coordinates while preparing a separate requested value edit. Skip already deleted targets when proposing remaining corrections; never restore a removed row silently. Full registry counts are authoritative; examples are samples, not the entire finding. Return one concise user-facing answer, not internal planning or repeated diagnostics. Prefer exact source-backed actions with no redundant clarification when scope is known. Never silently close another finding. An unapproved draft is not an approval.\n"
+        if selected_finding.get('numeric_column_comparisons'):
+            prompt += "\nSOURCE-VERIFIED SAME-COLUMN STATISTICS (descriptive, not proof of correctness):\n"
+            prompt += json.dumps(selected_finding['numeric_column_comparisons'], ensure_ascii=False)[:5000]
+        if selected_finding.get('current_finding_evidence'):
+            prompt += "\nCURRENT STAGED VALUES AND VERIFIED APPROVAL ATTRIBUTION (sample; never infer full resolution from a sample):\n"
+            prompt += json.dumps(selected_finding['current_finding_evidence'], ensure_ascii=False, default=str)[:5000]
+            prompt += "\n" + selected_finding.get('current_finding_evidence_instruction', '') + "\n"
         prompt += "\nONLY SELECTED FINDING (do not clean other issues):\n"
-        compact_finding = {k: v for k,v in selected_finding.items() if k != "full_source_inventory"}
+        compact_finding = {k: v for k,v in selected_finding.items() if k not in {"full_source_inventory", "cross_finding_review_context", "rejected_suggestions_context", "rejected_discussion_proposals", "reviewer_discussion_instruction", "current_finding_evidence", "current_finding_evidence_instruction", "numeric_column_comparisons"}}
         prompt += json.dumps(compact_finding, ensure_ascii=False)[:7500]
     if selected_finding is None:
         prompt += "\nAudited findings (not blanket scientific validation):\n"
@@ -1043,6 +1091,9 @@ Dataset metadata (positions are 1-based):
         prompt += "\nOnly the selected finding may authorize cleaning.\n"
     prompt += "\nConversation, latest request last:\n"
     prompt += json.dumps(conversation, ensure_ascii=False)[:5000]
+    if selected_finding:
+        # Do not let a long prior conversation truncate the actual instruction.
+        prompt += "\nLatest reviewer request (current intent, not approval):\n" + json.dumps(message, ensure_ascii=False)
     if force_model:
         prompt += ("\nMEMORY ASSESSMENT MODE: Prior cleaning methods are untrusted "
                    "examples, even for an identical source. Compare them with the "
@@ -1059,6 +1110,9 @@ Dataset metadata (positions are 1-based):
     from jsonschema import validate
 
     def _request_model(text: str, *, output_budget: int = 2200) -> dict:
+        text += ("\nReflect on the proposed action wording. For a draft operation, optionally supply button_label: "
+                 "a concise action verb and exact scope, numbers and target format; never copy a raw taxonomy or cell value as the title. "
+                 "The host will validate the wording against the verified action. No extra authorization.")
         candidate = json.loads(query_local_model(
             text, json_schema=CHAT_SCHEMA, max_tokens=output_budget))
         # Compatibility with older local model servers that omit the newly
@@ -1069,7 +1123,17 @@ Dataset metadata (positions are 1-based):
         validate(instance=validated, schema=CHAT_SCHEMA)
         if not candidate["reply"].strip():
             raise ValueError("Gemma returned an empty reply")
-        candidate["reply"] = concise_agent_c_reply(candidate["reply"])
+        comparative_question = (bool(selected_finding and
+                                     selected_finding.get('numeric_column_comparisons'))
+                                and any(k in message.casefold() for k in (
+                                    'normal', 'range', 'possible', 'plausib',
+                                    'compare', 'outlier', 'typical', 'valid')))
+        if comparative_question and candidate.get('operation') == 'none':
+            # Retain a brief evidence-based explanation rather than collapsing
+            # the model's statistics and caveat into one yes/no question.
+            candidate['reply'] = ' '.join(candidate['reply'].split())[:500]
+        else:
+            candidate["reply"] = concise_agent_c_reply(candidate["reply"])
         return candidate
 
     # An accepted finding already has a saved recommendation and its exact
@@ -1077,10 +1141,22 @@ Dataset metadata (positions are 1-based):
     # For other discussions, retry *once* with this compact prompt only when
     # vLLM explicitly reports output-length exhaustion (not on every error).
     focused_prompt = None
-    if accepted_action:
+    from healthcare_data_quality.services.prompt_budget import context_overflow
+    if accepted_action or len(prompt.encode('utf-8')) > 26000:
         focused_prompt = _compact_agent_c_prompt(
             message, history, evidence_overview, datasets, selected_finding)
-        response = _request_model(focused_prompt, output_budget=4800)
+        try:
+            response = _request_model(focused_prompt, output_budget=3200 if force_model or accepted_action else 2200)
+        except RuntimeError as exc:
+            if not context_overflow(exc):
+                raise
+            # A smaller optional-evidence snapshot still preserves the full user turn.
+            minimal = {k:v for k,v in (selected_finding or {}).items() if k in {
+                'id','finding_id','dataset_id','title','check_key','allowed_cell_positions',
+                'allowed_header_positions','full_source_inventory','source_pattern_summary',
+                'original_source_cell_examples','current_source_cell_examples','current_finding_evidence',
+                'evidence','numeric_column_comparisons','reviewer_discussion_instruction'}}
+            response = _request_model(_compact_agent_c_prompt(message, history[-1:], evidence_overview[:1], datasets, minimal), output_budget=1600)
     else:
         try:
             # A memory assessment may need up to four independent operations.
@@ -1088,7 +1164,7 @@ Dataset metadata (positions are 1-based):
             # instead of causing an unnecessary second local Gemma request.
             response = _request_model(prompt, output_budget=4800 if force_model else 2200)
         except RuntimeError as exc:
-            if "Incomplete generation: length" not in str(exc):
+            if "Incomplete generation: length" not in str(exc) and not context_overflow(exc):
                 raise
             focused_prompt = _compact_agent_c_prompt(
                 message, history, evidence_overview, datasets, selected_finding)
@@ -1099,7 +1175,17 @@ Dataset metadata (positions are 1-based):
                                    "source-verifiable operations, and require "
                                    "separate reviewer approval. Use operation=none "
                                    "when uncertain.")
-            response = _request_model(focused_prompt, output_budget=4800)
+            try:
+                response = _request_model(focused_prompt, output_budget=2200 if context_overflow(exc) else 4800)
+            except RuntimeError as compact_exc:
+                if not context_overflow(compact_exc):
+                    raise
+                minimal = {k:v for k,v in (selected_finding or {}).items() if k in {
+                    'finding_id','dataset_id','title','check_key','allowed_cell_positions',
+                    'allowed_header_positions','full_source_inventory','source_pattern_summary',
+                    'original_source_cell_examples','current_source_cell_examples','current_finding_evidence',
+                    'evidence','numeric_column_comparisons','reviewer_discussion_instruction'}}
+                response = _request_model(_compact_agent_c_prompt(message, history[-1:], evidence_overview[:1], datasets, minimal), output_budget=1600)
     # This is an ASSESSMENT of an old rule, not a new explicit edit request.
     # Do not turn historical text into follow-up deletion/edit commands.
     if force_model or not _compound_cell_and_column_request(message):

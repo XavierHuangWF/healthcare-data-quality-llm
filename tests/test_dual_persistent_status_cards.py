@@ -73,8 +73,8 @@ def test_same_floating_container_hosts_two_cards_even_after_completion():
     source = (ROOT / "app.py").read_text()
     assert 'with st.container(key="hdq_investigation_banner")' in source
     assert 'with banner_slot.container():' in source
-    assert 'components.html(investigation_html, height=170, scrolling=False)' in source
-    assert 'components.html(render_recommendation_banner_html(recommendation_state)' in source
+    assert 'st.iframe(investigation_html, height=170)' in source
+    assert 'st.iframe(render_recommendation_banner_html(recommendation_state)' in source
     assert 'render_finished_investigation_banner_html(' in source
     assert 'job_fingerprint(cache_key, [], run_id=run_id)' in source
     assert 'banner_slot.empty()' not in source[source.index('def render_live_investigation_status'):source.index('def _toggle_full_dataset_preview')]
